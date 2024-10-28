@@ -1,0 +1,117 @@
+syntax = "proto3";
+package jobworkerp.runner.llm;
+
+// Container for various LLM response formats
+message LLMChatResult {
+
+  // Usage statistics for a request
+  message Usage {
+    // The name of the model used for the completion.
+    string model = 1;
+    // The number of tokens used in the prompt.
+    optional uint32 prompt_tokens = 2;
+    // The number of tokens used in the completion.
+    optional uint32 completion_tokens = 3;
+    // The total seconds taken to process the request prompt.
+    optional float total_prompt_time_sec = 4;
+    // The total seconds taken to process the completion.
+    optional float total_completion_time_sec = 5;
+  }
+
+  message MessageContent {
+    message ImageSource {
+      // For models/services that support URL as input
+      string url = 1;
+
+      // The base64 string of the image
+      string base64 = 2;
+    }
+
+    message Image {
+      string content_type = 1;
+      ImageSource source = 2;
+    }
+
+    message ToolCall {
+      string call_id = 1;
+      string fn_name = 2;
+      string fn_arguments = 3;
+    }
+
+    // Tool calls
+    message ToolCalls { repeated ToolCall calls = 1; }
+
+    oneof content {
+      // The role of the message.
+      string text = 1;
+
+      // The content of the message.
+      Image image = 2;
+
+      // The content of the message.
+      ToolCalls tool_calls = 3;
+    }
+  }
+
+  // The response of the completion. This can be the entire completion or only
+  // a token if the completion is streaming.
+  optional MessageContent content = 1;
+
+  // The response of the reasoning content(think tag etc). This can be the
+  // entire completion or only
+  optional string reasoning_content = 2;
+
+  // Whether the completion is done. If the completion is streaming, this will
+  // be false until the last response.
+  bool done = 3;
+
+  // information about the inferencing process
+  optional Usage usage = 4;
+
+  // Pending tool calls that require client approval (manual mode)
+  // When is_auto_calling=false and LLM requests tool calls, these are returned
+  // instead of being executed automatically
+  optional PendingToolCalls pending_tool_calls = 5;
+
+  // Indicates if response requires tool execution continuation
+  // True when pending_tool_calls is set and tool execution is needed
+  optional bool requires_tool_execution = 6;
+
+  // Tool execution results (for streaming mode)
+  // Contains results of executed tools during streaming
+  repeated ToolExecutionResult tool_execution_results = 7;
+
+  // Tool execution started notification (for streaming nested workflow progress)
+  optional ToolExecutionStarted tool_execution_started = 8;
+}
+
+// Pending tool calls to be executed (for manual mode)
+message PendingToolCalls {
+  repeated ToolCallRequest calls = 1;
+}
+
+// Tool call request details
+message ToolCallRequest {
+  string call_id = 1;
+  string fn_name = 2;
+  string fn_arguments = 3;  // JSON string of arguments
+}
+
+// Tool execution started notification (emitted immediately after enqueue)
+// Used by AG-UI server to start subscribing to nested workflow progress
+message ToolExecutionStarted {
+  string call_id = 1;              // Corresponding tool call ID
+  string fn_name = 2;              // Function name being executed
+  int64 job_id = 3;                // Job ID for subscribing to streaming progress
+  string fn_arguments = 4;         // JSON string of arguments (for AG-UI TOOL_CALL_ARGS)
+}
+
+// Tool execution result (for streaming mode)
+message ToolExecutionResult {
+  string call_id = 1;              // Corresponding tool call ID
+  string fn_name = 2;              // Executed function name
+  string result = 3;               // Execution result (JSON string)
+  optional string error = 4;       // Error message (on failure)
+  bool success = 5;                // Success/failure flag
+  optional int64 job_id = 6;       // Job ID of the executed tool job
+}

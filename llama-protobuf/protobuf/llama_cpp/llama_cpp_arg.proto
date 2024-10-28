@@ -1,0 +1,48 @@
+syntax = "proto3";
+
+package llama_cpp;
+
+import "llama_cpp/media_input.proto";
+
+message LlamaArg {
+    // The initial prompt.
+    string prompt = 1;
+
+    // Inclusive absolute position cap (in tokens) for the generation loop.
+    // Generation produces tokens up to and including this position. The
+    // number of newly produced tokens is therefore `sample_len - n_past + 1`,
+    // where `n_past` is the number of tokens consumed by the prompt
+    // (text-only) or the prefill (multimodal). Callers that want to
+    // generate N tokens should set `sample_len = n_past + N - 1`.
+    uint32 sample_len = 2;
+
+    // The temperature used to generate samples.
+    // TODO
+    optional double temperature= 3;
+
+    // Nucleus sampling probability cutoff.
+    // TODO
+    optional double top_p = 4;
+
+    // Penalty to be applied for repeating tokens, 1. means no penalty.
+    // TODO
+    optional float repeat_penalty= 5;
+
+    // The context size to consider for the repeat penalty.
+    // TODO
+    optional uint32 repeat_last_n = 6;
+
+    // The seed to use when generating random samples.
+    optional uint64 seed = 7;
+
+    // print iteratively (false for plugin runner, true for cli)
+    bool need_print= 8;
+
+    // Media items attached to the prompt.
+    // `prompt` is the raw user turn content (before chat template is
+    // applied). Each media marker inside `prompt` must correspond 1:1 with
+    // an entry in `medias`. If `prompt` has no marker and `medias` is
+    // non-empty, the runner appends one marker per media at the tail of
+    // `prompt` — still before chat template application.
+    repeated MediaInput medias = 9;
+}

@@ -1,0 +1,96 @@
+name: Pull Request CI
+
+on:
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  test:
+    name: Build and Test
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
+    container: ${{ vars.BUILD_CONTAINER || '' }}
+
+    steps:
+      - name: Install Node.js and npm
+        if: vars.BUILD_CONTAINER != ''
+        run: |
+          apt-get update
+          apt-get install -y curl
+          curl -fsSL https://deb.nodesource.com/setup_lts.x | bash -
+          apt-get install -y nodejs
+
+      - name: Setup CUDA environment
+        if: vars.CUDA_COMPUTE_CAP != ''
+        run: |
+          echo "NVIDIA_VISIBLE_DEVICES=all" >> $GITHUB_ENV
+          echo "NVIDIA_DRIVER_CAPABILITIES=compute,utility" >> $GITHUB_ENV
+          echo "NVIDIA_DISABLE_REQUIRE=true" >> $GITHUB_ENV
+          echo "CUDA_COMPUTE_CAP=${{ vars.CUDA_COMPUTE_CAP }}" >> $GITHUB_ENV
+          # Workaround: llama-cpp-sys-2 builds ggml-cuda with NCCL support when
+          # libnccl is detected, but does not emit cargo:rustc-link-lib=nccl.
+          # Additionally, Cargo does not propagate build.rs link directives to
+          # bin targets when the crate also has a lib target (rust-lang/cargo#7506).
+          # This flag can be removed once llama-cpp-sys-2 fixes its build.rs to
+          # emit the missing link directive, or once Cargo #7506 is resolved.
+          echo "RUSTFLAGS=-C relocation-model=pic -C link-arg=-lnccl" >> $GITHUB_ENV
+          echo "CFLAGS=-fPIC" >> $GITHUB_ENV
+          echo "CXXFLAGS=-fPIC" >> $GITHUB_ENV
+          echo "CMAKE_POSITION_INDEPENDENT_CODE=ON" >> $GITHUB_ENV
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install protoc
+        if: vars.BUILD_CONTAINER == ''
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-registry-
+
+      - name: Cache cargo git
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/git
+          key: ${{ runner.os }}-cargo-git-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-git-
+
+      - name: Cache target directory
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: ${{ runner.os }}-target-pr-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-target-pr-
+            ${{ runner.os }}-target-
+
+      - name: Build
+        run: cargo build --release ${{ vars.CARGO_FEATURES && format('--features {0}', vars.CARGO_FEATURES) }}
+
+      - name: Run tests
+        run: cargo test --release ${{ vars.CARGO_FEATURES && format('--features {0}', vars.CARGO_FEATURES) }} -- --test-threads=1
+
+      - name: Run multimodal smoke tests
+        if: vars.CUDA_COMPUTE_CAP != ''
+        run: |
+          cargo test -p jobworkerp-llama-cpp-plugin \
+            test_multimodal_generation_with_real_model \
+            --release -- --ignored --test-threads=1 --nocapture
+          cargo test -p jobworkerp-llama-cpp-plugin \
+            test_multimodal_audio_generation \
+            --release -- --ignored --test-threads=1 --nocapture
+          cargo test -p embedding-llm \
+            integration_test_multimodal_embedding \
+            --release -- --ignored --test-threads=1 --nocapture

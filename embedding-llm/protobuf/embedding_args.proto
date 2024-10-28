@@ -1,0 +1,68 @@
+syntax = "proto3";
+
+package embedding_llm;
+
+import "llama_cpp/media_input.proto";
+
+message EmbeddingArgs {
+  // Input text/document to embed.
+  //
+  // Follows the same marker-insertion rules as LlamaArg.prompt: markers
+  // must appear inside the raw user content, before any template is
+  // applied. proto3 cannot distinguish "unset" from empty string here, so
+  // the runner treats the empty string as "no text provided" and, when
+  // `medias` is non-empty, synthesizes a prompt that consists solely of
+  // one media marker per item. If both `text == ""` AND `medias` is empty,
+  // the runner returns InvalidArgument.
+  string text = 1;
+
+  // Instruction prefix for the embedding task.
+  // Example: "Instruct: Given a web search query, retrieve relevant documents."
+  //
+  // Current behavior: instruction is treated as metadata and is NOT
+  // included in the tokens passed to the embedding model, in either
+  // text-only or multimodal paths. Providing an instruction therefore
+  // has no effect on the generated embedding vector today.
+  optional string instruction = 2;
+
+  // Whether to apply L2 normalization to output embeddings
+  bool normalize_embeddings = 3;
+
+  // Media items attached to the input.
+  // Only effective when the loaded model is a multimodal embedder with an
+  // mmproj that supports the corresponding MediaKind. Otherwise the runner
+  // returns an InvalidArgument error with a clear message.
+  repeated llama_cpp.MediaInput medias = 4;
+
+  // Pooling strategy for embedding extraction.
+  //
+  // Currently honored only by the multimodal path (medias non-empty).
+  // For text-only input the runner uses the pooling_type baked into the
+  // GGUF; passing a non-UNSPECIFIED value returns InvalidArgument to avoid
+  // silently ignoring the request. Text-only pooling override is tracked
+  // as future work.
+  //
+  // Unknown enum values (proto3 open-enum) return InvalidArgument on both
+  // paths rather than silently folding into the model default.
+  PoolingType pooling_type = 5;
+}
+
+// Pooling strategy for how the embedder extracts a single vector from the
+// per-token outputs. Values mirror `llama_cpp_2::LlamaPoolingType`.
+//
+// Variant names use the `POOLING_TYPE_` prefix so the generated Rust enum
+// variants become `PoolingType::Unspecified` etc. (prost strips the
+// snake-cased enum-name prefix from each variant when possible).
+enum PoolingType {
+  // Use the model default (from the GGUF); falls back to LAST when the
+  // model default is NONE (typical for generative models).
+  POOLING_TYPE_UNSPECIFIED = 0;
+  // Per-token embedding from the last token position.
+  POOLING_TYPE_NONE = 1;
+  // Mean-pool across all token positions.
+  POOLING_TYPE_MEAN = 2;
+  // Use the CLS token position.
+  POOLING_TYPE_CLS = 3;
+  // Use the last token position.
+  POOLING_TYPE_LAST = 4;
+}

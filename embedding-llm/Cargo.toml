@@ -1,0 +1,55 @@
+[package]
+name = "embedding-llm"
+version = { workspace = true }
+edition = { workspace = true }
+authors = { workspace = true }
+description = "LLM-based embedding generation plugin"
+repository = { workspace = true }
+license = { workspace = true }
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[dependencies]
+jobworkerp-client = { path = "../modules/jobworkerp-client" }
+jobworkerp-llama-protobuf = { path = "../llama-protobuf" }
+mtmd-support = { path = "../mtmd-support" }
+
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+command-utils = { path = "../modules/command-utils" }
+dotenvy = { workspace = true }
+encoding_rs = { workspace = true }
+hf-hub = { workspace = true }
+itertools = { workspace = true }
+llama-cpp-2 = { workspace = true }
+llama-cpp-sys-2 = { workspace = true }
+once_cell = { workspace = true }
+opentelemetry = { workspace = true}
+prost = { workspace = true }
+schemars = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread"] }
+tokenizers = { workspace = true }
+tracing = { workspace = true }
+
+[build-dependencies]
+prost-build = { workspace = true }
+
+[features]
+default = []
+metal = ["llama-cpp-2/metal"]
+cuda = ["llama-cpp-2/cuda"]
+# `native` optimizations are now enabled by default in llama-cpp-2 >= 0.1.143.
+# This feature is kept as a no-op for backward compatibility.
+native = []
+dynamic-link = ["llama-cpp-2/dynamic-link"]
+openmp = ["llama-cpp-2/openmp"]
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+chrono = { version = "0.4", features = ["serde"] }

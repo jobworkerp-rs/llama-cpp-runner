@@ -1,0 +1,211 @@
+name: Release Plugin
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-publish:
+    name: Build and Publish
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
+    container: ${{ vars.BUILD_CONTAINER || '' }}
+
+    steps:
+      - name: Install Node.js and npm
+        if: vars.BUILD_CONTAINER != ''
+        run: |
+          apt-get update
+          apt-get install -y curl git-lfs
+          curl -fsSL https://deb.nodesource.com/setup_lts.x | bash -
+          apt-get install -y nodejs
+
+      - name: Setup CUDA environment
+        if: vars.CUDA_COMPUTE_CAP != ''
+        run: |
+          echo "NVIDIA_VISIBLE_DEVICES=all" >> $GITHUB_ENV
+          echo "NVIDIA_DRIVER_CAPABILITIES=compute,utility" >> $GITHUB_ENV
+          echo "NVIDIA_DISABLE_REQUIRE=true" >> $GITHUB_ENV
+          echo "CUDA_COMPUTE_CAP=${{ vars.CUDA_COMPUTE_CAP }}" >> $GITHUB_ENV
+          # Workaround: llama-cpp-sys-2 builds ggml-cuda with NCCL support when
+          # libnccl is detected, but does not emit cargo:rustc-link-lib=nccl.
+          # Additionally, Cargo does not propagate build.rs link directives to
+          # bin targets when the crate also has a lib target (rust-lang/cargo#7506).
+          # This flag can be removed once llama-cpp-sys-2 fixes its build.rs to
+          # emit the missing link directive, or once Cargo #7506 is resolved.
+          echo "RUSTFLAGS=-C relocation-model=pic -C link-arg=-lnccl" >> $GITHUB_ENV
+          echo "CFLAGS=-fPIC" >> $GITHUB_ENV
+          echo "CXXFLAGS=-fPIC" >> $GITHUB_ENV
+          echo "CMAKE_POSITION_INDEPENDENT_CODE=ON" >> $GITHUB_ENV
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - name: Install protoc
+        if: vars.BUILD_CONTAINER == ''
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-registry-
+
+      - name: Cache cargo git
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/git
+          key: ${{ runner.os }}-cargo-git-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-git-
+
+      - name: Cache target directory
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: ${{ runner.os }}-target-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-target-
+
+      - name: Build
+        run: cargo build --release ${{ vars.CARGO_FEATURES && format('--features {0}', vars.CARGO_FEATURES) }}
+
+      - name: Run tests
+        run: cargo test --release ${{ vars.CARGO_FEATURES && format('--features {0}', vars.CARGO_FEATURES) }} -- --test-threads=1
+
+      - name: Run multimodal smoke tests
+        if: vars.CUDA_COMPUTE_CAP != ''
+        run: |
+          cargo test -p jobworkerp-llama-cpp-plugin \
+            test_multimodal_generation_with_real_model \
+            --release -- --ignored --test-threads=1 --nocapture
+          cargo test -p jobworkerp-llama-cpp-plugin \
+            test_multimodal_audio_generation \
+            --release -- --ignored --test-threads=1 --nocapture
+          cargo test -p embedding-llm \
+            integration_test_multimodal_embedding \
+            --release -- --ignored --test-threads=1 --nocapture
+
+      - name: Generate tag
+        id: tag
+        run: |
+          TAG_VERSION=$(git show --no-patch --no-notes --pretty='%ci' HEAD | sed -e 's/^\([0-9]\+\)\-\([0-9]\+\)\-\([0-9]\+\)\s\([0-9]\+\):\([0-9]\+\):\([0-9]\+\).*$/\1\2\3_\4\5\6/')
+          echo "tag=$TAG_VERSION" >> $GITHUB_OUTPUT
+          echo "Generated tag: $TAG_VERSION"
+
+      - name: Prepare artifacts
+        id: artifacts
+        run: |
+          SUFFIX="${{ vars.ASSET_SUFFIX }}"
+          ARCH=$(uname -m)
+          OS=$(uname -s | tr '[:upper:]' '[:lower:]')
+          CUDA_CC="${{ vars.CUDA_COMPUTE_CAP }}"
+
+          PLATFORM="${ARCH}-${OS}"
+          if [ -n "$CUDA_CC" ]; then
+            CUDA_VER=$(nvcc --version | grep -o 'release [0-9]*\.[0-9]*' | grep -o '[0-9]*\.[0-9]*')
+            echo "Detected CUDA version: ${CUDA_VER}"
+            PLATFORM="${PLATFORM}-cuda${CUDA_VER}-cc${CUDA_CC}"
+          fi
+
+          mkdir -p artifacts
+          for f in target/release/lib*.so; do
+            if [ ! -f "$f" ]; then continue; fi
+            base=$(basename "$f" .so)
+            dest="artifacts/${base}${SUFFIX}-${PLATFORM}.so.xz"
+            xz -c -9 "$f" > "$dest"
+            echo "Compressed: $f -> $dest ($(stat -c%s "$dest" 2>/dev/null || stat -f%z "$dest") bytes)"
+          done
+          ls -lh artifacts/
+
+      - name: Publish to GitHub Release
+        run: |
+          TAG="${{ steps.tag.outputs.tag }}"
+          REPO="${{ vars.GH_RELEASE_REPO || github.repository }}"
+          TOKEN="${{ secrets.GH_RELEASE_TOKEN || secrets.GITHUB_TOKEN }}"
+          API="https://api.github.com/repos/${REPO}"
+          AUTH="Authorization: token ${TOKEN}"
+          CUDA_CC="${{ vars.CUDA_COMPUTE_CAP }}"
+
+          echo "Creating release for tag: ${TAG} on repo: ${REPO}"
+          CREATE_RESP=$(curl -s -w "\n%{http_code}" -X POST "${API}/releases" \
+            -H "${AUTH}" \
+            -H "Content-Type: application/json" \
+            -d "{\"tag_name\":\"${TAG}\",\"name\":\"${TAG}\",\"body\":\"Build ${TAG}\",\"target_commitish\":\"main\"}")
+          CREATE_HTTP=$(echo "$CREATE_RESP" | tail -1)
+          CREATE_BODY=$(echo "$CREATE_RESP" | sed '$d')
+          echo "Create release HTTP status: $CREATE_HTTP"
+          if [ "$CREATE_HTTP" = "201" ]; then
+            echo "Release created successfully"
+          elif [ "$CREATE_HTTP" = "422" ]; then
+            echo "Release already exists, continuing..."
+          else
+            echo "Unexpected response: $CREATE_BODY"
+          fi
+
+          GET_RESP=$(curl -s -w "\n%{http_code}" "${API}/releases/tags/${TAG}" -H "${AUTH}")
+          GET_HTTP=$(echo "$GET_RESP" | tail -1)
+          GET_BODY=$(echo "$GET_RESP" | sed '$d')
+          if [ "$GET_HTTP" != "200" ]; then
+            echo "ERROR: Could not find release for tag ${TAG} (HTTP ${GET_HTTP})"
+            echo "$GET_BODY"
+            exit 1
+          fi
+          RELEASE_ID=$(echo "$GET_BODY" | grep -o '"id" *: *[0-9]*' | head -1 | grep -o '[0-9]*')
+          echo "Release ID: $RELEASE_ID"
+
+          UPLOAD_URL="https://uploads.github.com/repos/${REPO}/releases/${RELEASE_ID}/assets"
+          echo "Upload URL: ${UPLOAD_URL}"
+          echo "Artifacts to upload:"
+          ls -lh artifacts/*.so.xz
+
+          for f in artifacts/*.so.xz; do
+            [ -f "$f" ] || continue
+            filename=$(basename "$f")
+            filesize=$(stat -c%s "$f" 2>/dev/null || stat -f%z "$f")
+            echo "Processing: $filename (${filesize} bytes)"
+
+            echo "Checking for existing asset..."
+            ASSETS_JSON=$(curl -s --max-time 30 "${API}/releases/${RELEASE_ID}/assets" -H "${AUTH}")
+            ASSET_ID=$(echo "$ASSETS_JSON" | grep -B2 "\"name\" *: *\"${filename}\"" | grep -o '"id" *: *[0-9]*' | grep -o '[0-9]*' || true)
+            if [ -n "$ASSET_ID" ]; then
+              curl -s --max-time 30 -X DELETE "${API}/releases/assets/${ASSET_ID}" -H "${AUTH}"
+              echo "Deleted existing asset: $filename (ID: $ASSET_ID)"
+            else
+              echo "No existing asset found"
+            fi
+
+            LABEL_PARAM=""
+            if [ -n "$CUDA_CC" ]; then
+              LABEL_PARAM="&label=cuda"
+            fi
+
+            echo "Uploading $filename..."
+            UPLOAD_HTTP=$(curl -s -o /tmp/upload_resp.json -w "%{http_code}" \
+              --max-time 600 \
+              -X POST "${UPLOAD_URL}?name=${filename}${LABEL_PARAM}" \
+              -H "${AUTH}" \
+              -H "Content-Type: application/octet-stream" \
+              --data-binary "@${f}")
+            echo "Upload HTTP status: $UPLOAD_HTTP"
+            if [ "$UPLOAD_HTTP" = "201" ]; then
+              echo "Uploaded: $filename"
+            else
+              echo "ERROR: Failed to upload $filename (HTTP ${UPLOAD_HTTP})"
+              cat /tmp/upload_resp.json 2>/dev/null || true
+              exit 1
+            fi
+          done

@@ -1,0 +1,129 @@
+syntax = "proto3";
+package jobworkerp.runner.llm;
+
+// Completion request (text completion)
+message LLMChatArgs {
+  // LLM request options for generation configuration
+  // To specify to change the default behavior of the LLM
+  message LLMOptions {
+    // The length of the sample to generate (in tokens) (default: context size).
+    optional int32 max_tokens = 1;
+
+    // The temperature used to generate samples.
+    optional float temperature = 2;
+
+    // Nucleus sampling probability cutoff.
+    optional float top_p = 3;
+
+    // Penalty to be applied for repeating tokens, 1. means no penalty.
+    optional float repeat_penalty = 4;
+
+    // The context size to consider for the repeat penalty.
+    optional int32 repeat_last_n = 5;
+
+    // The seed to use when generating random samples.
+    optional int32 seed = 6;
+
+    // extract reasoning content from the response
+    optional bool extract_reasoning_content = 7;
+  }
+
+  message FunctionOptions {
+    // use function calling
+    bool use_function_calling = 1;
+    // function set name
+    optional string function_set_name = 2;
+    // use runners as function (exclusive with function_set_name)
+    optional bool use_runners_as_function = 3;
+    // use workers as function (exclusive with function_set_name)
+    optional bool use_workers_as_function = 4;
+    // automatically execute tool calls (default: false = manual mode)
+    // When false, tool calls are returned to the client for approval before execution
+    optional bool is_auto_calling = 5;
+    // When true, automatically inject FunctionSet selector tools to enable
+    // LLM-driven FunctionSet selection. Requires use_function_calling = true.
+    // Lower priority than function_set_name: ignored when function_set_name is set.
+    // When function_set_name is not specified, LLM discovers and selects
+    // appropriate FunctionSets dynamically via pseudo-tool calls.
+    optional bool auto_select_function_set = 6;
+  }
+
+  enum ChatRole {
+    // The role of the message.
+    UNSPECIFIED = 0;
+    SYSTEM = 1;    // System message
+    USER = 2;      // User message
+    ASSISTANT = 3; // Assistant message
+    TOOL = 4;      // Tool message
+  }
+
+  message MessageContent {
+    message ImageSource {
+      // For models/services that support URL as input
+      string url = 1;
+
+      // The base64 string of the image
+      string base64 = 2;
+    }
+
+    message Image {
+      string content_type = 1;
+      ImageSource source = 2;
+    }
+
+    message ToolCall {
+      string call_id = 1;
+      string fn_name = 2;
+      string fn_arguments = 3;
+    }
+
+    // Tool calls
+    message ToolCalls { repeated ToolCall calls = 1; }
+
+    // Tool execution request (client requesting server to execute a tool)
+    message ToolExecutionRequest {
+      string call_id = 1;
+      string fn_name = 2;
+      string fn_arguments = 3;  // JSON string of arguments (can be modified by client)
+    }
+
+    // Multiple tool execution requests
+    message ToolExecutionRequests { repeated ToolExecutionRequest requests = 1; }
+
+    oneof content {
+      // The role of the message.
+      string text = 1;
+
+      // The content of the message.
+      Image image = 2;
+
+      // Tool calls from LLM (ASSISTANT role)
+      ToolCalls tool_calls = 3;
+
+      // Tool execution requests from client (TOOL role, requesting server to execute)
+      ToolExecutionRequests tool_execution_requests = 4;
+    }
+  }
+
+  message ChatMessage {
+    /// The role of the message.
+    ChatRole role = 1;
+
+    /// The content of the message.
+    MessageContent content = 2;
+  }
+
+  // The name of the model (override default in runner settings).
+  optional string model = 1;
+
+  // The options to use for the model.
+  optional LLMOptions options = 2;
+
+  // The function options to use for the model.
+  optional FunctionOptions function_options = 4;
+
+  repeated ChatMessage messages = 5;
+  
+  // JSON Schema for structured output (optional)
+  optional string json_schema = 6;
+}

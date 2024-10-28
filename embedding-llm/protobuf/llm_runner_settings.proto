@@ -1,0 +1,76 @@
+syntax = "proto3";
+
+package embedding_llm;
+
+import "llama_cpp/media_input.proto";
+
+message EmbeddingLlmRunnerSettings {
+  // HuggingFace model ID or local model path
+  string model_id = 1;
+  
+  // Use CPU instead of GPU for inference
+  bool use_cpu = 2;
+  
+  // Model precision (default: F16 for GPU, F32 for CPU)
+  // Note: BF16 may have issues with CUDA acceleration in some environments
+  // ref. https://github.com/ggml-org/llama.cpp/issues/9881#issuecomment-2414516092
+  optional DType dtype = 3;
+  
+  // Maximum sequence length for tokenization
+  uint32 max_seq_length = 4;
+  
+  // Model format type
+  ModelType model_type = 5;
+  
+  // Model files (required when model_type = GGUF)
+  // For GGUF models, specify the .gguf files to load
+  repeated string model_files = 6;
+  
+  // Optional: separate tokenizer model ID (if different from model_id)
+  // If specified, this tokenizer will be used instead of GGUF built-in tokenizer
+  optional string tokenizer_model_id = 7;
+  
+  // Optional: hierarchical chunking configuration
+  optional HierarchicalChunkingConfig chunking_config = 8;
+  
+  // Maximum batch size for batch processing (default: adaptive based on memory)
+  // Used for hierarchical chunking batch processing optimization
+  optional uint32 max_batch_size = 9;
+  
+  // GPU device index to use for inference (default: 0)
+  // Only effective when use_cpu = false
+  // Ignored when use_cpu = true
+  optional int32 gpu_device = 10;
+
+  // Multimodal projector settings. Same semantics as
+  // LlamaRunnerSettings.mtmd — defined in llama_cpp/media_input.proto and
+  // shared between both runners.
+  optional llama_cpp.MtmdSettings mtmd = 11;
+}
+
+enum ModelType {
+  GGUF = 0;         // llama.cppメイン対応（デフォルト）
+}
+
+enum DType {
+  F32 = 0;  // 32-bit float (default for CPU)
+  F16 = 1;  // 16-bit float (default for GPU)
+  BF16 = 2; // 16-bit brain float (may have issues with CUDA)
+}
+
+message HierarchicalChunkingConfig {
+  // Maximum chunk tokens
+  uint32 max_chunk_tokens = 1;
+
+  // Minimum chunk tokens
+  uint32 min_chunk_tokens = 2;
+
+  // Enable paragraph merging for small paragraphs
+  bool enable_paragraph_merging = 3;
+
+  // Enable sentence splitting for large paragraphs
+  bool enable_sentence_splitting = 4;
+
+  // Enable forced splitting as last resort
+  bool enable_forced_splitting = 5;
+}

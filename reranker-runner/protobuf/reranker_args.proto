@@ -1,0 +1,74 @@
+syntax = "proto3";
+
+package reranker_runner;
+
+// Reranker execution arguments
+message RerankerArgs {
+  // Search query (required)
+  string query = 1;
+
+  // List of candidates to rerank (required)
+  repeated Candidate candidates = 2;
+
+  // Reranking options (optional)
+  optional RerankerOptions options = 3;
+}
+
+// Candidate data
+message Candidate {
+  // Candidate text (required)
+  // This text is used to calculate relevance score with the query
+  string text = 1;
+
+  // Original data (optional)
+  // Stored as JSON string and returned as-is in output
+  // Example: {"message_id": "123", "source": "slack", ...}
+  string original_data = 2;
+
+  // Original score (optional)
+  // Original score from vector search, etc.
+  // Can be blended with reranking_score using score_blend_ratio
+  optional float original_score = 3;
+
+  // Candidate ID (optional)
+  // For debugging and tracing
+  optional string id = 4;
+}
+
+// Reranking options
+message RerankerOptions {
+  // Return top N results (optional)
+  // default: return all results
+  optional uint32 top_k = 1;
+
+  // Minimum score threshold (optional)
+  // default: 0.0 (no threshold)
+  // Candidates with scores below this value are excluded
+  optional float score_threshold = 2;
+
+  // Custom instruction text (optional)
+  // default: settings.default_instruction
+  // Example: "Rank documents by technical relevance to Rust programming"
+  optional string instruction = 3;
+
+  // Score blend ratio (optional)
+  // 0.0 = use original_score completely
+  // 1.0 = use reranking_score completely
+  // 0.5 = 50/50 blend
+  // default: 1.0 (use reranking_score completely)
+  optional float score_blend_ratio = 4;
+
+  // Batch size (optional)
+  // Ignored in Phase 1 (Sequential processing only)
+  // default: 1
+  optional uint32 batch_size = 5;
+
+  // Use cache flag (optional)
+  // default: true
+  optional bool use_cache = 6;
+
+  // Maximum document length in tokens (optional)
+  // default: settings.max_document_length_{gpu,cpu}
+  // Documents exceeding this length are truncated from the beginning
+  optional uint32 max_document_length = 7;
+}

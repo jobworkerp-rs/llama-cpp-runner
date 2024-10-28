@@ -1,0 +1,43 @@
+syntax = "proto3";
+
+package embedding_llm;
+
+message EmbeddingLlmResult {
+  message Embedding {
+    repeated float values = 1;
+    uint32 begin_position = 2;  // Original text start character position
+    uint32 end_position = 3;    // Original text end character position
+    string content = 4;         // Actual text content for this embedding range
+  }
+  // For text-only inputs the runner may split long text into sliding windows
+  // and return one Embedding per window (each with its own position span).
+  //
+  // For multimodal inputs (medias non-empty) the runner always returns a
+  // single pooled Embedding whose values cover the entire input (text +
+  // media combined). The position and content metadata refer only to the
+  // text portion; media presence is indicated by the input args, not by
+  // these result fields. For media-only input (text=""), position metadata
+  // is 0..0 and content is empty. Sliding-window chunking is not applied
+  // because media items cannot be meaningfully split across windows.
+  // Callers must ensure the combined text + media fits within the model's
+  // context length; exceeding it returns an error.
+  repeated Embedding embeddings = 1;
+  
+  // Model metadata (optional)
+  optional ModelInfo model_info = 2;
+}
+
+message ModelInfo {
+  string model_name = 1;
+  uint32 embedding_dimension = 2;
+  string dtype_used = 3;
+
+  // Multimodal capability flags, populated when the loaded model has an
+  // mmproj projector attached. Both false for text-only embedders.
+  bool supports_vision = 4;
+  bool supports_audio = 5;
+
+  // Sample rate (Hz) expected by the audio mmproj, if supports_audio is
+  // true. Unset for vision-only or text-only models.
+  optional uint32 audio_sample_rate = 6;
+}
