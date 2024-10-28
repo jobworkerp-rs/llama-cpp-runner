@@ -1,2 +1,2 @@
-# jobworkerp-llama-cpp-plugin
+# llama-cpp-plugin
 

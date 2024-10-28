@@ -1,0 +1,29 @@
+syntax = "proto3";
+
+package llama_cpp;
+
+message LlamaOperation {
+    /// The path or name to the model
+    /// if hf_repo is Some, the model is filename on huggingface
+    /// if hf_remo is None, the model is a local path
+    string model = 1;
+    /// Download a model from huggingface (or use a cached version)
+    /// the repo containing the model. e.g. `TheBloke/Llama-2-7B-Chat-GGUF`
+    optional string hf_repo = 2;
+    /// Disable offloading layers to the gpu
+    bool disable_gpu = 3;
+    // RNG seed (default: 1234)
+    optional uint32 seed = 4;
+    // number of threads to use during generation (default: use all available threads)
+    optional uint32 threads = 5;
+    // number of threads to use during batch and prompt processing (default: use all available threads)
+    optional uint32 threads_batch = 6;
+    // size of the prompt context (default: 2048)
+    optional uint32 ctx_size = 7;
+    // use flash attention (default true)
+    optional bool use_flash_attention = 8;
+ 
+    // TODO
+    // override some parameters of the model
+    //key_value_overrides: Option<Vec<(String, ParamOverrideValueWrapper)>>,
+}
