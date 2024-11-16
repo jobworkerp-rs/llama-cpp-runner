@@ -85,6 +85,11 @@ pub struct LlamaModelConfig {
     ctx_size: Option<NonZeroU32>,
     // use flash attention (default true)
     use_flash_attention: Option<bool>,
+    // system prompt before the user prompt
+    // e.g. `The system will respond to your prompt`
+    // This is useful for instructing the user on how to use the model
+    // or to provide some context to the user
+    system_prompt: Option<String>,
 }
 impl From<LlamaOperation> for LlamaModelConfig {
     fn from(op: LlamaOperation) -> Self {
@@ -103,6 +108,7 @@ impl From<LlamaOperation> for LlamaModelConfig {
             threads_batch: op.threads_batch,
             ctx_size: op.ctx_size.and_then(NonZeroU32::new),
             use_flash_attention: op.use_flash_attention,
+            system_prompt: op.system_prompt,
         }
     }
 }
@@ -134,6 +140,7 @@ impl Default for LlamaModelConfig {
             threads_batch: None,
             ctx_size: None,
             use_flash_attention: None,
+            system_prompt: None,
         }
     }
 }
@@ -173,6 +180,7 @@ pub struct LlamaModelWrapper {
     model: LlamaModel,
     backend: LlamaBackend,
     ctx_params: LlamaContextParams,
+    system_prompt: String,
 }
 
 impl LlamaModelWrapper {
@@ -210,7 +218,8 @@ impl LlamaModelWrapper {
 
         // initialize the context
         let mut ctx_params = LlamaContextParams::default()
-            .with_n_ctx(config.ctx_size.or(Some(NonZeroU32::new(2048).unwrap())))
+            // .with_n_ctx(config.ctx_size.or(Some(NonZeroU32::new(2048).unwrap())))
+            .with_n_ctx(config.ctx_size)
             .with_seed(config.seed.unwrap_or(1234))
             .with_flash_attention(config.use_flash_attention.unwrap_or(true));
         if let Some(threads) = config.threads {
@@ -224,6 +233,7 @@ impl LlamaModelWrapper {
             model,
             backend,
             ctx_params,
+            system_prompt: config.system_prompt.unwrap_or_else(|| "".to_string()),
         })
     }
 
@@ -318,7 +328,7 @@ impl LlamaModelWrapper {
     }
 
     fn decode(&mut self, args: InferenceArgs) -> Result<String> {
-        let prompt: &str = &args.prompt;
+        let prompt: String = format!("{}\n\n{}", self.system_prompt, &args.prompt);
         let n_len: i32 = args.sample_len;
         let mut history = Vec::<LlamaToken>::with_capacity(args.sample_len as usize);
 
@@ -327,7 +337,7 @@ impl LlamaModelWrapper {
             .new_context(&self.backend, self.ctx_params.clone())
             .with_context(|| "unable to create the llama_context")?;
 
-        let mut batch = self.create_batch(prompt, &ctx, n_len)?;
+        let mut batch = self.create_batch(prompt.as_str(), &ctx, n_len)?;
 
         // first decode the prompt
         ctx.decode(&mut batch)
@@ -345,7 +355,8 @@ impl LlamaModelWrapper {
 
         // XXX assume string byte size 4
         let mut output_buffer = String::with_capacity((n_len * 4) as usize);
-        output_buffer.push_str(prompt);
+        // not output the prompt
+        // output_buffer.push_str(prompt.as_str());
 
         while n_cur <= n_len {
             // sample the next token
