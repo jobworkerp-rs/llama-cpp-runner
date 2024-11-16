@@ -1,0 +1,209 @@
+kind: pipeline
+type: docker
+name: pullreq
+
+environment:
+  NVIDIA_VISIBLE_DEVICES: all
+  NVIDIA_DISABLE_REQUIRE: true
+  NVIDIA_DRIVER_CAPABILITIES: compute,utility
+
+steps:
+  - name: submodules
+    image: gitea.toris.dev/servers/drone-git-ssh:0.0.4
+    commands:
+      - cd github
+      - git submodule update --init --recursive
+  - name: test
+    image: gitea.toris.dev/servers/rust-gpu-build:12.4.1-1
+    environment:
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DISABLE_REQUIRE: true
+#      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+    volumes:
+      - name: cargo_git
+        path: /usr/local/cargo/git
+      - name: cargo_registry
+        path: /usr/local/cargo/registry
+      - name: apt_cache
+        path: /var/cache/apt
+      - name: docker_sock
+        path: /var/run/docker.sock
+    commands:
+      - cd github
+      - cp dot.env .env
+      - /usr/bin/nvidia-smi
+      - echo $PATH
+      - rustup target add x86_64-unknown-linux-musl
+      - cargo clean
+      - cargo build --release
+      - cargo test --release -- --test-threads=1
+volumes:
+  - name: cargo_git
+    host:
+      path: /var/lib/drone/tmp/cargo/git
+  - name: cargo_registry
+    host:
+      path: /var/lib/drone/tmp/cargo/registry
+  - name: apt_cache
+    host:
+      path: /var/lib/drone/tmp/cache/apt
+  - name: docker_sock
+    host:
+      path: /var/run/docker.sock
+
+trigger:
+  branch:
+    - main
+  event:
+    - pull_request
+
+---
+kind: pipeline
+type: docker
+name: main_merge
+
+steps:
+  - name: submodules
+    image: gitea.toris.dev/servers/drone-git-ssh:0.0.4
+    commands:
+      - cd github
+      - git submodule update --init --recursive
+
+# testing
+#  - name: test
+#    image: gitea.toris.dev/servers/rust-gpu-build:12.4.1-1
+#    environment:
+#      CARGO_HOME: /usr/local/cargo
+#      NVIDIA_VISIBLE_DEVICES: all
+#      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+#    volumes:
+#      - name: cargo_git
+#        path: /usr/local/cargo/git
+#      - name: cargo_registry
+#        path: /usr/local/cargo/registry
+#      - name: apt_cache
+#        path: /var/cache/apt
+#      - name: docker_sock
+#        path: /var/run/docker.sock
+#    commands:
+#      #      - cp dot.env .env
+#      - rustup target add x86_64-unknown-linux-musl
+#      - cargo clean
+#      - cargo build --release
+#      - cargo test --release -- --test-threads=1
+
+  - name: tagging
+    image: gitea.toris.dev/servers/drone-git-ssh:0.0.4
+    commands:
+#      - TAG_VERSION=$(git show --no-patch --no-notes --pretty='%ci' HEAD | sed -e 's/^\(\w\+\)\-\(\w\+\)\-\(\w\+\)\s\(\w\+\):\(\w\+\):\(\w\+\).*$/\1\2\3_\4\5\6/')
+      - git remote set-url origin $(git remote get-url origin | sed -e 's/^https:\\/\\/gitea/git@gitea-ssh/' | sed -e 's/\(.*\)\\/\(.*\)\\/\(.*\)/\1:\2\\/\3/')
+      - git tag ${DRONE_TAG} # $TAG_VERSION
+      - git push origin --tags
+
+volumes:
+  - name: cargo_git
+    host:
+      path: /var/lib/drone/tmp/cargo/git
+  - name: cargo_registry
+    host:
+      path: /var/lib/drone/tmp/cargo/registry
+  - name: apt_cache
+    host:
+      path: /var/lib/drone/tmp/cache/apt
+  - name: docker_sock
+    host:
+      path: /var/run/docker.sock
+
+trigger:
+  branch:
+    - main
+  event:
+    - release
+#    - push
+
+---
+kind: pipeline
+type: docker
+name: publish_plugin
+
+steps:
+  - name: submodules
+    image: gitea.toris.dev/servers/drone-git-ssh:0.0.4
+    commands:
+      - cd github
+      - git submodule update --init --recursive
+
+  - name: build
+    image: gitea.toris.dev/servers/rust-gpu-build:12.4.1-1
+    environment:
+      CARGO_HOME: /usr/local/cargo
+      NVIDIA_VISIBLE_DEVICES: all
+#      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      NVIDIA_DISABLE_REQUIRE: true
+    volumes:
+      - name: cargo_git
+        path: /usr/local/cargo/git
+      - name: cargo_registry
+        path: /usr/local/cargo/registry
+      - name: docker_sock
+        path: /var/run/docker.sock
+    commands:
+      - cd github
+      - cargo clean
+      - cargo build --release
+
+#  - name: publish_plugin_prepare_upload
+#    image: gitea.toris.dev/servers/drone-git-ssh:0.0.4
+#    commands:
+#      # https://stackoverflow.com/a/69891948
+#      - git config --global http.postBuffer 524288000
+#      - cd github
+#      - mkdir -p upload
+#      # depth 1 (to avoid timeout error on clone)
+#      - git clone --depth 1 ssh://git@gitea-ssh.toris.dev/jobworkerp-rs/jobworkerp-plugins.git
+#      - cd jobworkerp-plugins
+#      - git checkout origin/main -- ./VERSION
+#      - git reset --soft origin/main
+#      - mkdir -p cuda_runner
+#      - cp ../target/release/lib*.so cuda_runner/
+#      - cp ../target/release/lib*.so ../upload/
+##      - cp ../target/release/*-test ../upload/
+#      - git add cuda_runner
+#      - test 0 -eq $(git diff --staged | wc -l) && exit
+#      - echo ${DRONE_TAG} > VERSION
+#      - git add ./VERSION
+#      - git commit -m "Publish plugin ${DRONE_TAG} from llama-cpp-plugin"
+#      - git push origin main
+#      - git tag -f ${DRONE_TAG}
+#      - git push origin --tags
+#  - name: publish github
+#    image: plugins/github-release
+#    settings:
+#      base_url: https://github.com/jobworkerp-rs/llama-cpp-plugin
+#      github_url: https://github.com/jobworkerp-rs/llama-cpp-plugin
+#      api_key:
+#        from_secret: github_token
+#      title: ${DRONE_TAG}_cuda_12.4.1_ubuntu22.04_x86_64
+#      files: ./github/upload/*
+#    checksum:
+#      - md5
+#      - sha1
+#      - sha256
+
+volumes:
+- name: cargo_git
+  host:
+    path: /var/lib/drone/tmp/cargo/git
+- name: cargo_registry
+  host:
+    path: /var/lib/drone/tmp/cargo/registry
+- name: apt_cache
+  host:
+    path: /var/lib/drone/tmp/cache/apt
+- name: docker_sock
+  host:
+    path: /var/run/docker.sock
+
+trigger:
+  event:
+    - tag
