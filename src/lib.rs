@@ -138,24 +138,25 @@ mod test {
     async fn test_plugin_runner() {
         tracing_subscriber::fmt::init();
         let env = "
-LLAMA_MODEL=Llama-3-ELYZA-JP-8B-q4_k_m.gguf # Phi-3-medium-128k-instruct.Q4_K.gguf # Meta-Llama-3.1-8B-Instruct-Q4_K_L.gguf #llama-2-7b-chat.Q4_K_M.gguf
-LLAMA_HF_REPO=elyza/Llama-3-ELYZA-JP-8B-GGUF # legraphista/Phi-3-medium-128k-instruct-IMat-GGUF # bartowski/Meta-Llama-3.1-8B-Instruct-GGUF #TheBloke/Llama-2-7B-Chat-GGUF
+#LLAMA_MODEL=Llama-3-ELYZA-JP-8B-q4_k_m.gguf # Phi-3-medium-128k-instruct.Q4_K.gguf # Meta-Llama-3.1-8B-Instruct-Q4_K_L.gguf #llama-2-7b-chat.Q4_K_M.gguf
+#LLAMA_HF_REPO=elyza/Llama-3-ELYZA-JP-8B-GGUF # legraphista/Phi-3-medium-128k-instruct-IMat-GGUF # bartowski/Meta-Llama-3.1-8B-Instruct-GGUF #TheBloke/Llama-2-7B-Chat-GGUF
+LLAMA_MODEL=tokyotech-llm-Llama-3.1-Swallow-70B-Instruct-v0.1-Q4_K_M.gguf # Phi-3-medium-128k-instruct.Q4_K.gguf # Meta-Llama-3.1-8B-Instruct-Q4_K_L.gguf #llama-2-7b-chat.Q4_K_M.gguf
+LLAMA_HF_REPO=mmnga/tokyotech-llm-Llama-3.1-Swallow-70B-Instruct-v0.1-gguf # legraphista/Phi-3-medium-128k-instruct-IMat-GGUF # bartowski/Meta-Llama-3.1-8B-Instruct-GGUF #TheBloke/Llama-2-7B-Chat-GGUF
+
 LLAMA_DISABLE_GPU=true
 LLAMA_SEED=1024
 LLAMA_THREADS=8
 LLAMA_USE_FLASH_ATTENTION=false
+LLAMA_SYSTEM_PROMPT=次の英語の文章を日本語に翻訳してください。翻訳結果のみを出力してください
 ";
         dotenvy::from_read(env.as_bytes()).ok();
 
-        // let system_prompt =
-        //     "カジュアルな対応をしてください。分からないことは分からないと言ってください。";
-        let user_prompt = r#"次の英語の文章を日本語に翻訳してください:
-English: There have been many moments of extreme danger over the past year. This is the worst.
+        let user_prompt = r#"
+There have been many moments of extreme danger over the past year. This is the worst.
 In the past seven days, Hezbollah leader Hassan Nasrallah has been assassinated, Israel has launched a ground invasion of Lebanon, and Iran has fired nearly 200 ballistic missiles at targets across Israel.
 Western and regional powers - led by the US - have pushed for de-escalation. The UN Security Council called for an "immediate end" to hostilities and the G7, which includes the US, UK and Germany, has called for “restraint”.
 But so far those efforts have failed - and the Middle East stands closer than ever to all-out war.
 Here’s how the last week played out.
-Japanese: 
 "#;
         let prompt = user_prompt.to_string();
 
