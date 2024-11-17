@@ -6,6 +6,7 @@ message LlamaOperation {
     // The path or name to the model
     // if hf_repo is Some, the model is filename on huggingface
     // if hf_remo is None, the model is a local path
+    // (multiple files can be specified with a comma)
     string model = 1;
     // Download a model from huggingface (or use a cached version)
     // the repo containing the model. e.g. `TheBloke/Llama-2-7B-Chat-GGUF`
@@ -18,7 +19,7 @@ message LlamaOperation {
     optional uint32 threads = 5;
     // number of threads to use during batch and prompt processing (default: use all available threads)
     optional uint32 threads_batch = 6;
-    // size of the prompt context (default: 2048)
+    // size of the prompt context (default: 0 (from model))
     optional uint32 ctx_size = 7;
     // use flash attention (default true)
     optional bool use_flash_attention = 8;

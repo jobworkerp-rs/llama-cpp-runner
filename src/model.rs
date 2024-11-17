@@ -7,7 +7,7 @@ use llama_cpp_2::{
     llama_batch::LlamaBatch,
     model::{
         params::{kv_overrides::ParamOverrideValue, LlamaModelParams},
-        AddBos, LlamaModel, Special,
+        AddBos, LlamaChatMessage, LlamaModel, Special,
     },
     token::{data_array::LlamaTokenDataArray, LlamaToken},
 };
@@ -115,16 +115,24 @@ impl From<LlamaOperation> for LlamaModelConfig {
 
 impl LlamaModelConfig {
     /// Convert the model to a path - may download from huggingface
-    fn get_or_load_model(&self) -> Result<PathBuf> {
+    fn get_or_load_model(&self) -> Result<Vec<PathBuf>> {
+        let modelfiles = self.model.split(',').map(PathBuf::from).collect::<Vec<_>>();
         match self.hf_repo.clone() {
-            None => Ok(PathBuf::from(self.model.clone())),
-            Some(repo) => ApiBuilder::new()
-                .with_progress(true)
-                .build()
-                .with_context(|| "unable to create huggingface api")?
-                .model(repo)
-                .get(&self.model)
-                .with_context(|| "unable to download model"),
+            None => Ok(modelfiles),
+            Some(repo) => {
+                let api = ApiBuilder::new()
+                    .with_progress(true)
+                    .build()
+                    .with_context(|| "unable to create huggingface api")?
+                    .model(repo);
+                modelfiles
+                    .iter()
+                    .map(|model| {
+                        api.get(model.to_string_lossy().as_ref())
+                            .with_context(|| "unable to download model")
+                    })
+                    .collect()
+            }
         }
     }
 }
@@ -188,7 +196,7 @@ impl LlamaModelWrapper {
         let mut backend = LlamaBackend::init()?;
         backend.void_logs();
 
-        let model_path = config
+        let model_paths = config
             .get_or_load_model()
             .with_context(|| "failed to get model from args")?;
 
@@ -213,12 +221,15 @@ impl LlamaModelWrapper {
                     .append_kv_override(k.as_c_str(), v.clone().into());
             }
         }
-        let model = LlamaModel::load_from_file(&backend, model_path, &model_params)
-            .with_context(|| "unable to load model")?;
+        let model = LlamaModel::load_from_file(
+            &backend,
+            model_paths[0].as_ref() as &std::path::Path,
+            &model_params,
+        )
+        .with_context(|| "unable to load model")?;
 
         // initialize the context
         let mut ctx_params = LlamaContextParams::default()
-            // .with_n_ctx(config.ctx_size.or(Some(NonZeroU32::new(2048).unwrap())))
             .with_n_ctx(config.ctx_size)
             .with_seed(config.seed.unwrap_or(1234))
             .with_flash_attention(config.use_flash_attention.unwrap_or(true));
@@ -328,7 +339,31 @@ impl LlamaModelWrapper {
     }
 
     fn decode(&mut self, args: InferenceArgs) -> Result<String> {
-        let prompt: String = format!("{}\n\n{}", self.system_prompt, &args.prompt);
+        let chats = match (
+            LlamaChatMessage::new("system".to_string(), self.system_prompt.clone()),
+            LlamaChatMessage::new("user".to_string(), args.prompt.clone()),
+        ) {
+            (Ok(system), Ok(user)) => Some(vec![system, user]),
+            (e1, e2) => {
+                tracing::warn!("cannot create chat messages: {:?}, {:?}", e1, e2);
+                None
+            }
+        };
+        let prompt = if let Some(vec) = chats {
+            match self.model.apply_chat_template(None, vec, true) {
+                Ok(v) => {
+                    tracing::debug!("applied chat template: {}", &v);
+                    v
+                }
+                Err(e) => {
+                    tracing::warn!("cannot apply chat template (use simple prompt): {:?}", e);
+                    format!("{}\n\n{}", self.system_prompt, &args.prompt)
+                }
+            }
+        } else {
+            format!("{}\n\n{}", self.system_prompt, &args.prompt)
+        };
+
         let n_len: i32 = args.sample_len;
         let mut history = Vec::<LlamaToken>::with_capacity(args.sample_len as usize);
 
