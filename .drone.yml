@@ -11,7 +11,7 @@ steps:
   - name: submodules
     image: gitea.toris.dev/servers/drone-git-ssh:0.0.4
     commands:
-      - cd github
+#      - cd github
       - git submodule update --init --recursive
   - name: test
     image: gitea.toris.dev/servers/rust-gpu-build:12.4.1-1
@@ -29,8 +29,8 @@ steps:
       - name: docker_sock
         path: /var/run/docker.sock
     commands:
-      - cd github
-      - cp dot.env .env
+#      - cd github
+#      - cp dot.env .env
       - /usr/bin/nvidia-smi
       - echo $PATH
       - rustup target add x86_64-unknown-linux-musl
@@ -66,7 +66,7 @@ steps:
   - name: submodules
     image: gitea.toris.dev/servers/drone-git-ssh:0.0.4
     commands:
-      - cd github
+#      - cd github
       - git submodule update --init --recursive
 
 # testing
@@ -130,7 +130,7 @@ steps:
   - name: submodules
     image: gitea.toris.dev/servers/drone-git-ssh:0.0.4
     commands:
-      - cd github
+#      - cd github
       - git submodule update --init --recursive
 
   - name: build
@@ -148,7 +148,7 @@ steps:
       - name: docker_sock
         path: /var/run/docker.sock
     commands:
-      - cd github
+#      - cd github
       - cargo clean
       - cargo build --release
 

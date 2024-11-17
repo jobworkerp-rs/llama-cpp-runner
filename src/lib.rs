@@ -101,10 +101,17 @@ impl PluginRunner for LlamaCppPlugin {
             let args = LlamaArg::decode(&mut Cursor::new(arg))
                 .map_err(|e| anyhow!("decode error: {}", e))?;
             tracing::debug!("LLMRunner run: {args:?}",);
-            let text = llama_model.run(args.into()).context("failed to decode")?;
+            let text = llama_model
+                .run(args.clone().into())
+                .context("failed to decode")?;
             tracing::debug!("END OF LLMRunner: {text:?}",);
+            let buf = LlamaArg {
+                prompt: text,
+                ..args
+            };
             // serialize and return
-            Ok(vec![text.bytes().collect()])
+            let bytes = buf.encode_to_vec();
+            Ok(vec![bytes])
         } else {
             Err(anyhow!("llama_model is not loaded"))
         }
@@ -120,7 +127,7 @@ impl PluginRunner for LlamaCppPlugin {
         include_str!("../protobuf/llama_cpp_arg.proto").to_string()
     }
     fn result_output_proto(&self) -> Option<String> {
-        Some("".to_string()) // string
+        Some(include_str!("../protobuf/llama_cpp_arg.proto").to_string()) // string
     }
     // if true, use job result of before job, else use job args from request
     fn use_job_result(&self) -> bool {
@@ -138,33 +145,47 @@ mod test {
     async fn test_plugin_runner() {
         tracing_subscriber::fmt::init();
         let env = "
-#LLAMA_MODEL=Llama-3-ELYZA-JP-8B-q4_k_m.gguf # Phi-3-medium-128k-instruct.Q4_K.gguf # Meta-Llama-3.1-8B-Instruct-Q4_K_L.gguf #llama-2-7b-chat.Q4_K_M.gguf
-#LLAMA_HF_REPO=elyza/Llama-3-ELYZA-JP-8B-GGUF # legraphista/Phi-3-medium-128k-instruct-IMat-GGUF # bartowski/Meta-Llama-3.1-8B-Instruct-GGUF #TheBloke/Llama-2-7B-Chat-GGUF
+##LLAMA_MODEL=Llama-3-ELYZA-JP-8B-q4_k_m.gguf # Phi-3-medium-128k-instruct.Q4_K.gguf # Meta-Llama-3.1-8B-Instruct-Q4_K_L.gguf #llama-2-7b-chat.Q4_K_M.gguf
+##LLAMA_HF_REPO=elyza/Llama-3-ELYZA-JP-8B-GGUF # legraphista/Phi-3-medium-128k-instruct-IMat-GGUF # bartowski/Meta-Llama-3.1-8B-Instruct-GGUF #TheBloke/Llama-2-7B-Chat-GGUF
 LLAMA_MODEL=tokyotech-llm-Llama-3.1-Swallow-70B-Instruct-v0.1-Q4_K_M.gguf # Phi-3-medium-128k-instruct.Q4_K.gguf # Meta-Llama-3.1-8B-Instruct-Q4_K_L.gguf #llama-2-7b-chat.Q4_K_M.gguf
 LLAMA_HF_REPO=mmnga/tokyotech-llm-Llama-3.1-Swallow-70B-Instruct-v0.1-gguf # legraphista/Phi-3-medium-128k-instruct-IMat-GGUF # bartowski/Meta-Llama-3.1-8B-Instruct-GGUF #TheBloke/Llama-2-7B-Chat-GGUF
+#LLAMA_MODEL=c4ai-command-r-plus-08-2024-Q4_K_M-00001-of-00002.gguf,c4ai-command-r-plus-08-2024-Q4_K_M-00002-of-00002.gguf # Phi-3-medium-128k-instruct.Q4_K.gguf # Meta-Llama-3.1-8B-Instruct-Q4_K_L.gguf #llama-2-7b-chat.Q4_K_M.gguf
+#LLAMA_HF_REPO=grapevine-AI/c4ai-command-r-plus-08-2024-gguf # legraphista/Phi-3-medium-128k-instruct-IMat-GGUF # bartowski/Meta-Llama-3.1-8B-Instruct-GGUF #TheBloke/Llama-2-7B-Chat-GGUF
 
 LLAMA_DISABLE_GPU=true
 LLAMA_SEED=1024
 LLAMA_THREADS=8
 LLAMA_USE_FLASH_ATTENTION=false
-LLAMA_SYSTEM_PROMPT=次の英語の文章を日本語に翻訳してください。翻訳結果のみを出力してください
+LLAMA_SYSTEM_PROMPT=次の文章を日本語に翻訳してください。翻訳結果のみを出力してください
 ";
         dotenvy::from_read(env.as_bytes()).ok();
 
         let user_prompt = r#"
-There have been many moments of extreme danger over the past year. This is the worst.
-In the past seven days, Hezbollah leader Hassan Nasrallah has been assassinated, Israel has launched a ground invasion of Lebanon, and Iran has fired nearly 200 ballistic missiles at targets across Israel.
-Western and regional powers - led by the US - have pushed for de-escalation. The UN Security Council called for an "immediate end" to hostilities and the G7, which includes the US, UK and Germany, has called for “restraint”.
-But so far those efforts have failed - and the Middle East stands closer than ever to all-out war.
-Here’s how the last week played out.
-"#;
+Daily Submission Limit Change
+Hey ARC Prize contestants!
+
+Greg from the ARC Prize team here. We are reducing the daily submission limit from 5 to 3 submissions per day.
+
+Why we're making this change:
+
+Discourage test probing: We want to ensure that the competition remains focused on developing robust, generalizable solutions rather than overfitting to the private evaluation data through repeated submissions.
+Maintain competition integrity: This change helps mitigate the risk of model selection bias, where participants might inadvertently learn enough about the private test set through frequent submissions to gain an unfair advantage.
+Encourage thoughtful iterations: By limiting submissions, we hope to promote deliberate and well-considered improvements to your models.
+What this means for you:
+
+You will now have 3 submission opportunities per day, not 5.
+This change reduces the total potential submissions over the remaining competition period by approximately 40%.
+We encourage you to use the public evaluation set for more frequent testing and iteration.
+We believe this change strikes a reasonable balance between allowing for necessary iterations and maintaining the integrity of the challenge. It also aligns our competition more closely with best practices in machine learning competitions.
+
+If you want to test more frequently we’ve made a secondary leaderboard, ARC-AGI-Pub, just for this check out our launch post for more information.
+
+We appreciate your understanding and continued participation in ARC Prize. If you have any questions, you can reach us at: team@arcprize.org
+
+Good luck in the competition and in advancing AI research!
+        "#;
         let prompt = user_prompt.to_string();
 
-        //         let prompt = format!(
-        //             "<|user|>
-        // {user_prompt}<|end|>
-        // <|assistant|>"
-        //         );
         let mut plugin = LlamaCppPlugin::new();
         plugin
             .load_model_from_env()
@@ -182,8 +203,10 @@ Here’s how the last week played out.
         let mut buf = Vec::with_capacity(request.encoded_len());
         request.encode(&mut buf).unwrap();
         let res = plugin.run(buf).expect("failed to run plugin");
-        let text = String::from_utf8_lossy(&res[0]);
-        println!("response: {:?}", text);
-        assert!(text.len() > user_prompt.len() && text.len() < 2048);
+        let res = LlamaArg::decode(&mut Cursor::new(res[0].clone()))
+            .map_err(|e| anyhow!("decode error: {}", e))
+            .unwrap();
+        println!("response: {:?}", res.prompt);
+        assert!(res.prompt.len() > user_prompt.len() && res.prompt.len() < 2048);
     }
 }
