@@ -145,10 +145,10 @@ mod test {
     async fn test_plugin_runner() {
         tracing_subscriber::fmt::init();
         let env = "
-##LLAMA_MODEL=Llama-3-ELYZA-JP-8B-q4_k_m.gguf # Phi-3-medium-128k-instruct.Q4_K.gguf # Meta-Llama-3.1-8B-Instruct-Q4_K_L.gguf #llama-2-7b-chat.Q4_K_M.gguf
-##LLAMA_HF_REPO=elyza/Llama-3-ELYZA-JP-8B-GGUF # legraphista/Phi-3-medium-128k-instruct-IMat-GGUF # bartowski/Meta-Llama-3.1-8B-Instruct-GGUF #TheBloke/Llama-2-7B-Chat-GGUF
-LLAMA_MODEL=tokyotech-llm-Llama-3.1-Swallow-70B-Instruct-v0.1-Q4_K_M.gguf # Phi-3-medium-128k-instruct.Q4_K.gguf # Meta-Llama-3.1-8B-Instruct-Q4_K_L.gguf #llama-2-7b-chat.Q4_K_M.gguf
-LLAMA_HF_REPO=mmnga/tokyotech-llm-Llama-3.1-Swallow-70B-Instruct-v0.1-gguf # legraphista/Phi-3-medium-128k-instruct-IMat-GGUF # bartowski/Meta-Llama-3.1-8B-Instruct-GGUF #TheBloke/Llama-2-7B-Chat-GGUF
+LLAMA_MODEL=Llama-3-ELYZA-JP-8B-q4_k_m.gguf # Phi-3-medium-128k-instruct.Q4_K.gguf # Meta-Llama-3.1-8B-Instruct-Q4_K_L.gguf #llama-2-7b-chat.Q4_K_M.gguf
+LLAMA_HF_REPO=elyza/Llama-3-ELYZA-JP-8B-GGUF # legraphista/Phi-3-medium-128k-instruct-IMat-GGUF # bartowski/Meta-Llama-3.1-8B-Instruct-GGUF #TheBloke/Llama-2-7B-Chat-GGUF
+#LLAMA_MODEL=tokyotech-llm-Llama-3.1-Swallow-70B-Instruct-v0.1-Q4_K_M.gguf # Phi-3-medium-128k-instruct.Q4_K.gguf # Meta-Llama-3.1-8B-Instruct-Q4_K_L.gguf #llama-2-7b-chat.Q4_K_M.gguf
+#LLAMA_HF_REPO=mmnga/tokyotech-llm-Llama-3.1-Swallow-70B-Instruct-v0.1-gguf # legraphista/Phi-3-medium-128k-instruct-IMat-GGUF # bartowski/Meta-Llama-3.1-8B-Instruct-GGUF #TheBloke/Llama-2-7B-Chat-GGUF
 #LLAMA_MODEL=c4ai-command-r-plus-08-2024-Q4_K_M-00001-of-00002.gguf,c4ai-command-r-plus-08-2024-Q4_K_M-00002-of-00002.gguf # Phi-3-medium-128k-instruct.Q4_K.gguf # Meta-Llama-3.1-8B-Instruct-Q4_K_L.gguf #llama-2-7b-chat.Q4_K_M.gguf
 #LLAMA_HF_REPO=grapevine-AI/c4ai-command-r-plus-08-2024-gguf # legraphista/Phi-3-medium-128k-instruct-IMat-GGUF # bartowski/Meta-Llama-3.1-8B-Instruct-GGUF #TheBloke/Llama-2-7B-Chat-GGUF
 
