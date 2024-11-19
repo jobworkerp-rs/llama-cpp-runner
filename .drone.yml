@@ -69,28 +69,27 @@ steps:
 #      - cd github
       - git submodule update --init --recursive
 
-# testing
-#  - name: test
-#    image: gitea.toris.dev/servers/rust-gpu-build:12.4.1-1
-#    environment:
-#      CARGO_HOME: /usr/local/cargo
-#      NVIDIA_VISIBLE_DEVICES: all
-#      NVIDIA_DRIVER_CAPABILITIES: compute,utility
-#    volumes:
-#      - name: cargo_git
-#        path: /usr/local/cargo/git
-#      - name: cargo_registry
-#        path: /usr/local/cargo/registry
-#      - name: apt_cache
-#        path: /var/cache/apt
-#      - name: docker_sock
-#        path: /var/run/docker.sock
-#    commands:
-#      #      - cp dot.env .env
-#      - rustup target add x86_64-unknown-linux-musl
-#      - cargo clean
-#      - cargo build --release
-#      - cargo test --release -- --test-threads=1
+  # release build(cuda)
+  - name: build
+    image: gitea.toris.dev/servers/rust-gpu-build:12.4.1-1
+    environment:
+      CARGO_HOME: /usr/local/cargo
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+    volumes:
+      - name: cargo_git
+        path: /usr/local/cargo/git
+      - name: cargo_registry
+        path: /usr/local/cargo/registry
+      - name: apt_cache
+        path: /var/cache/apt
+      - name: docker_sock
+        path: /var/run/docker.sock
+    commands:
+      #      - cp dot.env .env
+      - rustup target add x86_64-unknown-linux-musl
+      - cargo clean
+      - cargo build --release --features cuda
 
   - name: tagging
     image: gitea.toris.dev/servers/drone-git-ssh:0.0.4
@@ -99,6 +98,27 @@ steps:
       - git remote set-url origin $(git remote get-url origin | sed -e 's/^https:\\/\\/gitea/git@gitea-ssh/' | sed -e 's/\(.*\)\\/\(.*\)\\/\(.*\)/\1:\2\\/\3/')
       - git tag ${DRONE_TAG} # $TAG_VERSION
       - git push origin --tags
+
+  # for jobworkerp plugin
+  - name: publish_plugin
+    image: gitea.toris.dev/servers/drone-git-ssh:0.0.4
+    commands:
+    # https://stackoverflow.com/questions/66366582/github-unexpected-disconnect-while-reading-sideband-packet
+    - git config --global http.postBuffer 157286400
+    - git config --global http.version HTTP/1.1
+    - git clone --depth 1 ssh://git@gitea-ssh.toris.dev/jobworkerp-rs/jobworkerp-plugins.git
+    - cd jobworkerp-plugins
+    - git checkout origin/main -- ./VERSION
+    - git reset --soft origin/main
+    - cp ../target/release/lib*plugin.so runner/
+    - git add .
+    - test 0 -eq $(git diff --staged | wc -l) && exit
+    - echo ${DRONE_TAG} > VERSION
+    - git add ./VERSION
+    - git commit -m "Publish plugin ${DRONE_TAG}"
+    - git push origin main
+    - git tag ${DRONE_TAG}
+    - git push origin --tags
 
 volumes:
   - name: cargo_git
@@ -121,37 +141,37 @@ trigger:
     - release
 #    - push
 
----
-kind: pipeline
-type: docker
-name: publish_plugin
-
-steps:
-  - name: submodules
-    image: gitea.toris.dev/servers/drone-git-ssh:0.0.4
-    commands:
-#      - cd github
-      - git submodule update --init --recursive
-
-  - name: build
-    image: gitea.toris.dev/servers/rust-gpu-build:12.4.1-1
-    environment:
-      CARGO_HOME: /usr/local/cargo
-      NVIDIA_VISIBLE_DEVICES: all
-#      NVIDIA_DRIVER_CAPABILITIES: compute,utility
-      NVIDIA_DISABLE_REQUIRE: true
-    volumes:
-      - name: cargo_git
-        path: /usr/local/cargo/git
-      - name: cargo_registry
-        path: /usr/local/cargo/registry
-      - name: docker_sock
-        path: /var/run/docker.sock
-    commands:
-#      - cd github
-      - cargo clean
-      - cargo build --release
-
+#---
+#kind: pipeline
+#type: docker
+#name: publish_plugin
+#
+#steps:
+#  - name: submodules
+#    image: gitea.toris.dev/servers/drone-git-ssh:0.0.4
+#    commands:
+##      - cd github
+#      - git submodule update --init --recursive
+#
+#  - name: build
+#    image: gitea.toris.dev/servers/rust-gpu-build:12.4.1-1
+#    environment:
+#      CARGO_HOME: /usr/local/cargo
+#      NVIDIA_VISIBLE_DEVICES: all
+##      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+#      NVIDIA_DISABLE_REQUIRE: true
+#    volumes:
+#      - name: cargo_git
+#        path: /usr/local/cargo/git
+#      - name: cargo_registry
+#        path: /usr/local/cargo/registry
+#      - name: docker_sock
+#        path: /var/run/docker.sock
+#    commands:
+##      - cd github
+#      - cargo clean
+#      - cargo build --release --features cuda
+#
 #  - name: publish_plugin_prepare_upload
 #    image: gitea.toris.dev/servers/drone-git-ssh:0.0.4
 #    commands:
@@ -189,21 +209,22 @@ steps:
 #      - md5
 #      - sha1
 #      - sha256
-
-volumes:
-- name: cargo_git
-  host:
-    path: /var/lib/drone/tmp/cargo/git
-- name: cargo_registry
-  host:
-    path: /var/lib/drone/tmp/cargo/registry
-- name: apt_cache
-  host:
-    path: /var/lib/drone/tmp/cache/apt
-- name: docker_sock
-  host:
-    path: /var/run/docker.sock
-
-trigger:
-  event:
-    - tag
+#
+#volumes:
+#- name: cargo_git
+#  host:
+#    path: /var/lib/drone/tmp/cargo/git
+#- name: cargo_registry
+#  host:
+#    path: /var/lib/drone/tmp/cargo/registry
+#- name: apt_cache
+#  host:
+#    path: /var/lib/drone/tmp/cache/apt
+#- name: docker_sock
+#  host:
+#    path: /var/run/docker.sock
+#
+#trigger:
+#  event:
+#    - tag
+#
