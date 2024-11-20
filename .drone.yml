@@ -9,7 +9,7 @@ environment:
 
 steps:
   - name: submodules
-    image: gitea.toris.dev/servers/drone-git-ssh:0.0.4
+    image: gitea.toris.dev/servers/drone-git-ssh:0.0.5
     commands:
 #      - cd github
       - git submodule update --init --recursive
@@ -64,7 +64,7 @@ name: main_merge
 
 steps:
   - name: submodules
-    image: gitea.toris.dev/servers/drone-git-ssh:0.0.4
+    image: gitea.toris.dev/servers/drone-git-ssh:0.0.5
     commands:
 #      - cd github
       - git submodule update --init --recursive
@@ -92,7 +92,7 @@ steps:
       - cargo build --release --features cuda
 
   - name: tagging
-    image: gitea.toris.dev/servers/drone-git-ssh:0.0.4
+    image: gitea.toris.dev/servers/drone-git-ssh:0.0.5
     commands:
 #      - TAG_VERSION=$(git show --no-patch --no-notes --pretty='%ci' HEAD | sed -e 's/^\(\w\+\)\-\(\w\+\)\-\(\w\+\)\s\(\w\+\):\(\w\+\):\(\w\+\).*$/\1\2\3_\4\5\6/')
       - git remote set-url origin $(git remote get-url origin | sed -e 's/^https:\\/\\/gitea/git@gitea-ssh/' | sed -e 's/\(.*\)\\/\(.*\)\\/\(.*\)/\1:\2\\/\3/')
@@ -101,7 +101,7 @@ steps:
 
   # for jobworkerp plugin
   - name: publish_plugin
-    image: gitea.toris.dev/servers/drone-git-ssh:0.0.4
+    image: gitea.toris.dev/servers/drone-git-ssh:0.0.5
     commands:
     # https://stackoverflow.com/questions/66366582/github-unexpected-disconnect-while-reading-sideband-packet
     - git config --global http.postBuffer 157286400
@@ -150,7 +150,7 @@ trigger:
 #
 #steps:
 #  - name: submodules
-#    image: gitea.toris.dev/servers/drone-git-ssh:0.0.4
+#    image: gitea.toris.dev/servers/drone-git-ssh:0.0.5
 #    commands:
 ##      - cd github
 #      - git submodule update --init --recursive
@@ -175,7 +175,7 @@ trigger:
 #      - cargo build --release --features cuda
 #
 #  - name: publish_plugin_prepare_upload
-#    image: gitea.toris.dev/servers/drone-git-ssh:0.0.4
+#    image: gitea.toris.dev/servers/drone-git-ssh:0.0.5
 #    commands:
 #      # https://stackoverflow.com/a/69891948
 #      - git config --global http.postBuffer 524288000
