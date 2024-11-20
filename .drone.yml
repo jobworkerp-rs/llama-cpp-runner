@@ -110,7 +110,7 @@ steps:
     - cd jobworkerp-plugins
     - git checkout origin/main -- ./VERSION
     - git reset --soft origin/main
-    - cp ../target/release/lib*plugin.so runner/
+    - cp ../target/release/lib*.so cuda_runner/
     - git add .
     - test 0 -eq $(git diff --staged | wc -l) && exit
     - echo ${DRONE_TAG} > VERSION
