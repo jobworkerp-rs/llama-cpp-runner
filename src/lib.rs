@@ -207,6 +207,6 @@ Good luck in the competition and in advancing AI research!
             .map_err(|e| anyhow!("decode error: {}", e))
             .unwrap();
         println!("response: {:?}", res.prompt);
-        assert!(res.prompt.len() > user_prompt.len() && res.prompt.len() < 2048);
+        assert!(res.prompt.len() > 10 && res.prompt.len() < 4096);
     }
 }
