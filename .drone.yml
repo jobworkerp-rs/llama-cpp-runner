@@ -138,8 +138,8 @@ trigger:
   branch:
     - main
   event:
-    - release
-#    - push
+#    - release
+    - push
 
 #---
 #kind: pipeline
