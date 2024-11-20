@@ -106,8 +106,10 @@ steps:
     # https://stackoverflow.com/questions/66366582/github-unexpected-disconnect-while-reading-sideband-packet
     - git config --global http.postBuffer 157286400
     - git config --global http.version HTTP/1.1
-    - git clone --depth 1 ssh://git@gitea-ssh.toris.dev/jobworkerp-rs/jobworkerp-plugins.git
+    - git clone ssh://git@gitea-ssh.toris.dev/jobworkerp-rs/jobworkerp-plugins.git
     - cd jobworkerp-plugins
+    - git lfs install
+    - git lfs pull
     - git checkout origin/main -- ./VERSION
     - git reset --soft origin/main
     - cp ../target/release/lib*.so cuda_runner/
