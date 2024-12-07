@@ -81,7 +81,7 @@ pub struct LlamaModelConfig {
     threads: Option<u32>,
     // number of threads to use during batch and prompt processing (default: use all available threads)
     threads_batch: Option<u32>,
-    // size of the prompt context (default: 2048)
+    // size of the prompt context (default: model size)
     ctx_size: Option<NonZeroU32>,
     // use flash attention (default true)
     use_flash_attention: Option<bool>,
@@ -248,6 +248,10 @@ impl LlamaModelWrapper {
         })
     }
 
+    pub fn set_system_prompt(&mut self, prompt: &str) {
+        self.system_prompt = prompt.to_string();
+    }
+
     pub fn run(&mut self, args: InferenceArgs) -> Result<String> {
         if args.prompt.is_empty() {
             bail!("prompt is empty")
@@ -269,7 +273,7 @@ impl LlamaModelWrapper {
 
         // create a llama_batch with size 512
         // we use this object to submit token data for decoding
-        let mut batch = LlamaBatch::new(512, 1);
+        let mut batch = LlamaBatch::new(n_len as usize, 1);
 
         let last_index: i32 = (tokens_list.len() - 1) as i32;
         for (i, token) in (0_i32..).zip(tokens_list.into_iter()) {

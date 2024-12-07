@@ -7,7 +7,7 @@ edition = "2021"
 #name = "sample"
 
 [lib]
-crate-type = ["dylib"]
+crate-type = ["dylib", "rlib"]
 #crate-type = ["cdylib"]
 
 
@@ -17,26 +17,27 @@ command-utils = { git = "https://github.com/sutr-app/command-utils", branch = "m
 anyhow = "1"
 async-trait = { version = "0.1" }
 base64 = { version = "0.22" }
-bindgen = "0.70"
-cc = "1.1"
+#bindgen = "0.70"
+#cc = "1.1"
 clap = { version = "4.5", features = ["derive"] }
-criterion = "0.5"
+#criterion = "0.5"
 dotenvy = { version = "0.15" }
 encoding_rs = "0.8"
 envy = { version = "0.4" }
 hf-hub = { version = "0.3" }
-llama-cpp-2 = { version = "0.1.83" }
+#llama-cpp-2 = { version = "0.1.83" }
+llama-cpp-2 = { git = "https://github.com/utilityai/llama-cpp-rs", rev = "2822e3ae86a66b571cc6de371feefb938f4f1da7" }
 log = { version = "0.4" }
 once_cell = { version = "1" }
 #pprof = "0.13.0"
 prost = { version = "0.13" }
 rand = { version = "0.8" }
-safetensors = { version = "0.4" }
-scopeguard = { version = "1" }
+#safetensors = { version = "0.4" }
+#scopeguard = { version = "1" }
 serde = { version = "1" }
 serde_json = { version = "1" }
 thiserror = { version = "2" }
-tokenizers = { version = "0.20" }
+#tokenizers = { version = "0.20" }
 tokio = { version = "1" }
 tracing = { version = "0.1" }
 tracing-subscriber = { version = "0.3" }

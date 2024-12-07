@@ -76,6 +76,11 @@ impl LlamaCppPlugin {
         self.llama_model = Some(LlamaModelWrapper::new(Self::load_config_from_env()?)?);
         Ok(())
     }
+    pub fn set_system_prompt(&mut self, system_prompt: &str) {
+        if let Some(llama_model) = self.llama_model.as_mut() {
+            llama_model.set_system_prompt(system_prompt);
+        }
+    }
 }
 
 impl Default for LlamaCppPlugin {
