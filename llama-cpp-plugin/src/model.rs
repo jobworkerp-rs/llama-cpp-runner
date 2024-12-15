@@ -1,5 +1,6 @@
 use anyhow::{bail, Context, Result};
 use hf_hub::api::sync::ApiBuilder;
+use jobworkerp_llama_protobuf::protobuf::llama_cpp::{LlamaArg, LlamaOperation};
 use llama_cpp_2::{
     context::{params::LlamaContextParams, LlamaContext},
     ggml_time_us,
@@ -9,12 +10,11 @@ use llama_cpp_2::{
         params::{kv_overrides::ParamOverrideValue, LlamaModelParams},
         AddBos, LlamaChatMessage, LlamaModel, Special,
     },
-    token::{data_array::LlamaTokenDataArray, LlamaToken},
+    sampling::LlamaSampler,
+    token::LlamaToken,
 };
 use serde::{Deserialize, Serialize};
 use std::{ffi::CString, num::NonZeroU32, path::PathBuf, time::Duration};
-
-use crate::protobuf::llama_cpp::{LlamaArg, LlamaOperation};
 
 /// for deserialization.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -75,7 +75,8 @@ pub struct LlamaModelConfig {
     key_value_overrides: Option<Vec<(String, ParamOverrideValueWrapper)>>,
     /// Disable offloading layers to the gpu
     disable_gpu: bool,
-    // RNG seed (default: 1234)
+    // RNG seed (default: 1234) TODO
+    #[allow(unused)]
     seed: Option<u32>,
     // number of threads to use during generation (default: use all available threads)
     threads: Option<u32>,
@@ -96,7 +97,7 @@ impl From<LlamaOperation> for LlamaModelConfig {
         Self {
             model: op.model,
             hf_repo: op.hf_repo,
-            key_value_overrides: None,
+            key_value_overrides: None, // TODO
             // op.key_value_overrides.map(|v| {
             //     v.into_iter()
             //         .map(|(k, v)| (k, v.into()))
@@ -231,7 +232,7 @@ impl LlamaModelWrapper {
         // initialize the context
         let mut ctx_params = LlamaContextParams::default()
             .with_n_ctx(config.ctx_size)
-            .with_seed(config.seed.unwrap_or(1234))
+            // .with_seed(config.seed.unwrap_or(1234))
             .with_flash_attention(config.use_flash_attention.unwrap_or(true));
         if let Some(threads) = config.threads {
             ctx_params = ctx_params.with_n_threads(threads as i32);
@@ -266,14 +267,16 @@ impl LlamaModelWrapper {
             .model
             .str_to_token(prompt, AddBos::Always)
             .with_context(|| format!("failed to tokenize {prompt}"))?;
+        let total_len = tokens_list.len() as i32 + n_len;
 
-        self.check_token_length(&tokens_list, ctx, n_len)?;
+        self.check_token_length(&tokens_list, ctx, total_len)?;
 
         // print the prompt token-by-token
 
         // create a llama_batch with size 512
         // we use this object to submit token data for decoding
-        let mut batch = LlamaBatch::new(n_len as usize, 1);
+        let mut batch = LlamaBatch::new(7542, 1);
+        // let mut batch = LlamaBatch::new(total_len as usize, 1);
 
         let last_index: i32 = (tokens_list.len() - 1) as i32;
         for (i, token) in (0_i32..).zip(tokens_list.into_iter()) {
@@ -309,38 +312,38 @@ impl LlamaModelWrapper {
         Ok(())
     }
 
-    #[inline]
-    fn setup_candidates(
-        ctx: &mut LlamaContext,
-        candidates: &mut LlamaTokenDataArray,
-        history: &[LlamaToken],
-        args: &InferenceArgs,
-    ) -> Result<()> {
-        // setup sampler
-        if let Some(penalty) = args.repeat_penalty.as_ref() {
-            let repeat_last_n = args.repeat_last_n.unwrap_or(8) as usize;
-            candidates.sample_repetition_penalty(
-                Some(ctx),
-                history,
-                repeat_last_n,
-                *penalty,
-                0.0, // no frequency penalty
-                0.0, // no present penalty
-            );
-        }
-        // sampler.push_step(&|c, _| c.sample_top_k(Some(ctx), 40, 1));
-        // sampler.push_step(&|c, _| c.sample_tail_free(Some(ctx), 1.0, 1));
-        // sampler.push_step(&|c, _| c.sample_typical(Some(ctx), 1.0, 1));
-        if let Some(top_p) = args.top_p.as_ref() {
-            let top_p = *top_p as f32;
-            candidates.sample_top_p(Some(ctx), top_p, 1);
-        }
-        // sampler.push_step(&|c, _| c.sample_min_p(Some(ctx), 0.05, 1));
-        if let Some(temperature) = args.temperature {
-            candidates.sample_temp(Some(ctx), temperature as f32);
-        }
-        Ok(())
-    }
+    // #[inline]
+    // fn setup_candidates(
+    //     ctx: &mut LlamaContext,
+    //     candidates: &mut LlamaTokenDataArray,
+    //     history: &[LlamaToken],
+    //     args: &InferenceArgs,
+    // ) -> Result<()> {
+    //     // // setup sampler
+    //     // if let Some(penalty) = args.repeat_penalty.as_ref() {
+    //     //     let repeat_last_n = args.repeat_last_n.unwrap_or(8) as usize;
+    //     //     candidates.sample_repetition_penalty(
+    //     //         Some(ctx),
+    //     //         history,
+    //     //         repeat_last_n,
+    //     //         *penalty,
+    //     //         0.0, // no frequency penalty
+    //     //         0.0, // no present penalty
+    //     //     );
+    //     // }
+    //     // // sampler.push_step(&|c, _| c.sample_top_k(Some(ctx), 40, 1));
+    //     // // sampler.push_step(&|c, _| c.sample_tail_free(Some(ctx), 1.0, 1));
+    //     // // sampler.push_step(&|c, _| c.sample_typical(Some(ctx), 1.0, 1));
+    //     // if let Some(top_p) = args.top_p.as_ref() {
+    //     //     let top_p = *top_p as f32;
+    //     //     candidates.sample_top_p(Some(ctx), top_p, 1);
+    //     // }
+    //     // // sampler.push_step(&|c, _| c.sample_min_p(Some(ctx), 0.05, 1));
+    //     // if let Some(temperature) = args.temperature {
+    //     //     candidates.sample_temp(Some(ctx), temperature as f32);
+    //     // }
+    //     Ok(())
+    // }
 
     fn decode(&mut self, args: InferenceArgs) -> Result<String> {
         let chats = match (
@@ -369,7 +372,7 @@ impl LlamaModelWrapper {
         };
 
         let n_len: i32 = args.sample_len;
-        let mut history = Vec::<LlamaToken>::with_capacity(args.sample_len as usize);
+        // let mut history = Vec::<LlamaToken>::with_capacity(args.sample_len as usize);
 
         let mut ctx: LlamaContext = self
             .model
@@ -396,36 +399,61 @@ impl LlamaModelWrapper {
         let mut output_buffer = String::with_capacity((n_len * 4) as usize);
         // not output the prompt
         // output_buffer.push_str(prompt.as_str());
+        let mut sampler =
+            LlamaSampler::chain_simple([LlamaSampler::dist(1234), LlamaSampler::greedy()]);
 
         while n_cur <= n_len {
             // sample the next token
             {
-                let candidates = ctx.candidates_ith(batch.n_tokens() - 1);
+                let token = sampler.sample(&ctx, batch.n_tokens() - 1);
 
-                let mut candidates_p = LlamaTokenDataArray::from_iter(candidates, false);
+                sampler.accept(token);
 
-                Self::setup_candidates(&mut ctx, &mut candidates_p, &history, &args)?;
-                // sample the most likely token
-                candidates_p.sample_softmax(Some(&mut ctx));
-                let new_token = candidates_p.data[0];
-                let new_token_id = new_token.id();
                 // is it an end of stream?
-                if self.model.is_eog_token(new_token_id) {
+                if self.model.is_eog_token(token) {
+                    eprintln!();
                     break;
                 }
-                history.push(new_token_id);
 
-                let output_bytes = self.model.token_to_bytes(new_token_id, Special::Tokenize)?;
+                let output_bytes = self.model.token_to_bytes(token, Special::Tokenize)?;
                 // use `Decoder.decode_to_string()` to avoid the intermediate buffer
                 let mut output_string = String::with_capacity(32);
                 let _decode_result =
                     decoder.decode_to_string(&output_bytes, &mut output_string, false);
+                // output_buffer.push_str(&output_string);
                 // print!("{output_string}");
-                output_buffer.push_str(&output_string);
                 // std::io::stdout().flush()?;
 
                 batch.clear();
-                batch.add(new_token_id, n_cur, &[0], true)?;
+                batch.add(token, n_cur, &[0], true)?;
+
+                // let candidates = ctx.candidates_ith(batch.n_tokens() - 1);
+
+                // let mut candidates_p = LlamaTokenDataArray::from_iter(candidates, false);
+
+                // Self::setup_candidates(&mut ctx, &mut candidates_p, &history, &args)?;
+                // // sample the most likely token
+                // // candidates_p.sample_softmax(Some(&mut ctx));
+                // candidates_p.sample_token_greedy();
+                // let new_token = candidates_p.data[0];
+                // let new_token_id = new_token.id();
+                // // is it an end of stream?
+                // if self.model.is_eog_token(new_token_id) {
+                //     break;
+                // }
+                // history.push(new_token_id);
+
+                // let output_bytes = self.model.token_to_bytes(new_token_id, Special::Tokenize)?;
+                // // use `Decoder.decode_to_string()` to avoid the intermediate buffer
+                // let mut output_string = String::with_capacity(32);
+                // let _decode_result =
+                //     decoder.decode_to_string(&output_bytes, &mut output_string, false);
+                // // print!("{output_string}");
+                output_buffer.push_str(&output_string);
+                // // std::io::stdout().flush()?;
+
+                // batch.clear();
+                // batch.add(new_token_id, n_cur, &[0], true)?;
             }
 
             n_cur += 1;

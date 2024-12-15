@@ -47,8 +47,8 @@ struct Args {
     // #[cfg(any(feature = "cuda", feature = "vulkan"))]
     #[clap(long)]
     disable_gpu: bool,
-    #[arg(short = 's', long, help = "RNG seed (default: 1234)")]
-    seed: Option<u32>,
+    // #[arg(short = 's', long, help = "RNG seed (default: 1234)")]
+    // seed: Option<u32>,
     #[arg(
         short = 't',
         long,
@@ -127,7 +127,7 @@ fn main() -> Result<()> {
         // #[cfg(any(feature = "cuda", feature = "vulkan"))]
         disable_gpu,
         key_value_overrides,
-        seed,
+        // seed,
         threads,
         threads_batch,
         ctx_size,
@@ -174,9 +174,9 @@ fn main() -> Result<()> {
         .with_context(|| "unable to load model")?;
 
     // initialize the context
-    let mut ctx_params = LlamaContextParams::default()
-        .with_n_ctx(ctx_size.or(Some(NonZeroU32::new(2048).unwrap())))
-        .with_seed(seed.unwrap_or(1234));
+    let mut ctx_params =
+        LlamaContextParams::default().with_n_ctx(ctx_size.or(Some(NonZeroU32::new(2048).unwrap())));
+    // .with_seed(seed.unwrap_or(1234));
     if let Some(threads) = threads {
         ctx_params = ctx_params.with_n_threads(threads);
     }
@@ -251,10 +251,11 @@ either reduce n_len or increase n_ctx"
         {
             let candidates = ctx.candidates_ith(batch.n_tokens() - 1);
 
-            let candidates_p = LlamaTokenDataArray::from_iter(candidates, false);
+            let mut candidates_p = LlamaTokenDataArray::from_iter(candidates, false);
 
             // sample the most likely token
-            let new_token_id = ctx.sample_token_greedy(candidates_p);
+            // candidates_p.sample_token_greedy();
+            let new_token_id = candidates_p.sample_token_greedy();
 
             // is it an end of stream?
             if new_token_id == model.token_eos() {

@@ -1,24 +1,29 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result};
 use command_utils::util::option::Exists;
-use jobworkerp_llama_cpp_plugin::protobuf::llama_cpp::LlamaArg;
-use jobworkerp_llama_cpp_plugin::LlamaCppPlugin;
-use jobworkerp_llama_cpp_plugin::PluginRunner;
-use prost::Message;
-use std::env;
+use ollama_rs::{
+    generation::completion::{request::GenerationRequest, GenerationResponseStream},
+    Ollama,
+};
 use std::fs;
-use std::io::Cursor;
 use std::path::{Path, PathBuf};
+use tokio::io::{stdout, AsyncWriteExt};
+use tokio_stream::StreamExt;
 use tracing::Level;
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     command_utils::util::tracing::tracing_init_test(Level::INFO);
     dotenvy::dotenv().ok();
 
-    let args: Vec<String> = env::args().collect();
-    if args.len() < 2 {
-        println!("Usage: {} <directory_path> [separator]", args[0]);
-        std::process::exit(1);
-    }
+    // let args: Vec<String> = env::args().collect();
+    // if args.len() < 2 {
+    //     println!("Usage: {} <directory_path> [separator]", args[0]);
+    //     std::process::exit(1);
+    // }
+    let args = vec![
+        "summary".to_string(),
+        "/Users/sutr/mnt/Documents/obsidian/日記/2024/11/".to_string(),
+    ];
 
     let directory = &args[1];
     let separator = args.get(2).map(|s| s.as_str()).unwrap_or("\n---\n");
@@ -28,31 +33,32 @@ fn main() -> Result<()> {
 
     let content_len = combined_content.len();
     println!("combined_content length: {}", &content_len);
-    let mut plugin = LlamaCppPlugin::new();
-    plugin
-        .load_model_from_env()
-        .expect("failed to load model from env");
-    let system_prompt = "以下の文章は、ある特定の年月の日記(Markdownファイル)を結合して作成された文章です。実施したこと、良かった点、改善したい点をそれぞれまとめてください。";
-    plugin.set_system_prompt(system_prompt);
 
-    let request = LlamaArg {
-        prompt: combined_content,
-        sample_len: (content_len ) as u32,
-        temperature: Some(0.8),
-        top_p: Some(0.9),
-        repeat_penalty: Some(0.9),
-        repeat_last_n: Some(8),
-        seed: Some(32),
-        need_print: true,
-    };
-    let mut buf = Vec::with_capacity(request.encoded_len());
-    request.encode(&mut buf).unwrap();
-    let res = plugin.run(buf).expect("failed to run plugin");
-    let res = LlamaArg::decode(&mut Cursor::new(res[0].clone()))
-        .map_err(|e| anyhow!("decode error: {}", e))
-        .unwrap();
+    let system_prompt = 
+    "以下の文章は、ある特定の年月の日記(Markdownファイル)を結合したものです。その月のまとめとして日記の内容の要約をしてください。";
 
-    println!("response: {:?}", res.prompt);
+    let ollama = Ollama::new("http://localhost".to_string(), 11434);
+    // let mut context: Option<GenerationContext> = None;
+
+    let request = GenerationRequest::new("llama3.3:70b".into(), combined_content)
+        .system(system_prompt.to_string());
+
+    // if let Some(context) = context.clone() {
+    //     request = request.context(context);
+    // }
+    let mut stream: GenerationResponseStream = ollama.generate_stream(request).await?;
+
+    let mut stdout = stdout();
+    while let Some(Ok(res)) = stream.next().await {
+        for ele in res {
+            stdout.write_all(ele.response.as_bytes()).await?;
+            stdout.flush().await?;
+
+            // if ele.context.is_some() {
+            //     context = ele.context;
+            // }
+        }
+    }
 
     Ok(())
 }

@@ -1,50 +1,52 @@
-[package]
-name = "jobworkerp-llama-cpp-plugin"
+[workspace]
+
+members = ["llama-protobuf", "llama-cpp-plugin", "ollama-plugin"]
+
+resolver = "2"
+
+[workspace.package]
 version = "0.1.0"
 edition = "2021"
+authors = ["sutr"]
+description = "Job-Worker plugin using llama"
+repository = "https://github.com/jobworkerp-rs/llama-plugins"
+license = "MIT"
 
-#[[bin]]
-#name = "sample"
-
-[lib]
-crate-type = ["dylib", "rlib"]
-#crate-type = ["cdylib"]
-
-
-[dependencies]
-command-utils = { git = "https://github.com/sutr-app/command-utils", branch = "main" }
+[workspace.dependencies]
 
 anyhow = "1"
 async-trait = { version = "0.1" }
-base64 = { version = "0.22" }
+#base64 = { version = "0.22" }
 #bindgen = "0.70"
 #cc = "1.1"
 clap = { version = "4.5", features = ["derive"] }
+command-utils = { git = "https://github.com/sutr-app/command-utils", branch = "main" }
 #criterion = "0.5"
 dotenvy = { version = "0.15" }
 encoding_rs = "0.8"
 envy = { version = "0.4" }
 hf-hub = { version = "0.3" }
-#llama-cpp-2 = { version = "0.1.83" }
-llama-cpp-2 = { git = "https://github.com/utilityai/llama-cpp-rs", rev = "2822e3ae86a66b571cc6de371feefb938f4f1da7" }
-log = { version = "0.4" }
+# llama-cpp-2 = { version = "0.1.85" }
+# llama-cpp-2 = { git = "https://github.com/utilityai/llama-cpp-rs", rev = "2822e3ae86a66b571cc6de371feefb938f4f1da7" }
+llama-cpp-2 = { git = "https://github.com/utilityai/llama-cpp-rs", rev = "4d1df04fb28b247494849d018d55a7fcf42c0ee1" }
+#log = { version = "0.4" }
+ollama-rs = { version = "0.2", features = ["stream"] }
 once_cell = { version = "1" }
 #pprof = "0.13.0"
 prost = { version = "0.13" }
-rand = { version = "0.8" }
+prost-build = { version = "0.13" }
+#rand = { version = "0.8" }
 #safetensors = { version = "0.4" }
 #scopeguard = { version = "1" }
 serde = { version = "1" }
 serde_json = { version = "1" }
-thiserror = { version = "2" }
+#thiserror = { version = "2" }
 #tokenizers = { version = "0.20" }
 tokio = { version = "1" }
+tokio-stream = { version = "0.1" }
 tracing = { version = "0.1" }
 tracing-subscriber = { version = "0.3" }
 url = { version = "2" }
-
-[build-dependencies]
-prost-build = { version = "0.13" }
 
 [workspace.lints.rust]
 missing_docs = { level = "warn" }
@@ -57,16 +59,6 @@ pedantic = { level = "warn" }
 # Tell `rustc` to optimize for small code size.
 opt-level = "s"
 panic = "unwind"
-
-[features]
-#default = ["cuda"]
-#default = ["openmp"]
-default = []
-metal = ["llama-cpp-2/metal"]
-cuda = ["llama-cpp-2/cuda"]
-native = ["llama-cpp-2/native"]
-dynamic-link = ["llama-cpp-2/dynamic-link"]
-openmp = ["llama-cpp-2/openmp"]
 
 [profile.dev]
 panic = "unwind"

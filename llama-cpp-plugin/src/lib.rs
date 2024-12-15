@@ -1,30 +1,13 @@
 pub mod model;
 
 use anyhow::{anyhow, Context, Result};
-use async_trait::async_trait;
+use jobworkerp_llama_protobuf::{
+    protobuf::llama_cpp::{LlamaArg, LlamaOperation},
+    PluginRunner,
+};
 use model::{LlamaModelConfig, LlamaModelWrapper};
 use prost::Message;
-use protobuf::llama_cpp::{LlamaArg, LlamaOperation};
 use std::io::Cursor;
-
-pub mod protobuf {
-    pub mod llama_cpp {
-        include!(concat!(env!("OUT_DIR"), "/llama_cpp.rs"));
-    }
-}
-
-#[async_trait]
-pub trait PluginRunner: Send + Sync {
-    fn name(&self) -> String;
-    fn load(&mut self, operation: Vec<u8>) -> Result<()>;
-    fn run(&mut self, arg: Vec<u8>) -> Result<Vec<Vec<u8>>>;
-    fn cancel(&self) -> bool;
-    fn operation_proto(&self) -> String;
-    fn job_args_proto(&self) -> String;
-    fn result_output_proto(&self) -> Option<String>;
-    // if true, use job result of before job, else use job args from request
-    fn use_job_result(&self) -> bool;
-}
 
 // suppress warn improper_ctypes_definitions
 #[allow(improper_ctypes_definitions)]
@@ -126,13 +109,17 @@ impl PluginRunner for LlamaCppPlugin {
         false
     }
     fn operation_proto(&self) -> String {
-        include_str!("../protobuf/llama_cpp_operation.proto").to_string()
+        include_str!("../../llama-protobuf/protobuf/llama_cpp/llama_cpp_operation.proto")
+            .to_string()
     }
     fn job_args_proto(&self) -> String {
-        include_str!("../protobuf/llama_cpp_arg.proto").to_string()
+        include_str!("../../llama-protobuf/protobuf/llama_cpp/llama_cpp_arg.proto").to_string()
     }
     fn result_output_proto(&self) -> Option<String> {
-        Some(include_str!("../protobuf/llama_cpp_arg.proto").to_string()) // string
+        // for prompt chain
+        Some(
+            include_str!("../../llama-protobuf/protobuf/llama_cpp/llama_cpp_arg.proto").to_string(),
+        )
     }
     // if true, use job result of before job, else use job args from request
     fn use_job_result(&self) -> bool {
@@ -142,7 +129,7 @@ impl PluginRunner for LlamaCppPlugin {
 
 #[cfg(test)]
 mod test {
-    use protobuf::llama_cpp::LlamaArg;
+    use jobworkerp_llama_protobuf::protobuf::llama_cpp::LlamaArg;
 
     // create a test that loads the plugin model from environment variables and runs it internal model (llama_model)
     use super::*;
