@@ -1,0 +1,13 @@
+[package]
+name = "jobworkerp-llama-protobuf"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+async-trait = { version = "0.1" }
+prost = { version = "0.13" }
+
+[build-dependencies]
+prost-build = { version = "0.13" }
+

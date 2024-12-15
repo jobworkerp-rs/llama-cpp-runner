@@ -1,0 +1,16 @@
+syntax = "proto3";
+
+package ollama;
+
+message OllamaOperation {
+    // base_url(default: http://localhost:11434)
+    optional string base_url = 1;
+    // The name to the model
+    string model = 2;
+    // system prompt before the user prompt
+    optional string system_prompt = 3;
+
+    // TODO
+    // override some parameters of the model
+    //key_value_overrides: Option<Vec<(String, ParamOverrideValueWrapper)>>,
+}
