@@ -40,8 +40,6 @@ prost-build = { version = "0.13" }
 #scopeguard = { version = "1" }
 serde = { version = "1" }
 serde_json = { version = "1" }
-#thiserror = { version = "2" }
-#tokenizers = { version = "0.20" }
 tokio = { version = "1" }
 tokio-stream = { version = "0.1" }
 tracing = { version = "0.1" }
