@@ -1,30 +1,15 @@
 input: # for annotation only
   schema:
     document:
-      type: object
-      description: ollama's input
-      properties:
-        prompt:
-          type: string
-          description: The prompt.(required)
-        sampleLen:
-          type: integer
-          description: max length of the output sample.(optional)
-        temperature:
-          type: number
-          description: temperature(optional)
-        topP:
-          type: number
-          description: topP
-        repeatPenalty:
-          type: number
-          description: repeat_penalty(optional)
-        repeatLastN:
-          type: integer
-          description: repeat_last_n(optional)
-        seed:
-          type: integer
-          description: random seed.(optional)
+      type: string
+      description: ollama input
+#      properties:
+#        prompt:
+#          type: string
+#          description: The prompt.(required)
+#        sampleLen:
+#          type: integer
+#          description: max length of the output sample.(optional)
 output: # for annotation only
   schema:
     document:
@@ -33,24 +18,18 @@ output: # for annotation only
 run:
   script:
     language: jobworkerp
-    code: # extends serverless workflow
-      workerName: ollamaWorker
-      initArguments:
-        - name: baseUrl
-          value: http://ollma.ollama.svc.cluster.local:11434
-        - name: model
-          value: hf.co/Local-Novel-LLM-project/Shadows-MoE-GGUF
-          # value: hf.co/elyza/Llama-3-ELYZA-JP-8B-GGUF #karakuri-lm-8x7b-instruct-v0.1-Q3_K_M
-        - name: systemPrompt
-          value: |
-            以下は直近のニュースのタイトルと本文と掲載リンク先を並べたものです。500文字以内程度で簡単に目を通すためのタイトルと内容の要約を日本語でマークダウン形式で作成してください。要約部分には要約文のみを出力してください：
-            ${input.prompt}
-            要約：
+    code: OllamaRunner
     arguments: # for annotation only
       prompt: ${input.prompt}
-      sampleLen: ${input.sampleLen}
-      temperature: ${input.temperature}
-      topP: ${input.topP}
-      repeatPenalty: ${input.repeatPenalty}
-      repeatLastN: ${input.repeatLastN}
-      seed: ${input.seed}
+metadata: # todo init parameters
+  initArg:
+    baseUrl: http://ollma.ollama.svc.cluster.local:11434
+    model: hf.co/Local-Novel-LLM-project/Shadows-MoE-GGUF
+    # hf.co/elyza/Llama-3-ELYZA-JP-8B-GGUF #karakuri-lm-8x7b-instruct-v0.1-Q3_K_M
+    systemPrompt: |
+      以下は直近のニュースのタイトルと本文と掲載リンク先を並べたものです。500文字以内程度で簡単に目を通すためのタイトルと内容の要約を日本語でマークダウン形式で作成してください。要約部分には要約文のみを出力してください：
+      ${input.prompt}
+      要約：
+  worker:
+    name: OllamaWorker
+    channel: gpu
