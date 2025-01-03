@@ -9,6 +9,8 @@ message OllamaOperation {
     string model = 2;
     // system prompt before the user prompt
     optional string system_prompt = 3;
+    // pull the model from the server (set false if you want to use manually loaded model)
+    optional bool pull_model = 4;
 
     // TODO
     // override some parameters of the model

@@ -60,12 +60,16 @@ impl OllamaPlugin {
         let url_base = std::env::var("LLAMA_URL_BASE").unwrap_or(Self::URL_BASE.to_string());
         let model = std::env::var("LLAMA_MODEL").context("LLAMA_MODEL is not set")?;
         let system_prompt = std::env::var("LLAMA_SYSTEM_PROMPT").ok();
+        let pull_model = std::env::var("LLAMA_PULL_MODEL")
+            .ok()
+            .map(|b| b.as_str() == "true");
 
         tokio::runtime::Runtime::new().unwrap().block_on(async {
             self.load_model(OllamaOperation {
                 base_url: Some(url_base),
                 model,
                 system_prompt,
+                pull_model,
             })
             .await
         })?;
@@ -73,8 +77,10 @@ impl OllamaPlugin {
     }
     pub async fn load_model(&mut self, operation: OllamaOperation) -> Result<()> {
         let llama = Ollama::try_new(operation.base_url.unwrap_or(Self::URL_BASE.to_string()))?;
-        let pull = llama.pull_model(operation.model.clone(), false).await?;
-        tracing::debug!("model loaded: result = {:?}", pull);
+        if operation.pull_model.unwrap_or(true) {
+            let pull = llama.pull_model(operation.model.clone(), false).await?;
+            tracing::debug!("model loaded: result = {:?}", pull);
+        };
         self.ollama = Some(llama);
         self.model = operation.model;
         self.system_prompt = operation.system_prompt;
