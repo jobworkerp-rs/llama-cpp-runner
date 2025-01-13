@@ -2,7 +2,7 @@ syntax = "proto3";
 
 package llama_cpp;
 
-message LlamaOperation {
+message LlamaRunnerSettings {
     // The path or name to the model
     // if hf_repo is Some, the model is filename on huggingface
     // if hf_remo is None, the model is a local path

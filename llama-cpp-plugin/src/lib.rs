@@ -2,7 +2,7 @@ pub mod model;
 
 use anyhow::{anyhow, Context, Result};
 use jobworkerp_llama_protobuf::{
-    protobuf::llama_cpp::{LlamaArg, LlamaOperation},
+    protobuf::llama_cpp::{LlamaArg, LlamaRunnerSettings},
     PluginRunner,
 };
 use model::{LlamaModelConfig, LlamaModelWrapper};
@@ -77,11 +77,11 @@ impl PluginRunner for LlamaCppPlugin {
         // specify as same string as worker.operation
         String::from("LLMPromptRunner")
     }
-    fn load(&mut self, operation: Vec<u8>) -> Result<()> {
-        let operation = LlamaOperation::decode(&mut Cursor::new(operation))
+    fn load(&mut self, settings: Vec<u8>) -> Result<()> {
+        let settings = LlamaRunnerSettings::decode(&mut Cursor::new(settings))
             .map_err(|e| anyhow!("decode error: {}", e))?;
-        tracing::debug!("LLMRunner load: {operation:?}",);
-        self.load_model(operation.into())?;
+        tracing::debug!("LLMRunner load: {settings:?}",);
+        self.load_model(settings.into())?;
         Ok(())
     }
     fn run(&mut self, arg: Vec<u8>) -> Result<Vec<Vec<u8>>> {
@@ -108,9 +108,8 @@ impl PluginRunner for LlamaCppPlugin {
         tracing::warn!("LLMRunner cancel: not implemented!");
         false
     }
-    fn operation_proto(&self) -> String {
-        include_str!("../../llama-protobuf/protobuf/llama_cpp/llama_cpp_operation.proto")
-            .to_string()
+    fn runner_settings_proto(&self) -> String {
+        include_str!("../../llama-protobuf/protobuf/llama_cpp/llama_cpp_runner.proto").to_string()
     }
     fn job_args_proto(&self) -> String {
         include_str!("../../llama-protobuf/protobuf/llama_cpp/llama_cpp_arg.proto").to_string()

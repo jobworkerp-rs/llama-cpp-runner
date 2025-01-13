@@ -1,6 +1,6 @@
 use anyhow::{bail, Context, Result};
 use hf_hub::api::sync::ApiBuilder;
-use jobworkerp_llama_protobuf::protobuf::llama_cpp::{LlamaArg, LlamaOperation};
+use jobworkerp_llama_protobuf::protobuf::llama_cpp::{LlamaArg, LlamaRunnerSettings};
 use llama_cpp_2::{
     context::{params::LlamaContextParams, LlamaContext},
     ggml_time_us,
@@ -92,8 +92,8 @@ pub struct LlamaModelConfig {
     // or to provide some context to the user
     system_prompt: Option<String>,
 }
-impl From<LlamaOperation> for LlamaModelConfig {
-    fn from(op: LlamaOperation) -> Self {
+impl From<LlamaRunnerSettings> for LlamaModelConfig {
+    fn from(op: LlamaRunnerSettings) -> Self {
         Self {
             model: op.model,
             hf_repo: op.hf_repo,

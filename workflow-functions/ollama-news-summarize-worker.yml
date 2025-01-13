@@ -25,7 +25,7 @@ input:
         seed:
           description: "The seed to use when generating random samples."
           type: integer
-      required: [ prompt ]
+      required: [prompt]
 output: # for annotation only
   schema:
     document:
@@ -62,7 +62,7 @@ run:
         ${$input}
         要約：
 metadata: # todo init parameters
-  initArgs:
+  runnerSettings:
     baseUrl: http://ollma.ollama.svc.cluster.local:11434
     #model: hf.co/Local-Novel-LLM-project/Shadows-MoE-GGUF
     model: hf.co/elyza/Llama-3-ELYZA-JP-8B-GGUF #karakuri-lm-8x7b-instruct-v0.1-Q3_K_M
@@ -70,4 +70,3 @@ metadata: # todo init parameters
       以下は直近のニュースのタイトルと本文と掲載リンク先を並べたものです。500文字以内程度で簡単に目を通すためのタイトルと内容の要約を日本語でマークダウン形式で作成してください。要約部分には要約文のみを出力してください：
   worker:
     name: OllamaWorker
-

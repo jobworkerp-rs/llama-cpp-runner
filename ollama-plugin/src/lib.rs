@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Context, Result};
 use jobworkerp_llama_protobuf::{
-    protobuf::ollama::{OllamaArg, OllamaOperation},
+    protobuf::ollama::{OllamaArg, OllamaRunnerSettings},
     PluginRunner,
 };
 use ollama_rs::{
@@ -65,7 +65,7 @@ impl OllamaPlugin {
             .map(|b| b.as_str() == "true");
 
         tokio::runtime::Runtime::new().unwrap().block_on(async {
-            self.load_model(OllamaOperation {
+            self.load_model(OllamaRunnerSettings {
                 base_url: Some(url_base),
                 model,
                 system_prompt,
@@ -75,29 +75,29 @@ impl OllamaPlugin {
         })?;
         Ok(())
     }
-    pub async fn load_model(&mut self, operation: OllamaOperation) -> Result<()> {
-        let llama = Ollama::try_new(operation.base_url.unwrap_or(Self::URL_BASE.to_string()))?;
-        if operation.pull_model.unwrap_or(true) {
-            let pull = llama.pull_model(operation.model.clone(), false).await?;
+    pub async fn load_model(&mut self, settings: OllamaRunnerSettings) -> Result<()> {
+        let llama = Ollama::try_new(settings.base_url.unwrap_or(Self::URL_BASE.to_string()))?;
+        if settings.pull_model.unwrap_or(true) {
+            let pull = llama.pull_model(settings.model.clone(), false).await?;
             tracing::debug!("model loaded: result = {:?}", pull);
         };
         self.ollama = Some(llama);
-        self.model = operation.model;
-        self.system_prompt = operation.system_prompt;
+        self.model = settings.model;
+        self.system_prompt = settings.system_prompt;
         Ok(())
     }
 }
 
 impl PluginRunner for OllamaPlugin {
     fn name(&self) -> String {
-        // specify as same string as worker.operation
+        // specify as same string as worker.settings
         String::from("OllamaPromptRunner")
     }
-    fn load(&mut self, operation: Vec<u8>) -> Result<()> {
-        let operation = OllamaOperation::decode(&mut Cursor::new(operation))
+    fn load(&mut self, settings: Vec<u8>) -> Result<()> {
+        let settings = OllamaRunnerSettings::decode(&mut Cursor::new(settings))
             .map_err(|e| anyhow!("decode error: {}", e))?;
         let runtime = tokio::runtime::Runtime::new().unwrap();
-        runtime.block_on(async { self.load_model(operation).await })?;
+        runtime.block_on(async { self.load_model(settings).await })?;
         tracing::info!("OllamaPromptRunner loaded",);
         Ok(())
     }
@@ -162,8 +162,8 @@ impl PluginRunner for OllamaPlugin {
         tracing::warn!("OllamaPromptRunner cancel: not implemented!");
         false
     }
-    fn operation_proto(&self) -> String {
-        include_str!("../../llama-protobuf/protobuf/ollama/ollama_operation.proto").to_string()
+    fn runner_settings_proto(&self) -> String {
+        include_str!("../../llama-protobuf/protobuf/ollama/ollama_runner.proto").to_string()
     }
     fn job_args_proto(&self) -> String {
         include_str!("../../llama-protobuf/protobuf/ollama/ollama_arg.proto").to_string()
@@ -179,6 +179,7 @@ impl PluginRunner for OllamaPlugin {
 
 #[cfg(test)]
 mod test {
+    use jobworkerp_llama_protobuf::protobuf::ollama::OllamaRunnerSettings;
     use tracing::Level;
 
     // create a test that loads the plugin model from environment variables and runs it internal model (llama_model)
@@ -188,19 +189,19 @@ mod test {
     fn test_plugin_runner() {
         command_utils::util::tracing::tracing_init_test(Level::DEBUG);
 
-        let operation = OllamaOperation {
+        let settings = OllamaRunnerSettings {
             base_url: Some("http://localhost:11434".to_string()),
             model: "qwq".to_string(),
             system_prompt: Some(
                 "次の文章を日本語に翻訳してください。翻訳結果のみを出力してください".to_string(),
             ),
         };
-        let mut buf = Vec::with_capacity(operation.encoded_len());
-        OllamaOperation::encode(&operation, &mut buf).unwrap();
-        let operation = buf;
+        let mut buf = Vec::with_capacity(settings.encoded_len());
+        OllamaRunnerSettings::encode(&settings, &mut buf).unwrap();
+        let settings = buf;
         let mut plugin = OllamaPlugin::new();
         plugin
-            .load(operation)
+            .load(settings)
             .expect("failed to load model from env");
 
         let user_prompt = r#"
