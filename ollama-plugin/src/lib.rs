@@ -78,7 +78,10 @@ impl OllamaPlugin {
     pub async fn load_model(&mut self, settings: OllamaRunnerSettings) -> Result<()> {
         let llama = Ollama::try_new(settings.base_url.unwrap_or(Self::URL_BASE.to_string()))?;
         if settings.pull_model.unwrap_or(true) {
-            let pull = llama.pull_model(settings.model.clone(), false).await?;
+            let pull = llama
+                .pull_model(settings.model.clone(), false)
+                .await
+                .map_err(|e| anyhow!("{}", e))?;
             tracing::debug!("model loaded: result = {:?}", pull);
         };
         self.ollama = Some(llama);
@@ -140,7 +143,8 @@ impl PluginRunner for OllamaPlugin {
             // }
             let res: GenerationResponse = tokio::runtime::Runtime::new()
                 .unwrap()
-                .block_on(ollama.generate(request))?;
+                .block_on(ollama.generate(request))
+                .map_err(|e| anyhow!("Generation error: {}", e))?;
 
             let text = res.response;
             tracing::debug!(

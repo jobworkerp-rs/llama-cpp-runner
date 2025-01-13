@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use command_utils::util::option::Exists;
 use ollama_rs::{
     generation::completion::{request::GenerationRequest, GenerationResponseStream},
-    Ollama,
+    Ollama, error::OllamaError
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -46,7 +46,12 @@ async fn main() -> Result<()> {
     // if let Some(context) = context.clone() {
     //     request = request.context(context);
     // }
-    let mut stream: GenerationResponseStream = ollama.generate_stream(request).await?;
+    let mut stream: GenerationResponseStream = ollama.generate_stream(request).await.map_err(
+        |e| match e {
+            OllamaError::Other(s) => anyhow::anyhow!(s),
+            e => anyhow::anyhow!(e.to_string()),
+        },
+    )?;
 
     let mut stdout = stdout();
     while let Some(Ok(res)) = stream.next().await {
