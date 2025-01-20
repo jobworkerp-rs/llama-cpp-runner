@@ -1,6 +1,12 @@
 [workspace]
 
-members = ["llama-protobuf", "llama-cpp-plugin", "ollama-plugin"]
+members = [
+    "modules/jobworkerp-client",
+    "modules/jobworkerp-util",
+    "llama-protobuf",
+    "llama-cpp-plugin",
+    "ollama-plugin",
+]
 
 resolver = "2"
 
@@ -13,7 +19,6 @@ repository = "https://github.com/jobworkerp-rs/llama-plugins"
 license = "MIT"
 
 [workspace.dependencies]
-
 anyhow = "1"
 async-trait = { version = "0.1" }
 #base64 = { version = "0.22" }
@@ -38,6 +43,7 @@ prost-build = { version = "0.13" }
 #rand = { version = "0.8" }
 #safetensors = { version = "0.4" }
 #scopeguard = { version = "1" }
+schemars = { version = "0.8" }
 serde = { version = "1" }
 serde_json = { version = "1" }
 tokio = { version = "1" }

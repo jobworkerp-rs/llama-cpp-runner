@@ -12,6 +12,7 @@ crate-type = ["dylib", "rlib"]
 
 
 [dependencies]
+jobworkerp-client = { path = "../modules/jobworkerp-client" }
 jobworkerp-llama-protobuf = { path = "../llama-protobuf" }
 
 anyhow = { workspace = true }

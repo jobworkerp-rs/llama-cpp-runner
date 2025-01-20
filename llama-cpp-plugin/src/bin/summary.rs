@@ -1,8 +1,8 @@
 use anyhow::{anyhow, Context, Result};
 use command_utils::util::option::Exists;
+use jobworkerp_client::plugins::PluginRunner;
 use jobworkerp_llama_cpp_plugin::LlamaCppPlugin;
 use jobworkerp_llama_protobuf::protobuf::llama_cpp::LlamaArg;
-use jobworkerp_llama_protobuf::PluginRunner;
 use prost::Message;
 use std::fs;
 use std::io::Cursor;

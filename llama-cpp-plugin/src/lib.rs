@@ -1,10 +1,8 @@
 pub mod model;
 
 use anyhow::{anyhow, Context, Result};
-use jobworkerp_llama_protobuf::{
-    protobuf::llama_cpp::{LlamaArg, LlamaRunnerSettings},
-    PluginRunner,
-};
+use jobworkerp_client::plugins::PluginRunner;
+use jobworkerp_llama_protobuf::protobuf::llama_cpp::{LlamaArg, LlamaRunnerSettings};
 use model::{LlamaModelConfig, LlamaModelWrapper};
 use prost::Message;
 use std::io::Cursor;
@@ -104,7 +102,7 @@ impl PluginRunner for LlamaCppPlugin {
             Err(anyhow!("llama_model is not loaded"))
         }
     }
-    fn cancel(&self) -> bool {
+    fn cancel(&mut self) -> bool {
         tracing::warn!("LLMRunner cancel: not implemented!");
         false
     }

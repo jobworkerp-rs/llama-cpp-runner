@@ -1,8 +1,8 @@
 use anyhow::{anyhow, Context, Result};
-use jobworkerp_llama_protobuf::{
-    protobuf::ollama::{OllamaArg, OllamaRunnerSettings},
-    PluginRunner,
-};
+use command_utils::util::json;
+use jobworkerp_client::plugins::PluginRunner;
+use jobworkerp_llama_protobuf::protobuf::ollama::{OllamaArg, OllamaRunnerSettings};
+use jobworkerp_util::runner::OLLAMA_PROMPT;
 use ollama_rs::{
     generation::{
         completion::{request::GenerationRequest, GenerationResponse},
@@ -11,6 +11,7 @@ use ollama_rs::{
     Ollama,
 };
 use prost::Message;
+use schemars::schema::RootSchema;
 use std::io::Cursor;
 
 // suppress warn improper_ctypes_definitions
@@ -94,25 +95,39 @@ impl OllamaPlugin {
 impl PluginRunner for OllamaPlugin {
     fn name(&self) -> String {
         // specify as same string as worker.settings
-        String::from("OllamaPromptRunner")
+        OLLAMA_PROMPT.to_string()
     }
     fn load(&mut self, settings: Vec<u8>) -> Result<()> {
         let settings = OllamaRunnerSettings::decode(&mut Cursor::new(settings))
             .map_err(|e| anyhow!("decode error: {}", e))?;
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async { self.load_model(settings).await })?;
-        tracing::info!("OllamaPromptRunner loaded",);
+        tracing::info!("{} loaded", OLLAMA_PROMPT);
         Ok(())
     }
     fn run(&mut self, arg: Vec<u8>) -> Result<Vec<Vec<u8>>> {
         if let Some(ollama) = self.ollama.as_mut() {
             let args = OllamaArg::decode(&mut Cursor::new(arg))
                 .map_err(|e| anyhow!("decode error: {}", e))?;
-            tracing::debug!("OllamaPromptRunner run: {args:?}",);
+            tracing::debug!("{OLLAMA_PROMPT} run: {args:?}",);
 
             let mut request = GenerationRequest::new(self.model.clone(), args.prompt);
             if let Some(system_prompt) = self.system_prompt.clone() {
                 request = request.system(system_prompt);
+            }
+            //XXX only support json format (TODO schema)
+            if let Some(_schema) = &args.schema_json {
+                // cannot use StructuredJson (schema is private field)
+                // let schema_root = serde_json::from_str(schema).map_err(|e| anyhow!("{}", e))?;
+                // let json_schema: RootSchema = schema_root;
+                // let serialized: ollama_rs::generation::parameters::JsonStructure =
+                //     json_schema.into();
+                // ollama_rs::generation::parameters::FormatType::StructuredJson(
+                //     ollama_rs::generation::parameters::JsonStructure {
+                //         schema: json_schema,
+                //     },
+                // ),
+                request = request.format(ollama_rs::generation::parameters::FormatType::Json);
             }
             let mut options = GenerationOptions::default();
             if let Some(sample_len) = args.sample_len {
@@ -148,7 +163,8 @@ impl PluginRunner for OllamaPlugin {
 
             let text = res.response;
             tracing::debug!(
-                "END OF OllamaPromptRunner: duration: {}",
+                "END OF {}: duration: {}",
+                OLLAMA_PROMPT,
                 res.total_duration.unwrap_or_default()
             );
             let buf = OllamaArg {
@@ -162,7 +178,7 @@ impl PluginRunner for OllamaPlugin {
             Err(anyhow!("llama_model is not loaded"))
         }
     }
-    fn cancel(&self) -> bool {
+    fn cancel(&mut self) -> bool {
         tracing::warn!("OllamaPromptRunner cancel: not implemented!");
         false
     }

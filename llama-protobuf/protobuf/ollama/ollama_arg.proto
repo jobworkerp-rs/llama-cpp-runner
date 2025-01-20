@@ -23,4 +23,7 @@ message OllamaArg {
 
   // The seed to use when generating random samples.
   optional int32 seed = 7;
+
+  // (TODO) The schema JSON to use for the structured output. (currently the content is ignored(specified or not)).
+  optional string schema_json = 8;
 }
