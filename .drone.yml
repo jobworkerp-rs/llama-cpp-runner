@@ -99,6 +99,28 @@ steps:
       - git tag ${DRONE_TAG} # $TAG_VERSION
       - git push origin --tags
 
+  - name: publish_proto
+    image: gitea.toris.dev/servers/drone-git-ssh:0.0.5
+    commands:
+    - mkdir temp
+    - cd temp
+    - git clone git@gitea-ssh.toris.dev:jobworkerp-rs/llama-protobuf.git
+    - cd jobworkerp-plugin-proto
+    - git fetch origin
+    - git checkout main
+    - cp -a ../llama-protobuf/* ./
+    - git add .
+    - git reset --soft origin/main
+    - test 0 -eq $(git diff --staged | wc -l) && exit
+    - echo ${DRONE_TAG} > VERSION
+    - git add ./VERSION
+    - git commit -m "Publish proto ${DRONE_TAG} from llama-cpp-plugin"
+    - git push origin main
+    - git tag ${DRONE_TAG}
+    - git push origin --tags
+    - cd ../..
+    - rm -rf temp
+
   # for jobworkerp plugin
   - name: publish_plugin
     image: gitea.toris.dev/servers/drone-git-ssh:0.0.5
@@ -121,30 +143,6 @@ steps:
     - git push origin main
     - git tag ${DRONE_TAG}
     - git push origin --tags
-
-  - name: publish_proto
-    image: gitea.toris.dev/servers/drone-git-ssh:0.0.5
-    commands:
-    - cd github
-    - mkdir temp
-    - cd temp
-    - git clone git@gitea-ssh.toris.dev:jobworkerp-rs/llama-protobuf.git
-    - cd jobworkerp-plugin-proto
-    - git fetch origin
-    - git checkout main
-    - cp -a ../../protobuf ./
-    - git add .
-    - git reset --soft origin/main
-    - test 0 -eq $(git diff --staged | wc -l) && exit
-    - echo ${DRONE_TAG} > VERSION
-    - git add ./VERSION
-    - git commit -m "Publish proto ${DRONE_TAG} from llama-cpp-plugin"
-    - git push origin main
-    - git tag ${DRONE_TAG}
-    - git push origin --tags
-    - cd ../..
-    - rm -rf temp
-
 
 volumes:
   - name: cargo_git
