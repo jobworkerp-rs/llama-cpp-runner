@@ -21,8 +21,10 @@ jobworkerp-llama-protobuf = { path = "../llama-protobuf" }
 anyhow = { workspace = true }
 command-utils = { workspace = true }
 dotenvy = { workspace = true }
-ollama-rs = { workspace = true }
+itertools = { workspace = true }
+ollama-rs = { workspace = true, features = ["stream", "tool-implementations"] }
 prost = { workspace = true }
+rand = { workspace = true }
 schemars = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

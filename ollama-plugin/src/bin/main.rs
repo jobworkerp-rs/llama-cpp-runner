@@ -1,8 +1,9 @@
 use anyhow::{Context, Result};
 use command_utils::util::option::Exists;
 use ollama_rs::{
+    error::OllamaError,
     generation::completion::{request::GenerationRequest, GenerationResponseStream},
-    Ollama, error::OllamaError
+    Ollama,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -34,24 +35,35 @@ async fn main() -> Result<()> {
     let content_len = combined_content.len();
     println!("combined_content length: {}", &content_len);
 
-    let system_prompt = 
-    "以下の文章は、ある特定の年月の日記(Markdownファイル)を結合したものです。その月のまとめとして日記の内容の要約をしてください。";
+    let system_prompt = r#"
+        以下はある一定期間の日記のテキストを繋ぎ合わせたものです。
+        内容を以下の項目別に記載のあった項目別に整理、要約してください。
+        - 実施したこと、取り組んだこと
+        - 反省点・改善点
+        - 今後の目標・予定 (やると書いているが実行できていないこと)
+        - 感想
+        日毎にまとめるのではなく全日程を通してまとめた要約を作成してください。
+        日別に付けている点数に関しては要約に含めないでください。
+        フォーマットはマークダウン形式の箇条書きで作成してください。
+        作成したマークダウン形式の要約文章のみを思考内容も含めて日本語で出力してください。
+    "#;
 
     let ollama = Ollama::new("http://localhost".to_string(), 11434);
     // let mut context: Option<GenerationContext> = None;
 
-    let request = GenerationRequest::new("llama3.3:70b".into(), combined_content)
-        .system(system_prompt.to_string());
+    // let model = "deepseek-r1:70b";
+    let model = "phi4";
+    let request =
+        GenerationRequest::new(model.into(), combined_content).system(system_prompt.to_string());
 
     // if let Some(context) = context.clone() {
     //     request = request.context(context);
     // }
-    let mut stream: GenerationResponseStream = ollama.generate_stream(request).await.map_err(
-        |e| match e {
+    let mut stream: GenerationResponseStream =
+        ollama.generate_stream(request).await.map_err(|e| match e {
             OllamaError::Other(s) => anyhow::anyhow!(s),
             e => anyhow::anyhow!(e.to_string()),
-        },
-    )?;
+        })?;
 
     let mut stdout = stdout();
     while let Some(Ok(res)) = stream.next().await {

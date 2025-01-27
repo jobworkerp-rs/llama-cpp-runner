@@ -7,7 +7,7 @@ fn main() {
                 "llama_cpp/llama_cpp_runner.proto",
                 "llama_cpp/llama_cpp_arg.proto",
                 "ollama/ollama_runner.proto",
-                "ollama/ollama_arg.proto",
+                "ollama/ollama_args.proto",
             ],
             &["./protobuf"],
         )
