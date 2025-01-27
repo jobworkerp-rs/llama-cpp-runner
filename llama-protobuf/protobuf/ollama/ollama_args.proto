@@ -46,27 +46,31 @@ message OllamaArgs {
   // The initial prompt.
   string prompt = 1;
 
+  // user id (for data management use only, not use for model input)
+  int64 user_id = 2;
+
   // The options to use for the model.
-  optional OllamaOptions options = 2;
+  optional OllamaOptions options = 3;
 
   // The system prompt to use for the system output.
   // (override the default system prompt)
-  optional string override_system_prompt = 3;
+  optional string override_system_prompt = 4;
 
   // The chat object to use for histories and the chat output.
-  // if false, do simple causal inference (the histories object will not be used)
-  bool use_chat = 4;
+  // if false, do simple causal inference (the histories object will not be
+  // used)
+  bool use_chat = 5;
 
   // chat histries can be specified.
   // (valid only when use_chat is true)
-  repeated ChatMessage histories = 5;
+  repeated ChatMessage histories = 6;
 
   // reflesh server history
   // (all chat history will be used as new request)
   // (valid only when use_chat is true)
-  bool refresh_history = 6;
+  bool refresh_history = 7;
 
-  // TODO (unimplemented) The schema JSON to use for the structured output. (currently the
-  // content is ignored(specified or not)).
-  optional string schema_json = 7;
+  // TODO (unimplemented) The schema JSON to use for the structured output.
+  // (currently the content is ignored(specified or not)).
+  optional string schema_json = 8;
 }

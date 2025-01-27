@@ -445,7 +445,9 @@ impl PluginRunner for OllamaPlugin {
 
 #[cfg(test)]
 mod test {
-    use jobworkerp_llama_protobuf::protobuf::ollama::OllamaRunnerSettings;
+    use jobworkerp_llama_protobuf::protobuf::ollama::{
+        ollama_args::OllamaOptions, OllamaRunnerSettings,
+    };
     use tracing::Level;
 
     // create a test that loads the plugin model from environment variables and runs it internal model (llama_model)
@@ -499,12 +501,15 @@ Good luck in the competition and in advancing AI research!
 
         let request = OllamaArgs {
             prompt,
-            sample_len: None, //2048,
-            temperature: Some(0.4),
-            top_p: Some(0.9),
-            repeat_penalty: Some(0.9),
-            repeat_last_n: Some(8),
-            seed: Some(32),
+            options: Some(OllamaOptions {
+                sample_len: Some(2048),
+                temperature: Some(0.4),
+                top_p: Some(0.9),
+                repeat_penalty: Some(0.9),
+                repeat_last_n: Some(8),
+                seed: Some(32),
+                ..Default::default()
+            }),
             ..Default::default()
         };
         let mut buf = Vec::with_capacity(request.encoded_len());

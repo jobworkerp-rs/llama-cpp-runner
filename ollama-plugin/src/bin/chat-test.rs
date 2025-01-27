@@ -112,6 +112,7 @@ fn main() -> Result<()> {
 
         let request = OllamaArgs {
             prompt: input.to_string(),
+            user_id: 1,
             options: None,
             override_system_prompt: if override_prompt {
                 Some(system_prompt2.clone())
