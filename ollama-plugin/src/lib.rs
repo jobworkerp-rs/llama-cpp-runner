@@ -161,26 +161,28 @@ impl OllamaPlugin {
     pub fn create_options(args: &OllamaArgs) -> GenerationOptions {
         let mut options = GenerationOptions::default();
 
-        if let Some(sample_len) = args.sample_len {
-            options = options.num_predict(sample_len);
-        } else {
-            // fill context
-            options = options.num_predict(-2);
-        }
-        if let Some(temperature) = args.temperature {
-            options = options.temperature(temperature);
-        }
-        if let Some(top_p) = args.top_p {
-            options = options.top_p(top_p);
-        }
-        if let Some(repeat_penalty) = args.repeat_penalty {
-            options = options.repeat_penalty(repeat_penalty);
-        }
-        if let Some(repeat_last_n) = args.repeat_last_n {
-            options = options.repeat_last_n(repeat_last_n);
-        }
-        if let Some(seed) = args.seed {
-            options = options.seed(seed);
+        if let Some(opts) = args.options {
+            if let Some(sample_len) = opts.sample_len {
+                options = options.num_predict(sample_len);
+            } else {
+                // fill context
+                options = options.num_predict(-2);
+            }
+            if let Some(temperature) = opts.temperature {
+                options = options.temperature(temperature);
+            }
+            if let Some(top_p) = opts.top_p {
+                options = options.top_p(top_p);
+            }
+            if let Some(repeat_penalty) = opts.repeat_penalty {
+                options = options.repeat_penalty(repeat_penalty);
+            }
+            if let Some(repeat_last_n) = opts.repeat_last_n {
+                options = options.repeat_last_n(repeat_last_n);
+            }
+            if let Some(seed) = opts.seed {
+                options = options.seed(seed);
+            }
         }
         options
     }

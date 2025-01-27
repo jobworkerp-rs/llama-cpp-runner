@@ -68,7 +68,7 @@ fn main() -> Result<()> {
         それでは上記の設定をもとにしてロールプレイをしてください。
     "#.to_string();
 
-    let mut system = system_prompt;
+    let system = system_prompt;
 
     let mut plugin = OllamaPlugin::new();
     let ollama = "http://localhost:11434".to_string();
@@ -112,12 +112,7 @@ fn main() -> Result<()> {
 
         let request = OllamaArgs {
             prompt: input.to_string(),
-            sample_len: None,
-            temperature: None,
-            top_p: None,
-            repeat_penalty: None,
-            repeat_last_n: None,
-            seed: None,
+            options: None,
             override_system_prompt: if override_prompt {
                 Some(system_prompt2.clone())
             } else {
@@ -132,7 +127,7 @@ fn main() -> Result<()> {
         // if let Some(context) = context.clone() {
         //     request = request.context(context);
         // }
-        let mut res = plugin
+        let res = plugin
             .run(request.encode_to_vec())
             .map_err(|e| tracing::error!("Error: {}", e));
 

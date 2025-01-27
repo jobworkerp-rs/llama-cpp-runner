@@ -23,41 +23,50 @@ message OllamaArgs {
     repeated bytes images = 5;
   }
 
+  message OllamaOptions {
+    // The length of the sample to generate (in tokens) (default: context size).
+    optional int32 sample_len = 1;
+
+    // The temperature used to generate samples.
+    optional float temperature = 2;
+
+    // Nucleus sampling probability cutoff.
+    optional float top_p = 3;
+
+    // Penalty to be applied for repeating tokens, 1. means no penalty.
+    optional float repeat_penalty = 4;
+
+    // The context size to consider for the repeat penalty.
+    optional int32 repeat_last_n = 5;
+
+    // The seed to use when generating random samples.
+    optional int32 seed = 6;
+  }
+
   // The initial prompt.
   string prompt = 1;
 
-  // The length of the sample to generate (in tokens) (default: context size).
-  optional int32 sample_len = 2;
+  // The options to use for the model.
+  optional OllamaOptions options = 2;
 
-  // The temperature used to generate samples.
-  optional float temperature = 3;
+  // The system prompt to use for the system output.
+  // (override the default system prompt)
+  optional string override_system_prompt = 3;
 
-  // Nucleus sampling probability cutoff.
-  optional float top_p = 4;
+  // The chat object to use for histories and the chat output.
+  // if false, do simple causal inference (the histories object will not be used)
+  bool use_chat = 4;
 
-  // Penalty to be applied for repeating tokens, 1. means no penalty.
-  optional float repeat_penalty = 5;
-
-  // The context size to consider for the repeat penalty.
-  optional int32 repeat_last_n = 6;
-
-  // The seed to use when generating random samples.
-  optional int32 seed = 7;
-
-  // The system prompt to use for the system output.(override the default system prompt)
-  optional string override_system_prompt = 8;
-
-  // The chat object to use for the chat output.
-  bool use_chat = 9;
-
-  // if use_chat, chat histries can be specified.
-  repeated ChatMessage histories = 10;
+  // chat histries can be specified.
+  // (valid only when use_chat is true)
+  repeated ChatMessage histories = 5;
 
   // reflesh server history
   // (all chat history will be used as new request)
-  bool refresh_history = 11;
+  // (valid only when use_chat is true)
+  bool refresh_history = 6;
 
-  // (TODO) The schema JSON to use for the structured output. (currently the
+  // TODO (unimplemented) The schema JSON to use for the structured output. (currently the
   // content is ignored(specified or not)).
-  optional string schema_json = 12;
+  optional string schema_json = 7;
 }
