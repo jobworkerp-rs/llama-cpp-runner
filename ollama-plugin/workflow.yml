@@ -7,24 +7,55 @@ input:
         prompt:
           type: string
           description: "The initial prompt."
-        sample_len:
-          description: "The length of the sample to generate (in tokens) (default: context size)."
+        user_id:
           type: integer
-        temperature:
-          description: "The temperature used to generate samples."
-          type: number
-        top_p:
-          description: "Nucleus sampling probability cutoff."
-          type: number
-        repeat_penalty:
-          description: "Penalty to be applied for repeating tokens, 1. means no penalty."
-          type: number
-        repeat_last_n:
-          description: "The context size to consider for the repeat penalty."
-          type: integer
-        seed:
-          description: "The seed to use when generating random samples."
-          type: integer
+          description: "The user ID of the user who generated the sample."
+        options:
+          type: object
+          description: "The options used to generate the sample. (optional)"
+          properties:
+            sample_len:
+              type: integer
+              description: "The length of the sample to generate (in tokens) (default: context size)."
+            temperature:
+              description: "The temperature used to generate samples."
+              type: number
+            top_p:
+              description: "Nucleus sampling probability cutoff."
+              type: number
+            repeat_penalty:
+              description: "Penalty to be applied for repeating tokens, 1. means no penalty."
+              type: number
+            repeat_last_n:
+              description: "The context size to consider for the repeat penalty."
+              type: integer
+            seed:
+              description: "The seed to use when generating random samples."
+              type: integer
+        override_system_prompt:
+          type: string
+          description: "The system prompt to use for this sample. (optional)"
+        use_chat:
+          type: boolean
+          description: "Whether to use the chat api for this sample. (optional)"
+        reflesh_history:
+          type: boolean
+          description: "Whether to reflesh the chat history for this sample. (optional)"
+        histories:
+          type: array
+          description: "The history of the conversation leading up to this sample. (optional)"
+          items:
+            type: object
+            properties:
+              chat_id:
+                type: integer
+                description: "The chat ID."
+              role:
+                type: string
+                description: "The role of the user in the chat.(user or system or assistant)"
+              content:
+                type: string
+                description: "The message that was sent."
       required: [prompt]
 output: # for annotation only
   schema:
@@ -35,24 +66,55 @@ output: # for annotation only
         prompt:
           type: string
           description: "The initial prompt."
-        sample_len:
+        user_id:
           type: integer
-          description: "The length of the sample to generate (in tokens) (default: context size)."
-        temperature:
-          description: "The temperature used to generate samples."
-          type: number
-        top_p:
-          description: "Nucleus sampling probability cutoff."
-          type: number
-        repeat_penalty:
-          description: "Penalty to be applied for repeating tokens, 1. means no penalty."
-          type: number
-        repeat_last_n:
-          description: "The context size to consider for the repeat penalty."
-          type: integer
-        seed:
-          description: "The seed to use when generating random samples."
-          type: integer
+          description: "The user ID of the user who generated the sample."
+        options:
+          type: object
+          description: "The options used to generate the sample. (optional)"
+          properties:
+            sample_len:
+              type: integer
+              description: "The length of the sample to generate (in tokens) (default: context size)."
+            temperature:
+              description: "The temperature used to generate samples."
+              type: number
+            top_p:
+              description: "Nucleus sampling probability cutoff."
+              type: number
+            repeat_penalty:
+              description: "Penalty to be applied for repeating tokens, 1. means no penalty."
+              type: number
+            repeat_last_n:
+              description: "The context size to consider for the repeat penalty."
+              type: integer
+            seed:
+              description: "The seed to use when generating random samples."
+              type: integer
+        override_system_prompt:
+          type: string
+          description: "The system prompt to use for this sample. (optional)"
+        use_chat:
+          type: boolean
+          description: "Whether to use the chat api for this sample. (optional)"
+        reflesh_history:
+          type: boolean
+          description: "Whether to reflesh the chat history for this sample. (optional)"
+        histories:
+          type: array
+          description: "The history of the conversation leading up to this sample. (optional)"
+          items:
+            type: object
+            properties:
+              chat_id:
+                type: integer
+                description: "The chat ID."
+              role:
+                type: string
+                description: "The role of the user in the chat.(user or system or assistant)"
+              content:
+                type: string
+                description: "The message that was sent."
 run:
   script:
     language: jobworkerp
@@ -60,11 +122,12 @@ run:
     arguments: # for annotation only
       prompt: |
         ${.}
-metadata: # todo init parameters
+metadata:
   runnerSettings:
     baseUrl: http://localhost:11434
     model: # specify the model to use (string)
     systemPrompt: # specify the system prompt to use (string)
+    pull_model: false # whether to pull the model from the server (boolean)
   worker:
     name: OllamaWorker # temporary name
 
