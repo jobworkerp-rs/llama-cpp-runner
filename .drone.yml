@@ -35,7 +35,7 @@ steps:
       - echo $PATH
       - rustup target add x86_64-unknown-linux-musl
       - cargo clean
-      - cargo build --release
+      - cargo build --release --features cuda
       - cargo test --release -- --test-threads=1
 volumes:
   - name: cargo_git
@@ -74,6 +74,7 @@ steps:
     image: gitea.toris.dev/servers/rust-gpu-build:12.4.1-1
     environment:
       CARGO_HOME: /usr/local/cargo
+      NVIDIA_DISABLE_REQUIRE: true
       NVIDIA_VISIBLE_DEVICES: all
       NVIDIA_DRIVER_CAPABILITIES: compute,utility
     volumes:

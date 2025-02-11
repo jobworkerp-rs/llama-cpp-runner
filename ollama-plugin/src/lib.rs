@@ -214,7 +214,7 @@ impl OllamaPlugin {
             let res = tokio::runtime::Runtime::new()
                 .unwrap()
                 .block_on(ollama.send_chat_messages_with_history(&mut histories, request))
-                .map_err(|e| anyhow!("Generation error: {}", e))?;
+                .map_err(|e| anyhow!("Generation error(chat_with_history): {}", e))?;
             tracing::debug!(
                 "END OF chat {}: created_at: {}",
                 OLLAMA_PROMPT,
@@ -331,7 +331,7 @@ impl OllamaPlugin {
                     .unwrap()
                     .block_on(ollama.send_chat_messages(request))
             }
-            .map_err(|e| anyhow!("Generation error: {}", e))?;
+            .map_err(|e| anyhow!("Generation error(chat_with_history_refleshed): {}", e))?;
             tracing::debug!(
                 "END OF chat {}: created_at: {}",
                 OLLAMA_PROMPT,
@@ -379,7 +379,7 @@ impl OllamaPlugin {
             let res: GenerationResponse = tokio::runtime::Runtime::new()
                 .unwrap()
                 .block_on(ollama.generate(request))
-                .map_err(|e| anyhow!("Generation error: {}", e))?;
+                .map_err(|e| anyhow!("Generation error(generation): {}", e))?;
             tracing::debug!(
                 "END OF generation {}: duration: {}",
                 OLLAMA_PROMPT,
