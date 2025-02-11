@@ -437,10 +437,6 @@ impl PluginRunner for OllamaPlugin {
     fn result_output_proto(&self) -> Option<String> {
         Some(include_str!("../../llama-protobuf/protobuf/ollama/ollama_args.proto").to_string())
     }
-    // if true, use job result of before job, else use job args from request
-    fn use_job_result(&self) -> bool {
-        false
-    }
 }
 
 #[cfg(test)]

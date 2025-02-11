@@ -118,10 +118,6 @@ impl PluginRunner for LlamaCppPlugin {
             include_str!("../../llama-protobuf/protobuf/llama_cpp/llama_cpp_arg.proto").to_string(),
         )
     }
-    // if true, use job result of before job, else use job args from request
-    fn use_job_result(&self) -> bool {
-        false
-    }
 }
 
 #[cfg(test)]
