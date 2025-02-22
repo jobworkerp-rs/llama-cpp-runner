@@ -11,14 +11,14 @@ steps:
   - name: submodules
     image: gitea.toris.dev/servers/drone-git-ssh:0.0.5
     commands:
-#      - cd github
+      #      - cd github
       - git submodule update --init --recursive
   - name: test
     image: gitea.toris.dev/servers/rust-gpu-build:12.4.1-1
     environment:
       NVIDIA_VISIBLE_DEVICES: all
       NVIDIA_DISABLE_REQUIRE: true
-#      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+    #      NVIDIA_DRIVER_CAPABILITIES: compute,utility
     volumes:
       - name: cargo_git
         path: /usr/local/cargo/git
@@ -29,11 +29,12 @@ steps:
       - name: docker_sock
         path: /var/run/docker.sock
     commands:
-#      - cd github
-#      - cp dot.env .env
+      #      - cd github
+      #      - cp dot.env .env
       - /usr/bin/nvidia-smi
       - echo $PATH
       - rustup target add x86_64-unknown-linux-musl
+      - rustup update stable
       - cargo clean
       - cargo build --release --features cuda
       - cargo test --release -- --test-threads=1
@@ -66,7 +67,7 @@ steps:
   - name: submodules
     image: gitea.toris.dev/servers/drone-git-ssh:0.0.5
     commands:
-#      - cd github
+      #      - cd github
       - git submodule update --init --recursive
 
   # release build(cuda)
@@ -89,13 +90,14 @@ steps:
     commands:
       #      - cp dot.env .env
       - rustup target add x86_64-unknown-linux-musl
+      - rustup update stable
       - cargo clean
       - cargo build --release --features cuda
 
   - name: tagging
     image: gitea.toris.dev/servers/drone-git-ssh:0.0.5
     commands:
-#      - TAG_VERSION=$(git show --no-patch --no-notes --pretty='%ci' HEAD | sed -e 's/^\(\w\+\)\-\(\w\+\)\-\(\w\+\)\s\(\w\+\):\(\w\+\):\(\w\+\).*$/\1\2\3_\4\5\6/')
+      #      - TAG_VERSION=$(git show --no-patch --no-notes --pretty='%ci' HEAD | sed -e 's/^\(\w\+\)\-\(\w\+\)\-\(\w\+\)\s\(\w\+\):\(\w\+\):\(\w\+\).*$/\1\2\3_\4\5\6/')
       - git remote set-url origin $(git remote get-url origin | sed -e 's/^https:\\/\\/gitea/git@gitea-ssh/' | sed -e 's/\(.*\)\\/\(.*\)\\/\(.*\)/\1:\2\\/\3/')
       - git tag ${DRONE_TAG} # $TAG_VERSION
       - git push origin --tags
@@ -103,47 +105,47 @@ steps:
   - name: publish_proto
     image: gitea.toris.dev/servers/drone-git-ssh:0.0.5
     commands:
-    - mkdir temp
-    - cd temp
-    - git clone git@gitea-ssh.toris.dev:jobworkerp-rs/llama-protobuf.git
-    - cd llama-protobuf
-    - git fetch origin
-    - git checkout main
-    - cp -a ../../llama-protobuf ../
-    - git add .
-    - git reset --soft origin/main
-    - test 0 -eq $(git diff --staged | wc -l) && exit
-    - echo ${DRONE_TAG} > VERSION
-    - git add ./VERSION
-    - git commit -m "Publish proto ${DRONE_TAG} from llama-cpp-plugin"
-    - git push origin main
-    - git tag ${DRONE_TAG}
-    - git push origin --tags
-    - cd ../..
-    - rm -rf temp
+      - mkdir temp
+      - cd temp
+      - git clone git@gitea-ssh.toris.dev:jobworkerp-rs/llama-protobuf.git
+      - cd llama-protobuf
+      - git fetch origin
+      - git checkout main
+      - cp -a ../../llama-protobuf ../
+      - git add .
+      - git reset --soft origin/main
+      - test 0 -eq $(git diff --staged | wc -l) && exit
+      - echo ${DRONE_TAG} > VERSION
+      - git add ./VERSION
+      - git commit -m "Publish proto ${DRONE_TAG} from llama-cpp-plugin"
+      - git push origin main
+      - git tag ${DRONE_TAG}
+      - git push origin --tags
+      - cd ../..
+      - rm -rf temp
 
   # for jobworkerp plugin
   - name: publish_plugin
     image: gitea.toris.dev/servers/drone-git-ssh:0.0.5
     commands:
-    # https://stackoverflow.com/questions/66366582/github-unexpected-disconnect-while-reading-sideband-packet
-    - git config --global http.postBuffer 157286400
-    - git config --global http.version HTTP/1.1
-    - git clone --depth 1 ssh://git@gitea-ssh.toris.dev/jobworkerp-rs/jobworkerp-plugins.git
-    - cd jobworkerp-plugins
-    - git lfs install
-    - git lfs pull
-    - git checkout origin/main -- ./VERSION
-    - git reset --soft origin/main
-    - cp ../target/release/lib*.so cuda_runner/
-    - git add .
-    - test 0 -eq $(git diff --staged | wc -l) && exit
-    - echo ${DRONE_TAG} > VERSION
-    - git add ./VERSION
-    - git commit -m "Publish plugin ${DRONE_TAG}"
-    - git push origin main
-    - git tag ${DRONE_TAG}
-    - git push origin --tags
+      # https://stackoverflow.com/questions/66366582/github-unexpected-disconnect-while-reading-sideband-packet
+      - git config --global http.postBuffer 157286400
+      - git config --global http.version HTTP/1.1
+      - git clone --depth 1 ssh://git@gitea-ssh.toris.dev/jobworkerp-rs/jobworkerp-plugins.git
+      - cd jobworkerp-plugins
+      - git lfs install
+      - git lfs pull
+      - git checkout origin/main -- ./VERSION
+      - git reset --soft origin/main
+      - cp ../target/release/lib*.so cuda_runner/
+      - git add .
+      - test 0 -eq $(git diff --staged | wc -l) && exit
+      - echo ${DRONE_TAG} > VERSION
+      - git add ./VERSION
+      - git commit -m "Publish plugin ${DRONE_TAG}"
+      - git push origin main
+      - git tag ${DRONE_TAG}
+      - git push origin --tags
 
 volumes:
   - name: cargo_git
@@ -163,9 +165,8 @@ trigger:
   branch:
     - main
   event:
-#    - release
+    #    - release
     - push
-
 #---
 #kind: pipeline
 #type: docker
