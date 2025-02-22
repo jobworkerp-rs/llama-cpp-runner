@@ -357,7 +357,8 @@ impl LlamaModelWrapper {
             }
         };
         let prompt = if let Some(vec) = chats {
-            match self.model.apply_chat_template(None, vec, true) {
+            let tmpl = self.model.get_chat_template()?;
+            match self.model.apply_chat_template(&tmpl, vec.as_slice(), true) {
                 Ok(v) => {
                     tracing::debug!("applied chat template: {}", &v);
                     v
