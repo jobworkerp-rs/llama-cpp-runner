@@ -73,4 +73,10 @@ message OllamaArgs {
   // TODO (unimplemented) The schema JSON to use for the structured output.
   // (currently the content is ignored(specified or not)).
   optional string schema_json = 8;
+
+  // divide output text and think text as result
+  bool divide_think_tag = 9;
+
+  // think tag (maybe some if divide_think_tag is true)
+  optional string think = 10;
 }

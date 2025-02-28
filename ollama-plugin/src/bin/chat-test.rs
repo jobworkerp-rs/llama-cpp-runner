@@ -123,6 +123,8 @@ fn main() -> Result<()> {
             histories: history.clone(),
             refresh_history: override_prompt,
             schema_json: None,
+            divide_think_tag: false,
+            think: None,
         };
 
         // if let Some(context) = context.clone() {

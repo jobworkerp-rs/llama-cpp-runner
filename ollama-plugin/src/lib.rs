@@ -275,11 +275,21 @@ impl OllamaPlugin {
                     }
                 })
                 .collect();
-            Ok(OllamaArgs {
-                prompt: res.message.content,
-                histories,
-                ..args
-            })
+            if args.divide_think_tag {
+                let (prompt, think) = Self::divide_think_tag(res.message.content);
+                Ok(OllamaArgs {
+                    prompt,
+                    think,
+                    histories,
+                    ..args
+                })
+            } else {
+                Ok(OllamaArgs {
+                    prompt: res.message.content,
+                    histories,
+                    ..args
+                })
+            }
         } else {
             Err(anyhow!("llama_model is not loaded"))
         }
@@ -343,11 +353,21 @@ impl OllamaPlugin {
                 Self::to_jobworker_chat(&latest, true),
                 Self::to_jobworker_chat(&res.message, true),
             ]);
-            Ok(OllamaArgs {
-                prompt: res.message.content,
-                histories,
-                ..args
-            })
+            if args.divide_think_tag {
+                let (prompt, think) = Self::divide_think_tag(res.message.content);
+                Ok(OllamaArgs {
+                    prompt,
+                    think,
+                    histories,
+                    ..args
+                })
+            } else {
+                Ok(OllamaArgs {
+                    prompt: res.message.content,
+                    histories,
+                    ..args
+                })
+            }
         } else {
             Err(anyhow!("llama_model is not loaded"))
         }
@@ -385,13 +405,33 @@ impl OllamaPlugin {
                 OLLAMA_PROMPT,
                 res.total_duration.unwrap_or_default()
             );
-            Ok(OllamaArgs {
-                prompt: res.response,
-                ..args
-            })
+            if args.divide_think_tag {
+                let (prompt, think) = Self::divide_think_tag(res.response);
+                Ok(OllamaArgs {
+                    prompt,
+                    think,
+                    ..args
+                })
+            } else {
+                Ok(OllamaArgs {
+                    prompt: res.response,
+                    ..args
+                })
+            }
         } else {
             Err(anyhow!("llama_model is not loaded"))
         }
+    }
+    // divide <think></think> tag from prompt
+    fn divide_think_tag(prompt: String) -> (String, Option<String>) {
+        if let Some(think_start) = prompt.find("<think>") {
+            if let Some(think_end) = prompt.find("</think>") {
+                let think = Some(prompt[think_start + 7..think_end].trim().to_string());
+                let new_prompt = prompt[..think_start].to_string() + &prompt[think_end + 8..];
+                return (new_prompt.trim().to_string(), think);
+            }
+        }
+        (prompt.trim().to_string(), None)
     }
 }
 
@@ -516,5 +556,20 @@ Good luck in the competition and in advancing AI research!
             .unwrap();
         println!("response: {:?}", res.prompt);
         assert!(res.prompt.len() > 10 && res.prompt.len() < 4096);
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn test_divide_think_tag() {
+        let (prompt, think) = OllamaPlugin::divide_think_tag(
+            "aaa\n<think>\nbbb\nccc\n</think>\nddd\neee".to_string(),
+        );
+        assert_eq!(prompt, "aaa\n\nddd\neee");
+        assert_eq!(think, Some("bbb\nccc".to_string()));
+
+        let (prompt, think) =
+            OllamaPlugin::divide_think_tag("<think>\naaa\nbbb\nccc\nddd\neee".to_string());
+        assert_eq!(prompt, "<think>\naaa\nbbb\nccc\nddd\neee");
+        assert_eq!(think, None);
     }
 }
