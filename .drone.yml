@@ -18,6 +18,7 @@ steps:
     environment:
       NVIDIA_VISIBLE_DEVICES: all
       NVIDIA_DISABLE_REQUIRE: true
+      RUSTFLAGS: "-C relocation-model=pic"
     #      NVIDIA_DRIVER_CAPABILITIES: compute,utility
     volumes:
       - name: cargo_git
@@ -78,6 +79,7 @@ steps:
       NVIDIA_DISABLE_REQUIRE: true
       NVIDIA_VISIBLE_DEVICES: all
       NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      RUSTFLAGS: "-C relocation-model=pic"
     volumes:
       - name: cargo_git
         path: /usr/local/cargo/git
