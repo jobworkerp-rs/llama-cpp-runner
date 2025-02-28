@@ -37,7 +37,7 @@ steps:
 #      - rustup target add x86_64-unknown-linux-musl
 #      - rustup update stable
       - cargo clean
-      - cargo build --release --features cuda
+      - cargo build --release #--features cuda
       - cargo test --release -- --test-threads=1
 volumes:
   - name: cargo_git
@@ -94,7 +94,7 @@ steps:
 #      - rustup target add x86_64-unknown-linux-musl
 #      - rustup update stable
       - cargo clean
-      - cargo build --release --features cuda
+      - cargo build --release #--features cuda
 
   - name: tagging
     image: gitea.toris.dev/servers/drone-git-ssh:0.0.5
