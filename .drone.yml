@@ -14,7 +14,7 @@ steps:
       #      - cd github
       - git submodule update --init --recursive
   - name: test
-    image: gitea.toris.dev/servers/rust-gpu-build:20250228-0
+    image: gitea.toris.dev/servers/rust-gpu-build:20250320
     environment:
       NVIDIA_VISIBLE_DEVICES: all
       NVIDIA_DISABLE_REQUIRE: true
@@ -73,7 +73,7 @@ steps:
 
   # release build(cuda)
   - name: build
-    image: gitea.toris.dev/servers/rust-gpu-build:20250228-0
+    image: gitea.toris.dev/servers/rust-gpu-build:20250320
     environment:
       CARGO_HOME: /usr/local/cargo
       NVIDIA_DISABLE_REQUIRE: true
@@ -182,7 +182,7 @@ trigger:
 #      - git submodule update --init --recursive
 #
 #  - name: build
-#    image: gitea.toris.dev/servers/rust-gpu-build:20250228-0
+#    image: gitea.toris.dev/servers/rust-gpu-build:20250320
 #    environment:
 #      CARGO_HOME: /usr/local/cargo
 #      NVIDIA_VISIBLE_DEVICES: all
