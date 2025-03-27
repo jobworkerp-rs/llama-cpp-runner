@@ -440,6 +440,10 @@ impl PluginRunner for OllamaPlugin {
         // specify as same string as worker.settings
         OLLAMA_PROMPT.to_string()
     }
+    fn description(&self) -> String {
+        "OllamaPromptRunner connects to Ollama server and lets you generate text with your own prompts and settings"
+            .to_string()
+    }
     fn load(&mut self, settings: Vec<u8>) -> Result<()> {
         let settings = OllamaRunnerSettings::decode(&mut Cursor::new(settings))
             .map_err(|e| anyhow!("decode error: {}", e))?;

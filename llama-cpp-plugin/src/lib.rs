@@ -75,6 +75,10 @@ impl PluginRunner for LlamaCppPlugin {
         // specify as same string as worker.operation
         String::from("LLMPromptRunner")
     }
+    fn description(&self) -> String {
+        String::from(
+            "LLMPromptRunner is a plugin that lets you run LLM models with your own prompts and custom settings",        )
+    }
     fn load(&mut self, settings: Vec<u8>) -> Result<()> {
         let settings = LlamaRunnerSettings::decode(&mut Cursor::new(settings))
             .map_err(|e| anyhow!("decode error: {}", e))?;
