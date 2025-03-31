@@ -47,7 +47,7 @@ rand = { version = "0.9" }
 regex = { version = "1" }
 #safetensors = { version = "0.4" }
 #scopeguard = { version = "1" }
-schemars = { version = "0.8" }
+schemars = { version = "1.0.0-alpha.17", features = ["chrono04"] }
 serde = { version = "1" }
 serde_json = { version = "1" }
 tonic = { version = "0.13" }

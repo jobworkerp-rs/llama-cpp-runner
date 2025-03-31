@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 anyhow = "1"
 async-trait = { version = "0.1" }
+schemars = { version = "1.0.0-alpha.17", features = ["chrono04"] }
 serde = { version = "1" }
 prost = { version = "0.13" }
 

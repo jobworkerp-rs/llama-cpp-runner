@@ -2,6 +2,8 @@ use anyhow::{anyhow, Context, Result};
 use command_utils::util::option::Exists;
 use itertools::Itertools;
 use jobworkerp_client::plugins::PluginRunner;
+use jobworkerp_client::{schema_to_json_string, schema_to_json_string_option};
+use jobworkerp_llama_protobuf::protobuf::llama_cpp::{LlamaArg, LlamaRunnerSettings};
 use jobworkerp_llama_protobuf::protobuf::ollama::ollama_args::{self, MessageRole};
 use jobworkerp_llama_protobuf::protobuf::ollama::{OllamaArgs, OllamaRunnerSettings};
 use jobworkerp_util::runner::OLLAMA_PROMPT;
@@ -472,6 +474,10 @@ impl PluginRunner for OllamaPlugin {
         tracing::warn!("OllamaPromptRunner cancel: not implemented!");
         false
     }
+    fn is_canceled(&self) -> bool {
+        tracing::warn!("OllamaPromptRunner is_canceled: not implemented!");
+        false
+    }
     fn runner_settings_proto(&self) -> String {
         include_str!("../../llama-protobuf/protobuf/ollama/ollama_runner.proto").to_string()
     }
@@ -480,6 +486,18 @@ impl PluginRunner for OllamaPlugin {
     }
     fn result_output_proto(&self) -> Option<String> {
         Some(include_str!("../../llama-protobuf/protobuf/ollama/ollama_args.proto").to_string())
+    }
+    fn settings_schema(&self) -> String {
+        schema_to_json_string!(LlamaRunnerSettings, "settings_schema")
+    }
+    fn arguments_schema(&self) -> String {
+        schema_to_json_string!(LlamaArg, "arguments_schema")
+    }
+    fn output_json_schema(&self) -> Option<String> {
+        schema_to_json_string_option!(LlamaArg, "arguments_schema")
+    }
+    fn output_type(&self) -> jobworkerp_client::jobworkerp::data::StreamingOutputType {
+        jobworkerp_client::jobworkerp::data::StreamingOutputType::NonStreaming
     }
 }
 

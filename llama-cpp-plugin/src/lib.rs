@@ -1,7 +1,9 @@
 pub mod model;
 
 use anyhow::{anyhow, Context, Result};
-use jobworkerp_client::plugins::PluginRunner;
+use jobworkerp_client::{
+    plugins::PluginRunner, schema_to_json_string, schema_to_json_string_option,
+};
 use jobworkerp_llama_protobuf::protobuf::llama_cpp::{LlamaArg, LlamaRunnerSettings};
 use model::{LlamaModelConfig, LlamaModelWrapper};
 use prost::Message;
@@ -110,6 +112,10 @@ impl PluginRunner for LlamaCppPlugin {
         tracing::warn!("LLMRunner cancel: not implemented!");
         false
     }
+    fn is_canceled(&self) -> bool {
+        tracing::warn!("LLMRunner is_canceled: not implemented!");
+        false
+    }
     fn runner_settings_proto(&self) -> String {
         include_str!("../../llama-protobuf/protobuf/llama_cpp/llama_cpp_runner.proto").to_string()
     }
@@ -121,6 +127,15 @@ impl PluginRunner for LlamaCppPlugin {
         Some(
             include_str!("../../llama-protobuf/protobuf/llama_cpp/llama_cpp_arg.proto").to_string(),
         )
+    }
+    fn settings_schema(&self) -> String {
+        schema_to_json_string!(LlamaRunnerSettings, "settings_schema")
+    }
+    fn arguments_schema(&self) -> String {
+        schema_to_json_string!(LlamaArg, "arguments_schema")
+    }
+    fn output_json_schema(&self) -> Option<String> {
+        schema_to_json_string_option!(LlamaRunnerSettings, "settings_schema")
     }
 }
 
