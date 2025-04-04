@@ -54,17 +54,14 @@ output:
           description: "The seed to use when generating random samples."
           type: integer
 run:
-  script:
-    language: jobworkerp
-    code: OllamaPromptRunner
+  function:
+    runnerName: OllamaPromptRunner
     arguments:
       prompt: |
         ${.}
-metadata:
-  runnerSettings:
-    baseUrl: http://ollma.ollama.svc.cluster.local:11434
-    model: phi4
-    systemPrompt: |
-        You are a helpful assistant.
-  worker:
+    settings:
+      baseUrl: http://ollma.ollama.svc.cluster.local:11434
+      model: phi4
+      systemPrompt: |
+          You are a helpful assistant.
 

@@ -116,18 +116,14 @@ output: # for annotation only
                 type: string
                 description: "The message that was sent."
 run:
-  script:
-    language: jobworkerp
-    code: OllamaPromptRunner
+  function:
+    runnerName: OllamaPromptRunner
     arguments: # for annotation only
       prompt: |
         ${.}
-metadata:
-  runnerSettings:
-    baseUrl: http://localhost:11434
-    model: # specify the model to use (string)
-    systemPrompt: # specify the system prompt to use (string)
-    pull_model: false # whether to pull the model from the server (boolean)
-  worker:
-    name: OllamaWorker # temporary name
+    settings:
+      baseUrl: http://localhost:11434
+      model: # specify the model to use (string)
+      systemPrompt: # specify the system prompt to use (string)
+      pull_model: false # whether to pull the model from the server (boolean)
 
