@@ -1,5 +1,4 @@
 use anyhow::{anyhow, Context, Result};
-use command_utils::util::option::Exists;
 use itertools::Itertools;
 use jobworkerp_client::plugins::PluginRunner;
 use jobworkerp_client::{schema_to_json_string, schema_to_json_string_option};
@@ -13,8 +12,8 @@ use ollama_rs::{
     generation::{
         chat::ChatMessage,
         completion::{request::GenerationRequest, GenerationResponse},
-        options::GenerationOptions,
     },
+    models::ModelOptions,
     Ollama,
 };
 use prost::Message;
@@ -160,8 +159,8 @@ impl OllamaPlugin {
                 .unwrap_or_default(),
         }
     }
-    pub fn create_options(args: &OllamaArgs) -> GenerationOptions {
-        let mut options = GenerationOptions::default();
+    pub fn create_options(args: &OllamaArgs) -> ModelOptions {
+        let mut options = ModelOptions::default();
 
         if let Some(opts) = args.options {
             if let Some(sample_len) = opts.sample_len {
@@ -198,7 +197,7 @@ impl OllamaPlugin {
                 .collect();
             if !histories
                 .first()
-                .exists(|m| m.role == chat::MessageRole::System)
+                .is_some_and(|m| m.role == chat::MessageRole::System)
             {
                 let system = if let Some(system_prompt) = args.override_system_prompt.clone() {
                     system_prompt
@@ -307,7 +306,7 @@ impl OllamaPlugin {
                 .collect();
             if messages
                 .first()
-                .exists(|m| m.role == chat::MessageRole::System)
+                .is_some_and(|m| m.role == chat::MessageRole::System)
             {
                 // replace system prompt if override_system_prompt is specified
                 if let Some(system_prompt) = args.override_system_prompt.clone() {

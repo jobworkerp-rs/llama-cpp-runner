@@ -1,5 +1,4 @@
 use anyhow::{anyhow, Context, Result};
-use command_utils::util::option::Exists;
 use jobworkerp_client::plugins::PluginRunner;
 use jobworkerp_llama_cpp_plugin::LlamaCppPlugin;
 use jobworkerp_llama_protobuf::protobuf::llama_cpp::LlamaArg;
@@ -70,7 +69,7 @@ fn collect_markdown_files(dir: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
             } else if path.is_file()
                 && path
                     .file_name()
-                    .exists(|f| !f.to_string_lossy().starts_with("._"))
+                    .is_some_and(|f| !f.to_string_lossy().starts_with("._"))
                 && path.extension().map_or(false, |ext| ext == "md")
             {
                 files.push(path);

@@ -1,5 +1,4 @@
 use anyhow::{Context, Result};
-use command_utils::util::option::Exists;
 use ollama_rs::{
     error::OllamaError,
     generation::completion::{request::GenerationRequest, GenerationResponseStream},
@@ -90,7 +89,7 @@ fn collect_markdown_files(dir: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
             } else if path.is_file()
                 && path
                     .file_name()
-                    .exists(|f| !f.to_string_lossy().starts_with("._"))
+                    .is_some_and(|f| !f.to_string_lossy().starts_with("._"))
                 && path.extension().map_or(false, |ext| ext == "md")
             {
                 files.push(path);
