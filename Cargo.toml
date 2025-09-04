@@ -6,6 +6,7 @@ members = [
     "llama-protobuf",
     "llama-cpp-plugin",
     "ollama-plugin",
+    "embedding-llm",
 ]
 
 resolver = "2"
@@ -51,7 +52,9 @@ regex = { version = "1" }
 schemars = { version = "1.0.4", features = ["chrono04"] }
 serde = { version = "1" }
 serde_json = { version = "1" }
+thiserror = "2"
 tonic = { version = "0.14" }
+tokenizers = "0.22"
 tokio = { version = "1" }
 tokio-stream = { version = "0.1" }
 tracing = { version = "0.1" }

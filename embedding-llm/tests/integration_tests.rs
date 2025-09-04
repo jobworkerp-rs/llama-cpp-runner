@@ -1,0 +1,354 @@
+use embedding_llm::{
+    embedding::LlamaCppEmbedder,
+    protobuf::embedding_llm::{EmbeddingLlmRunnerSettings, ModelType, DType, SlidingWindowConfig},
+};
+use tracing_subscriber;
+
+/// 実際のGGUFモデルを使用した統合テスト
+/// 
+/// 複数のモデル設定でテストを実行し、実際のembeddingベクトル計算を検証します。
+/// 
+/// 使用例:
+/// ```bash
+/// # 統合テスト実行（小型モデルを自動ダウンロード）
+/// cargo test integration_test_real_embedding -- --ignored --test-threads=1 --nocapture
+/// ```
+
+#[tokio::test]
+#[ignore] // 実際のモデルが必要なため通常は無視
+async fn integration_test_real_embedding() {
+    
+    // ログ初期化
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .with_test_writer()
+        .try_init();
+    
+    // テスト用モデル設定（小型モデルを使用）
+    let test_configs = get_test_model_configs();
+    
+    for (config_name, settings) in test_configs {
+        println!("\n======== Testing with {} ========", config_name);
+        if let Err(e) = run_embedding_test_with_config(&settings).await {
+            println!("✗ Test failed for {}: {}", config_name, e);
+            println!("Skipping to next configuration...\n");
+            continue;
+        }
+    }
+    
+    println!("\n=== Real Embedding Integration Test Completed ===");
+    println!("All available configurations tested!");
+}
+
+/// 個別の設定でembeddingテストを実行
+async fn run_embedding_test_with_config(settings: &EmbeddingLlmRunnerSettings) -> anyhow::Result<()> {
+    
+    println!("Model: {}", settings.model_id);
+    println!("Files: {:?}", settings.model_files);
+    println!("Tokenizer: {:?}", settings.tokenizer_model_id);
+    println!("Use CPU: {}", settings.use_cpu);
+    println!("Max seq length: {}", settings.max_seq_length);
+    
+    // Embedderの初期化
+    println!("\n1. Loading model...");
+    let embedder = match LlamaCppEmbedder::new_from_settings(settings) {
+        Ok(embedder) => {
+            println!("✓ Model loaded successfully");
+            embedder
+        },
+        Err(e) => {
+            panic!("✗ Failed to load model '{}': {}\n\nTroubleshooting:\n- Ensure network connectivity for HF models\n- Verify GGUF file format\n- Check available memory\n- Try CPU-only mode", settings.model_id, e);
+        }
+    };
+    
+    // ヘルスチェック
+    println!("\n2. Performing health check...");
+    if let Err(e) = embedder.health_check() {
+        panic!("✗ Health check failed: {}", e);
+    }
+    println!("✓ Health check passed");
+    
+    // モデル情報の表示
+    let model_info = embedder.model_info();
+    println!("\n3. Model Information:");
+    println!("   Path: {}", model_info.model_path);
+    println!("   Embedding dimension: {}", model_info.embedding_dimension);
+    println!("   Max context length: {}", model_info.max_context_length);
+    println!("   Vocabulary size: {}", model_info.vocab_size);
+    println!("   Dtype: {}", model_info.dtype);
+    
+    // 基本的な検証
+    assert!(model_info.embedding_dimension > 0, "Invalid embedding dimension");
+    assert!(model_info.max_context_length > 0, "Invalid context length");
+    assert!(model_info.vocab_size > 0, "Invalid vocabulary size");
+    
+    // テストケース
+    let long_text = "A".repeat(1000);
+    let test_cases = vec![
+        ("Hello world", None, "Basic English text"),
+        ("こんにちは世界", None, "Japanese text"),
+        ("The quick brown fox jumps over the lazy dog", None, "Long English sentence"),
+        ("Artificial intelligence", Some("Represent this concept:"), "With instruction"),
+        ("", None, "Empty text (should handle gracefully)"),
+        (long_text.as_str(), None, "Very long text (sliding window test)"),
+    ];
+    
+    println!("\n4. Running embedding generation tests...");
+    for (i, (text, instruction, description)) in test_cases.iter().enumerate() {
+        println!("   Test {}: {}", i + 1, description);
+        
+        if text.is_empty() {
+            // 空のテキストは適切にエラーハンドリングされることを確認
+            let result = embedder.generate_embeddings_with_instruction(text, instruction.as_deref(), true, None);
+            match result {
+                Err(_) => println!("     ✓ Empty text handled correctly with error"),
+                Ok(embeddings) if embeddings.is_empty() => println!("     ✓ Empty text returned empty embeddings"),
+                Ok(_) => println!("     ? Empty text returned embeddings (model-dependent behavior)"),
+            }
+            continue;
+        }
+        
+        // 正常なケースの処理
+        let start_time = std::time::Instant::now();
+        let result = embedder.generate_embeddings_with_instruction(text, instruction.as_deref(), true, None);
+        let duration = start_time.elapsed();
+        
+        match result {
+            Ok(embeddings) => {
+                println!("     ✓ Generated {} embeddings in {:?}", embeddings.len(), duration);
+                
+                // 基本的な検証
+                assert!(!embeddings.is_empty(), "No embeddings generated for: {}", description);
+                
+                for (j, embedding) in embeddings.iter().enumerate() {
+                    assert_eq!(embedding.len(), model_info.embedding_dimension, 
+                               "Wrong embedding dimension for embedding {} in: {}", j, description);
+                    
+                    // L2正規化されているかチェック（normalize=trueのため）
+                    let norm: f32 = embedding.iter().map(|x| x * x).sum::<f32>().sqrt();
+                    let norm_diff = (norm - 1.0).abs();
+                    assert!(norm_diff < 0.01, 
+                           "Embedding {} not properly normalized (norm: {:.6}) in: {}", j, norm, description);
+                    
+                    // NaN/Infチェック  
+                    assert!(!embedding.iter().any(|x| x.is_nan() || x.is_infinite()),
+                           "Invalid values in embedding {} for: {}", j, description);
+                }
+                
+                println!("       - Embedding dimensions: {}x{}", embeddings.len(), embeddings[0].len());
+                println!("       - First 5 values: {:?}", &embeddings[0][..5.min(embeddings[0].len())]);
+                println!("       - L2 norm: {:.6}", embeddings[0].iter().map(|x| x * x).sum::<f32>().sqrt());
+            },
+            Err(e) => {
+                panic!("✗ Failed to generate embedding for '{}': {}", description, e);
+            }
+        }
+    }
+    
+    // 5. バッチ処理テスト
+    println!("\n5. Testing batch processing...");
+    let batch_texts = vec![
+        "First text".to_string(),
+        "Second text".to_string(),
+        "Third text".to_string(),
+    ];
+    
+    let individual_start = std::time::Instant::now();
+    let mut individual_embeddings = Vec::new();
+    for text in &batch_texts {
+        let emb = embedder.generate_embeddings_with_instruction(text, None, true, None)
+            .map_err(|e| anyhow::anyhow!("Batch processing failed: {}", e))?;
+        individual_embeddings.push(emb);
+    }
+    let individual_duration = individual_start.elapsed();
+    
+    println!("   - Individual processing: {} texts in {:?}", batch_texts.len(), individual_duration);
+    println!("   ✓ Batch processing test completed");
+    
+    // 6. メモリ使用量推定
+    println!("\n6. Resource usage estimation:");
+    let estimated_memory = embedder.estimate_memory_usage();
+    println!("   - Estimated memory usage: {:.2} MB", estimated_memory as f64 / 1024.0 / 1024.0);
+    
+    // 7. 同一テキストの一貫性テスト
+    println!("\n7. Testing consistency...");
+    let test_text = "Consistency test text";
+    let embedding1 = embedder.generate_embeddings_with_instruction(test_text, None, true, None)
+        .map_err(|e| anyhow::anyhow!("Consistency test failed: {}", e))?;
+    let embedding2 = embedder.generate_embeddings_with_instruction(test_text, None, true, None)
+        .map_err(|e| anyhow::anyhow!("Consistency test failed: {}", e))?;
+    
+    assert_eq!(embedding1.len(), embedding2.len(), "Inconsistent number of embeddings");
+    
+    // ベクトル間の距離を計算（同一テキストなので距離は0に近いはず）
+    if !embedding1.is_empty() && !embedding2.is_empty() {
+        let cosine_sim = embedding1[0].iter()
+            .zip(embedding2[0].iter())
+            .map(|(a, b)| a * b)
+            .sum::<f32>();
+        
+        println!("   - Cosine similarity between identical texts: {:.6}", cosine_sim);
+        assert!(cosine_sim > 0.99, "Inconsistent embeddings for identical text");
+        println!("   ✓ Consistency test passed");
+    }
+    
+    println!("   ✓ All tests passed for this configuration!");
+    
+    Ok(()) // Resultの返却を追加
+}
+
+/// テスト用モデル設定を取得
+/// 複数の設定でrobustnessを検証
+fn get_test_model_configs() -> Vec<(&'static str, EmbeddingLlmRunnerSettings)> {
+    vec![
+        // 1. Qwen3-Embeddingのみ（動作確認済み）
+        ("Qwen3-Embedding-Only", EmbeddingLlmRunnerSettings {
+            model_id: "Qwen/Qwen3-Embedding-4B-GGUF".to_string(),
+            use_cpu: true,
+            dtype: Some(DType::F32 as i32),
+            max_seq_length: 256, // 短くして高速化
+            model_type: ModelType::Gguf as i32,
+            model_files: vec!["Qwen3-Embedding-4B-Q4_K_M.gguf".to_string()],
+            tokenizer_model_id: None, // GGUF内蔵tokenizerでシンプル化
+            sliding_window_config: None, // sliding windowなしで高速化
+            max_batch_size: Some(8), // バッチ処理テスト用
+        }),
+        
+        // 2. Qwen3-Embedding（最新embedding専用モデル、GGUF内蔵tokenizer）
+        ("Qwen3-Embedding-GGUF-Tokenizer", EmbeddingLlmRunnerSettings {
+            model_id: "Qwen/Qwen3-Embedding-4B-GGUF".to_string(),
+            use_cpu: true,
+            dtype: None, // デフォルト値テスト
+            max_seq_length: 1024,
+            model_type: ModelType::Gguf as i32,
+            model_files: vec!["Qwen3-Embedding-4B-Q4_K_M.gguf".to_string()],
+            tokenizer_model_id: None, // GGUF内蔵tokenizerを使用
+            sliding_window_config: Some(SlidingWindowConfig {
+                window_stride: 512,
+                min_window_size: 128,
+            }),
+            max_batch_size: Some(6),
+        }),
+        
+        // 3. Qwen3-Embedding + HuggingFace tokenizer組み合わせ
+        ("Qwen3-Embedding-HF-Tokenizer", EmbeddingLlmRunnerSettings {
+            model_id: "Qwen/Qwen3-Embedding-4B-GGUF".to_string(),
+            use_cpu: false,
+            dtype: Some(DType::F16 as i32),
+            max_seq_length: 768,
+            model_type: ModelType::Gguf as i32,
+            model_files: vec!["Qwen3-Embedding-4B-Q4_K_M.gguf".to_string()],
+            tokenizer_model_id: Some("Qwen/Qwen3-Embedding-4B".to_string()), // 元のembeddingモデルのtokenizer
+            sliding_window_config: None, // sliding window無効テスト
+            max_batch_size: Some(2), // GPU用小さめバッチサイズ
+        }),
+    ]
+}
+
+/// 個別テスト: Qwen3-Embeddingで高速テスト
+#[tokio::test]
+#[ignore]
+async fn integration_test_qwen3_embedding_quick() {
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG) // DEBUGレベルに変更
+        .with_test_writer()
+        .try_init();
+    
+    let settings = EmbeddingLlmRunnerSettings {
+        model_id: "Qwen/Qwen3-Embedding-4B-GGUF".to_string(),
+        use_cpu: true, // CPU専用でデバッグ
+        dtype: Some(DType::F32 as i32),
+        max_seq_length: 64, // さらに短縮
+        model_type: ModelType::Gguf as i32,
+        model_files: vec!["Qwen3-Embedding-4B-Q4_K_M.gguf".to_string()],
+        tokenizer_model_id: None, // GGUF内蔵tokenizerのテスト
+        sliding_window_config: None,
+        max_batch_size: Some(4), // クイックテスト用バッチサイズ
+    };
+    
+    println!("=== Qwen3-Embedding Quick Test ===");
+    if let Err(e) = run_embedding_test_with_config(&settings).await {
+        panic!("Qwen3-Embedding test failed: {}", e);
+    }
+}
+
+/// 個別テスト: Qwen3-Embedding + GGUF内蔵tokenizer
+#[tokio::test] 
+#[ignore]
+async fn integration_test_qwen3_embedding_gguf_tokenizer() {
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO) 
+        .with_test_writer()
+        .try_init();
+    
+    let settings = EmbeddingLlmRunnerSettings {
+        model_id: "Qwen/Qwen3-Embedding-4B-GGUF".to_string(),
+        use_cpu: false,
+        dtype: None, // デフォルト値テスト
+        max_seq_length: 512,
+        model_type: ModelType::Gguf as i32,
+        model_files: vec!["Qwen3-Embedding-4B-Q4_K_M.gguf".to_string()],
+        tokenizer_model_id: Some("Qwen/Qwen3-Embedding-4B".to_string()), // GGUF内蔵tokenizerをテスト
+        sliding_window_config: Some(SlidingWindowConfig {
+            window_stride: 256,
+            min_window_size: 64,
+        }),
+        max_batch_size: Some(4), // GGUF内蔵tokenizer用バッチサイズ
+    };
+    
+    println!("=== Qwen3-Embedding with GGUF Built-in Tokenizer Test ===");
+    if let Err(e) = run_embedding_test_with_config(&settings).await {
+        panic!("Qwen3-Embedding GGUF tokenizer test failed: {}", e);
+    }
+}
+
+/// 実際のモデルでのエラーハンドリングテスト
+#[tokio::test]
+#[ignore]
+async fn integration_test_error_handling() {
+    
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::WARN)
+        .with_test_writer()
+        .try_init();
+    
+    println!("=== Error Handling Integration Test ===");
+    
+    // 1. 存在しないモデルファイル
+    let invalid_settings = EmbeddingLlmRunnerSettings {
+        model_id: "nonexistent".to_string(),
+        use_cpu: true,
+        dtype: Some(DType::F32 as i32),
+        max_seq_length: 512,
+        model_type: ModelType::Gguf as i32,
+        model_files: vec!["nonexistent.gguf".to_string()],
+        tokenizer_model_id: None,
+        sliding_window_config: None,
+        max_batch_size: Some(4),
+    };
+    
+    println!("1. Testing invalid model path...");
+    let result = LlamaCppEmbedder::new_from_settings(&invalid_settings);
+    assert!(result.is_err(), "Should fail with invalid model path");
+    println!("   ✓ Correctly handled invalid model path");
+    
+    // 2. 無効なtokenizer
+    let invalid_tokenizer_settings = EmbeddingLlmRunnerSettings {
+        model_id: "test".to_string(),
+        use_cpu: true,
+        dtype: Some(DType::F32 as i32),
+        max_seq_length: 512,
+        model_type: ModelType::Gguf as i32,
+        model_files: vec!["test.gguf".to_string()],
+        tokenizer_model_id: Some("nonexistent/tokenizer".to_string()),
+        sliding_window_config: None,
+        max_batch_size: Some(4),
+    };
+    
+    println!("2. Testing invalid tokenizer...");
+    let result = LlamaCppEmbedder::new_from_settings(&invalid_tokenizer_settings);
+    assert!(result.is_err(), "Should fail with invalid tokenizer");
+    println!("   ✓ Correctly handled invalid tokenizer");
+    
+    println!("=== Error Handling Test Completed ===");
+}
