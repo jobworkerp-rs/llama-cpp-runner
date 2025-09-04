@@ -3,6 +3,7 @@ use jobworkerp_client::plugins::PluginRunner;
 use jobworkerp_llama_cpp_plugin::LlamaCppPlugin;
 use jobworkerp_llama_protobuf::protobuf::llama_cpp::LlamaArg;
 use prost::Message;
+use std::collections::HashMap;
 use std::fs;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
@@ -49,8 +50,11 @@ fn main() -> Result<()> {
     };
     let mut buf = Vec::with_capacity(request.encoded_len());
     request.encode(&mut buf).unwrap();
-    let res = plugin.run(buf).expect("failed to run plugin");
-    let res = LlamaArg::decode(&mut Cursor::new(res[0].clone()))
+    let res = plugin
+        .run(buf, HashMap::new())
+        .0
+        .expect("failed to run plugin");
+    let res = LlamaArg::decode(&mut Cursor::new(res.clone()))
         .map_err(|e| anyhow!("decode error: {}", e))
         .unwrap();
 

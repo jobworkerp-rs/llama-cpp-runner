@@ -1,4 +1,7 @@
-use std::io::{stdout, Write};
+use std::{
+    collections::HashMap,
+    io::{stdout, Write},
+};
 
 use anyhow::Result;
 use jobworkerp_client::plugins::PluginRunner;
@@ -131,22 +134,21 @@ fn main() -> Result<()> {
         //     request = request.context(context);
         // }
         let res = plugin
-            .run(request.encode_to_vec())
+            .run(request.encode_to_vec(), HashMap::new())
+            .0
             .map_err(|e| tracing::error!("Error: {}", e));
 
         match res {
             Ok(v) => {
-                if let Some(v) = v.first() {
-                    let r = OllamaArgs::decode(v.as_slice());
-                    match r {
-                        Ok(r) => {
-                            stdout.write_all(format!("{:#?}", r).as_bytes()).unwrap();
-                            stdout.flush().unwrap();
-                            history = r.histories;
-                        }
-                        Err(e) => {
-                            tracing::error!("Error: {:?}", e);
-                        }
+                let r = OllamaArgs::decode(v.as_slice());
+                match r {
+                    Ok(r) => {
+                        stdout.write_all(format!("{:#?}", r).as_bytes()).unwrap();
+                        stdout.flush().unwrap();
+                        history = r.histories;
+                    }
+                    Err(e) => {
+                        tracing::error!("Error: {:?}", e);
                     }
                 }
             }

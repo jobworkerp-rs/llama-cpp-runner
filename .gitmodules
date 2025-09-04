@@ -1,6 +1,6 @@
 [submodule "modules/jobworkerp-util"]
 	path = modules/jobworkerp-util
-	url = git@gitea-ssh.toris.dev:jobworkerp-rs/jobworkerp-util.git
+	url = git@gitea.sutr.app:jobworkerp-rs/jobworkerp-util.git
 [submodule "modules/jobworkerp-client"]
 	path = modules/jobworkerp-client
 	url = https://github.com/jobworkerp-rs/jobworkerp-client-rs.git

@@ -7,7 +7,7 @@ use jobworkerp_client::{
 use jobworkerp_llama_protobuf::protobuf::llama_cpp::{LlamaArg, LlamaRunnerSettings};
 use model::{LlamaModelConfig, LlamaModelWrapper};
 use prost::Message;
-use std::io::Cursor;
+use std::{collections::HashMap, io::Cursor};
 
 // suppress warn improper_ctypes_definitions
 #[allow(improper_ctypes_definitions)]
@@ -88,27 +88,34 @@ impl PluginRunner for LlamaCppPlugin {
         self.load_model(settings.into())?;
         Ok(())
     }
-    fn run(&mut self, arg: Vec<u8>) -> Result<Vec<Vec<u8>>> {
-        if let Some(llama_model) = self.llama_model.as_mut() {
-            let args = LlamaArg::decode(&mut Cursor::new(arg))
-                .map_err(|e| anyhow!("decode error: {}", e))?;
-            tracing::debug!("LLMRunner run: {args:?}",);
-            let text = llama_model
-                .run(args.clone().into())
-                .context("failed to decode")?;
-            tracing::debug!("END OF LLMRunner: {text:?}",);
-            let buf = LlamaArg {
-                prompt: text,
-                ..args
-            };
-            // serialize and return
-            let bytes = buf.encode_to_vec();
-            Ok(vec![bytes])
-        } else {
-            Err(anyhow!("llama_model is not loaded"))
-        }
+    fn run(
+        &mut self,
+        arg: Vec<u8>,
+        metadata: HashMap<String, String>,
+    ) -> (Result<Vec<u8>>, HashMap<String, String>) {
+        let res = || -> Result<Vec<u8>> {
+            if let Some(llama_model) = self.llama_model.as_mut() {
+                let args = LlamaArg::decode(&mut Cursor::new(arg))
+                    .map_err(|e| anyhow!("decode error: {}", e))?;
+                tracing::debug!("LLMRunner run: {args:?}",);
+                let text = llama_model
+                    .run(args.clone().into())
+                    .context("failed to decode")?;
+                tracing::debug!("END OF LLMRunner: {text:?}",);
+                let buf = LlamaArg {
+                    prompt: text,
+                    ..args
+                };
+                // serialize and return
+                let bytes = buf.encode_to_vec();
+                Ok(bytes)
+            } else {
+                Err(anyhow!("llama_model is not loaded"))
+            }
+        };
+        (res(), metadata)
     }
-    fn cancel(&mut self) -> bool {
+    fn cancel(&self) -> bool {
         tracing::warn!("LLMRunner cancel: not implemented!");
         false
     }
@@ -206,8 +213,11 @@ Good luck in the competition and in advancing AI research!
         };
         let mut buf = Vec::with_capacity(request.encoded_len());
         request.encode(&mut buf).unwrap();
-        let res = plugin.run(buf).expect("failed to run plugin");
-        let res = LlamaArg::decode(&mut Cursor::new(res[0].clone()))
+        let res = plugin
+            .run(buf, HashMap::new())
+            .0
+            .expect("failed to run plugin");
+        let res = LlamaArg::decode(&mut Cursor::new(res.clone()))
             .map_err(|e| anyhow!("decode error: {}", e))
             .unwrap();
         println!("response: {:?}", res.prompt);

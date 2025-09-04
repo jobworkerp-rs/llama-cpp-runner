@@ -17,6 +17,7 @@ use ollama_rs::{
     Ollama,
 };
 use prost::Message;
+use std::collections::HashMap;
 use std::io::Cursor;
 use std::vec;
 
@@ -126,6 +127,7 @@ impl OllamaPlugin {
             //             .collect()
             //     })
             //     .unwrap_or_default(),
+            thinking: None,
         }
     }
     pub fn to_jobworker_chat(mes: &chat::ChatMessage, gen_id: bool) -> ollama_args::ChatMessage {
@@ -453,23 +455,30 @@ impl PluginRunner for OllamaPlugin {
         tracing::info!("{} loaded", OLLAMA_PROMPT);
         Ok(())
     }
-    fn run(&mut self, arg: Vec<u8>) -> Result<Vec<Vec<u8>>> {
-        let args = OllamaArgs::decode(&mut Cursor::new(arg))
-            .map_err(|e| anyhow!("decode error: {}", e))?;
-        let res = if args.use_chat {
-            if args.refresh_history {
-                self.request_with_history_refreshed(args)
+    fn run(
+        &mut self,
+        arg: Vec<u8>,
+        metadata: HashMap<String, String>,
+    ) -> (Result<Vec<u8>>, HashMap<String, String>) {
+        let res = || -> Result<Vec<u8>> {
+            let args = OllamaArgs::decode(&mut Cursor::new(arg))
+                .map_err(|e| anyhow!("decode error: {}", e))?;
+            let res = if args.use_chat {
+                if args.refresh_history {
+                    self.request_with_history_refreshed(args)
+                } else {
+                    self.request_chat_with_history(args)
+                }
             } else {
-                self.request_chat_with_history(args)
-            }
-        } else {
-            self.request_generation(args)
-        }?;
-        let mut buf = Vec::with_capacity(res.encoded_len());
-        res.encode(&mut buf).unwrap();
-        Ok(vec![buf])
+                self.request_generation(args)
+            }?;
+            let mut buf = Vec::with_capacity(res.encoded_len());
+            res.encode(&mut buf).unwrap();
+            Ok(buf)
+        };
+        (res(), metadata)
     }
-    fn cancel(&mut self) -> bool {
+    fn cancel(&self) -> bool {
         tracing::warn!("OllamaPromptRunner cancel: not implemented!");
         false
     }
@@ -497,6 +506,21 @@ impl PluginRunner for OllamaPlugin {
     }
     fn output_type(&self) -> jobworkerp_client::jobworkerp::data::StreamingOutputType {
         jobworkerp_client::jobworkerp::data::StreamingOutputType::NonStreaming
+    }
+
+    fn begin_stream(
+        &mut self,
+        arg: Vec<u8>,
+        metadata: std::collections::HashMap<String, String>,
+    ) -> Result<()> {
+        // default implementation (return empty)
+        let (_, _) = (arg, metadata);
+        Err(anyhow::anyhow!("not implemented"))
+    }
+
+    fn receive_stream(&mut self) -> Result<Option<Vec<u8>>> {
+        // default implementation (return empty)
+        Err(anyhow::anyhow!("not implemented"))
     }
 }
 
@@ -571,8 +595,11 @@ Good luck in the competition and in advancing AI research!
         };
         let mut buf = Vec::with_capacity(request.encoded_len());
         request.encode(&mut buf).unwrap();
-        let res = plugin.run(buf).expect("failed to run plugin");
-        let res = OllamaArgs::decode(&mut Cursor::new(res[0].clone()))
+        let res = plugin
+            .run(buf, HashMap::new())
+            .0
+            .expect("failed to run plugin");
+        let res = OllamaArgs::decode(&mut Cursor::new(res.clone()))
             .map_err(|e| anyhow!("decode error: {}", e))
             .unwrap();
         println!("response: {:?}", res.prompt);
