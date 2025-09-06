@@ -9,6 +9,13 @@ env:
   NVIDIA_DISABLE_REQUIRE: true
   NVIDIA_DRIVER_CAPABILITIES: compute,utility
   RUSTFLAGS: "-C relocation-model=pic"
+  CFLAGS: "-fPIC"
+  CXXFLAGS: "-fPIC"
+  NVCCFLAGS: "--compiler-options -fPIC"
+  CUDA_NVCC_FLAGS: "--compiler-options -fPIC"
+  CMAKE_POSITION_INDEPENDENT_CODE: "ON"
+  CMAKE_C_FLAGS: "-fPIC"
+  CMAKE_CXX_FLAGS: "-fPIC"
 
 jobs:
   build-and-publish:
@@ -24,6 +31,13 @@ jobs:
         NVIDIA_VISIBLE_DEVICES: all
         NVIDIA_DRIVER_CAPABILITIES: compute,utility
         RUSTFLAGS: "-C relocation-model=pic"
+        CFLAGS: "-fPIC"
+        CXXFLAGS: "-fPIC"
+        NVCCFLAGS: "--compiler-options -fPIC"
+        CUDA_NVCC_FLAGS: "--compiler-options -fPIC"
+        CMAKE_POSITION_INDEPENDENT_CODE: "ON"
+        CMAKE_C_FLAGS: "-fPIC"
+        CMAKE_CXX_FLAGS: "-fPIC"
 
     steps:
     - name: Install Node.js for GitHub Actions
@@ -63,7 +77,11 @@ jobs:
     - name: Clean previous builds
       run: cargo clean
 
-    - name: Build release
+    - name: Build release without CUDA (test)
+      run: cargo build --release
+      continue-on-error: true
+      
+    - name: Build release with CUDA
       run: cargo build --release --features cuda
 
     - name: Generate release tag
@@ -82,106 +100,11 @@ jobs:
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-    - name: Upload release binaries
-      uses: actions/upload-artifact@v4
-      with:
-        name: release-binaries
-        path: target/release/lib*.so
-        retention-days: 1
-
-  publish-proto:
-    needs: build-and-publish
-    runs-on: ubuntu-latest
-    container:
-      image: gitea.sutr.app/servers/drone-git-ssh:0.0.5
-
-    steps:
-    - name: Install Node.js for GitHub Actions
-      run: |
-        curl -fsSL https://deb.nodesource.com/setup_lts.x | bash -
-        apt-get install -y nodejs
-        node --version
-        npm --version
-
-    - name: Setup SSH key for submodules
-      run: |
-        mkdir -p ~/.ssh
-        echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_ed25519
-        chmod 600 ~/.ssh/id_ed25519
-        chmod 700 ~/.ssh
-        ssh-keyscan -H gitea.sutr.app >> ~/.ssh/known_hosts
-        chmod 644 ~/.ssh/known_hosts
-
-    - name: Checkout code
-      uses: actions/checkout@v4
-      with:
-        submodules: recursive
-
-    - name: Publish protobuf
-      run: |
-        mkdir temp
-        cd temp
-        git clone git@gitea-ssh.sutr.app:jobworkerp-rs/llama-protobuf.git
-        cd llama-protobuf
-        git fetch origin
-        git checkout main
-        cp -a ../../llama-protobuf ../
-        git add .
-        git reset --soft origin/main
-        if [ $(git diff --staged | wc -l) -eq 0 ]; then
-          echo "No changes to publish"
-          exit 0
-        fi
-        echo ${{ needs.build-and-publish.outputs.release-tag }} > VERSION
-        git add ./VERSION
-        git commit -m "Publish proto ${{ needs.build-and-publish.outputs.release-tag }} from llama-cpp-plugin"
-        git push origin main
-        git tag ${{ needs.build-and-publish.outputs.release-tag }}
-        git push origin --tags
-        cd ../..
-        rm -rf temp
-      env:
-        SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
-
-  publish-plugin:
-    needs: [build-and-publish, publish-proto]
-    runs-on: ubuntu-latest
-    container:
-      image: gitea.sutr.app/servers/drone-git-ssh:0.0.5
-
-    steps:
-    - name: Install Node.js for GitHub Actions
-      run: |
-        curl -fsSL https://deb.nodesource.com/setup_lts.x | bash -
-        apt-get install -y nodejs
-        node --version
-        npm --version
-
-    - name: Setup SSH key for submodules
-      run: |
-        mkdir -p ~/.ssh
-        echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_ed25519
-        chmod 600 ~/.ssh/id_ed25519
-        chmod 700 ~/.ssh
-        ssh-keyscan -H gitea.sutr.app >> ~/.ssh/known_hosts
-        chmod 644 ~/.ssh/known_hosts
-
-    - name: Checkout code
-      uses: actions/checkout@v4
-      with:
-        submodules: recursive
-
-    - name: Download build artifacts
-      uses: actions/download-artifact@v4
-      with:
-        name: release-binaries
-        path: target/release/
-
     - name: Publish plugin
       run: |
         git config --global http.postBuffer 157286400
         git config --global http.version HTTP/1.1
-        git clone --depth 1 ssh://git@gitea-ssh.sutr.app/jobworkerp-rs/jobworkerp-plugins.git
+        git clone --depth 1 ssh://git@gitea.sutr.app/jobworkerp-rs/jobworkerp-plugins.git
         cd jobworkerp-plugins
         git lfs install
         git lfs pull
@@ -193,11 +116,132 @@ jobs:
           echo "No changes to publish"
           exit 0
         fi
-        echo ${{ needs.build-and-publish.outputs.release-tag }} > VERSION
+        echo ${{ steps.tag.outputs.tag }} > VERSION
         git add ./VERSION
-        git commit -m "Publish plugin ${{ needs.build-and-publish.outputs.release-tag }}"
+        git commit -m "Publish plugin ${{ steps.tag.outputs.tag }}"
         git push origin main
-        git tag ${{ needs.build-and-publish.outputs.release-tag }}
+        git tag ${{ steps.tag.outputs.tag }}
         git push origin --tags
       env:
         SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+
+# for github release (artifacts)
+#    - name: Upload release binaries
+#      uses: actions/upload-artifact@v4
+#      with:
+#        name: release-binaries
+#        path: target/release/lib*.so
+#        retention-days: 1
+
+#  publish-proto:
+#    needs: build-and-publish
+#    runs-on: ubuntu-latest
+#    container:
+#      image: gitea.sutr.app/servers/drone-git-ssh:0.0.5
+#
+#    steps:
+#    - name: Install Node.js for GitHub Actions
+#      run: |
+#        curl -fsSL https://deb.nodesource.com/setup_lts.x | bash -
+#        apt-get install -y nodejs
+#        node --version
+#        npm --version
+#
+#    - name: Setup SSH key for submodules
+#      run: |
+#        mkdir -p ~/.ssh
+#        echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_ed25519
+#        chmod 600 ~/.ssh/id_ed25519
+#        chmod 700 ~/.ssh
+#        ssh-keyscan -H gitea.sutr.app >> ~/.ssh/known_hosts
+#        chmod 644 ~/.ssh/known_hosts
+#
+#    - name: Checkout code
+#      uses: actions/checkout@v4
+#      with:
+#        submodules: recursive
+#
+#    - name: Publish protobuf
+#      run: |
+#        mkdir temp
+#        cd temp
+#        git clone git@gitea-ssh.sutr.app:jobworkerp-rs/llama-protobuf.git
+#        cd llama-protobuf
+#        git fetch origin
+#        git checkout main
+#        cp -a ../../llama-protobuf ../
+#        git add .
+#        git reset --soft origin/main
+#        if [ $(git diff --staged | wc -l) -eq 0 ]; then
+#          echo "No changes to publish"
+#          exit 0
+#        fi
+#        echo ${{ needs.build-and-publish.outputs.release-tag }} > VERSION
+#        git add ./VERSION
+#        git commit -m "Publish proto ${{ needs.build-and-publish.outputs.release-tag }} from llama-cpp-plugin"
+#        git push origin main
+#        git tag ${{ needs.build-and-publish.outputs.release-tag }}
+#        git push origin --tags
+#        cd ../..
+#        rm -rf temp
+#      env:
+#        SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+#
+#  publish-plugin:
+#    needs: [build-and-publish, publish-proto]
+#    runs-on: ubuntu-latest
+#    container:
+#      image: gitea.sutr.app/servers/drone-git-ssh:0.0.5
+#
+#    steps:
+#    - name: Install Node.js for GitHub Actions
+#      run: |
+#        curl -fsSL https://deb.nodesource.com/setup_lts.x | bash -
+#        apt-get install -y nodejs
+#        node --version
+#        npm --version
+#
+#    - name: Setup SSH key for submodules
+#      run: |
+#        mkdir -p ~/.ssh
+#        echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_ed25519
+#        chmod 600 ~/.ssh/id_ed25519
+#        chmod 700 ~/.ssh
+#        ssh-keyscan -H gitea.sutr.app >> ~/.ssh/known_hosts
+#        chmod 644 ~/.ssh/known_hosts
+#
+#    - name: Checkout code
+#      uses: actions/checkout@v4
+#      with:
+#        submodules: recursive
+#
+#    - name: Download build artifacts
+#      uses: actions/download-artifact@v4
+#      with:
+#        name: release-binaries
+#        path: target/release/
+#
+#    - name: Publish plugin
+#      run: |
+#        git config --global http.postBuffer 157286400
+#        git config --global http.version HTTP/1.1
+#        git clone --depth 1 ssh://git@gitea-ssh.sutr.app/jobworkerp-rs/jobworkerp-plugins.git
+#        cd jobworkerp-plugins
+#        git lfs install
+#        git lfs pull
+#        git checkout origin/main -- ./VERSION
+#        git reset --soft origin/main
+#        cp ../target/release/lib*.so cuda_runner/
+#        git add .
+#        if [ $(git diff --staged | wc -l) -eq 0 ]; then
+#          echo "No changes to publish"
+#          exit 0
+#        fi
+#        echo ${{ needs.build-and-publish.outputs.release-tag }} > VERSION
+#        git add ./VERSION
+#        git commit -m "Publish plugin ${{ needs.build-and-publish.outputs.release-tag }}"
+#        git push origin main
+#        git tag ${{ needs.build-and-publish.outputs.release-tag }}
+#        git push origin --tags
+#      env:
+#        SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
