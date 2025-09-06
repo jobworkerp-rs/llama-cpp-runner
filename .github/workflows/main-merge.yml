@@ -33,6 +33,15 @@ jobs:
         node --version
         npm --version
 
+    - name: Setup SSH key for submodules
+      run: |
+        mkdir -p ~/.ssh
+        echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_ed25519
+        chmod 600 ~/.ssh/id_ed25519
+        chmod 700 ~/.ssh
+        ssh-keyscan -H gitea.sutr.app >> ~/.ssh/known_hosts
+        chmod 644 ~/.ssh/known_hosts
+
     - name: Checkout code
       uses: actions/checkout@v4
       with:
@@ -55,7 +64,7 @@ jobs:
       run: cargo clean
 
     - name: Build release
-      run: cargo build --release
+      run: cargo build --release --features cuda
 
     - name: Generate release tag
       id: tag
@@ -93,6 +102,15 @@ jobs:
         apt-get install -y nodejs
         node --version
         npm --version
+
+    - name: Setup SSH key for submodules
+      run: |
+        mkdir -p ~/.ssh
+        echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_ed25519
+        chmod 600 ~/.ssh/id_ed25519
+        chmod 700 ~/.ssh
+        ssh-keyscan -H gitea.sutr.app >> ~/.ssh/known_hosts
+        chmod 644 ~/.ssh/known_hosts
 
     - name: Checkout code
       uses: actions/checkout@v4
@@ -138,6 +156,15 @@ jobs:
         apt-get install -y nodejs
         node --version
         npm --version
+
+    - name: Setup SSH key for submodules
+      run: |
+        mkdir -p ~/.ssh
+        echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_ed25519
+        chmod 600 ~/.ssh/id_ed25519
+        chmod 700 ~/.ssh
+        ssh-keyscan -H gitea.sutr.app >> ~/.ssh/known_hosts
+        chmod 644 ~/.ssh/known_hosts
 
     - name: Checkout code
       uses: actions/checkout@v4

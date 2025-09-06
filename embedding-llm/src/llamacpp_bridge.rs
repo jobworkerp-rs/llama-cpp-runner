@@ -571,7 +571,7 @@ mod tests {
     #[test]
     fn test_validate_model_file() {
         // Test non-existent file that could be HF model
-        let result = helpers::validate_model_file("microsoft/phi-4-gguf/phi-4-q4.gguf");
+        let result = helpers::validate_model_file("microsoft/phi-4-gguf/phi-4-Q4_0.gguf");
         assert!(result.is_ok()); // Should pass validation, will be resolved later
 
         // Test invalid format
@@ -582,12 +582,12 @@ mod tests {
     #[test]
     fn test_hf_model_path_parsing() {
         // Test HuggingFace model path parsing logic
-        let model_path = "microsoft/phi-4-gguf/phi-4-q4.gguf";
+        let model_path = "microsoft/phi-4-gguf/phi-4-Q4_0.gguf";
         if let Some(last_slash_pos) = model_path.rfind('/') {
             let repo = &model_path[..last_slash_pos];
             let filename = &model_path[last_slash_pos + 1..];
             
-            assert_eq!(filename, "phi-4-q4.gguf");
+            assert_eq!(filename, "phi-4-Q4_0.gguf");
             assert_eq!(repo, "microsoft/phi-4-gguf");
         } else {
             panic!("Failed to find last slash");

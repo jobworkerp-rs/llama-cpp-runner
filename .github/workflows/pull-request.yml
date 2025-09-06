@@ -29,6 +29,19 @@ jobs:
         node --version
         npm --version
 
+    - name: Setup SSH key for submodules
+      run: |
+        mkdir -p ~/.ssh
+        echo "$SSH_KEY" > ~/.ssh/id_ed25519
+        chmod 600 ~/.ssh/id_ed25519
+        chmod 700 ~/.ssh
+        ssh-keyscan -H gitea.sutr.app >> ~/.ssh/known_hosts
+        chmod 644 ~/.ssh/known_hosts
+        # Debug: check key format
+        head -1 ~/.ssh/id_ed25519
+        tail -1 ~/.ssh/id_ed25519
+      env:
+        SSH_KEY: ${{ secrets.SSH_PRIVATE_KEY }} 
     - name: Checkout code
       uses: actions/checkout@v4
       with:
