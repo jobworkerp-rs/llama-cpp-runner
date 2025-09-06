@@ -1,0 +1,176 @@
+name: Main Branch CI/CD
+
+on:
+  push:
+    branches: [ main ]
+
+env:
+  NVIDIA_VISIBLE_DEVICES: all
+  NVIDIA_DISABLE_REQUIRE: true
+  NVIDIA_DRIVER_CAPABILITIES: compute,utility
+  RUSTFLAGS: "-C relocation-model=pic"
+
+jobs:
+  build-and-publish:
+    runs-on: ubuntu-latest
+    outputs:
+      release-tag: ${{ steps.tag.outputs.tag }}
+    container:
+      image: gitea.sutr.app/servers/rust-gpu-build:20250701
+      options: --gpus all
+      env:
+        CARGO_HOME: /usr/local/cargo
+        NVIDIA_DISABLE_REQUIRE: true
+        NVIDIA_VISIBLE_DEVICES: all
+        NVIDIA_DRIVER_CAPABILITIES: compute,utility
+        RUSTFLAGS: "-C relocation-model=pic"
+
+    steps:
+    - name: Install Node.js for GitHub Actions
+      run: |
+        curl -fsSL https://deb.nodesource.com/setup_lts.x | bash -
+        apt-get install -y nodejs
+        node --version
+        npm --version
+
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+        fetch-depth: 0
+
+    - name: Cache Cargo dependencies
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+        key: ${{ runner.os }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-cargo-release-
+          ${{ runner.os }}-cargo-
+
+    - name: Clean previous builds
+      run: cargo clean
+
+    - name: Build release
+      run: cargo build --release
+
+    - name: Generate release tag
+      id: tag
+      run: |
+        TAG_VERSION=$(date '+%Y%m%d_%H%M%S')
+        echo "tag=${TAG_VERSION}" >> $GITHUB_OUTPUT
+        echo "Generated tag: ${TAG_VERSION}"
+
+    - name: Create and push git tag
+      run: |
+        git config --global user.name "GitHub Actions"
+        git config --global user.email "actions@github.com"
+        git tag ${{ steps.tag.outputs.tag }}
+        git push origin --tags
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Upload release binaries
+      uses: actions/upload-artifact@v4
+      with:
+        name: release-binaries
+        path: target/release/lib*.so
+        retention-days: 1
+
+  publish-proto:
+    needs: build-and-publish
+    runs-on: ubuntu-latest
+    container:
+      image: gitea.sutr.app/servers/drone-git-ssh:0.0.5
+
+    steps:
+    - name: Install Node.js for GitHub Actions
+      run: |
+        curl -fsSL https://deb.nodesource.com/setup_lts.x | bash -
+        apt-get install -y nodejs
+        node --version
+        npm --version
+
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+
+    - name: Publish protobuf
+      run: |
+        mkdir temp
+        cd temp
+        git clone git@gitea-ssh.sutr.app:jobworkerp-rs/llama-protobuf.git
+        cd llama-protobuf
+        git fetch origin
+        git checkout main
+        cp -a ../../llama-protobuf ../
+        git add .
+        git reset --soft origin/main
+        if [ $(git diff --staged | wc -l) -eq 0 ]; then
+          echo "No changes to publish"
+          exit 0
+        fi
+        echo ${{ needs.build-and-publish.outputs.release-tag }} > VERSION
+        git add ./VERSION
+        git commit -m "Publish proto ${{ needs.build-and-publish.outputs.release-tag }} from llama-cpp-plugin"
+        git push origin main
+        git tag ${{ needs.build-and-publish.outputs.release-tag }}
+        git push origin --tags
+        cd ../..
+        rm -rf temp
+      env:
+        SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+
+  publish-plugin:
+    needs: [build-and-publish, publish-proto]
+    runs-on: ubuntu-latest
+    container:
+      image: gitea.sutr.app/servers/drone-git-ssh:0.0.5
+
+    steps:
+    - name: Install Node.js for GitHub Actions
+      run: |
+        curl -fsSL https://deb.nodesource.com/setup_lts.x | bash -
+        apt-get install -y nodejs
+        node --version
+        npm --version
+
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+
+    - name: Download build artifacts
+      uses: actions/download-artifact@v4
+      with:
+        name: release-binaries
+        path: target/release/
+
+    - name: Publish plugin
+      run: |
+        git config --global http.postBuffer 157286400
+        git config --global http.version HTTP/1.1
+        git clone --depth 1 ssh://git@gitea-ssh.sutr.app/jobworkerp-rs/jobworkerp-plugins.git
+        cd jobworkerp-plugins
+        git lfs install
+        git lfs pull
+        git checkout origin/main -- ./VERSION
+        git reset --soft origin/main
+        cp ../target/release/lib*.so cuda_runner/
+        git add .
+        if [ $(git diff --staged | wc -l) -eq 0 ]; then
+          echo "No changes to publish"
+          exit 0
+        fi
+        echo ${{ needs.build-and-publish.outputs.release-tag }} > VERSION
+        git add ./VERSION
+        git commit -m "Publish plugin ${{ needs.build-and-publish.outputs.release-tag }}"
+        git push origin main
+        git tag ${{ needs.build-and-publish.outputs.release-tag }}
+        git push origin --tags
+      env:
+        SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}

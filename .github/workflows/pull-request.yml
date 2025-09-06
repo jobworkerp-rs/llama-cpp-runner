@@ -1,0 +1,60 @@
+name: Pull Request CI
+
+on:
+  pull_request:
+    branches: [ main ]
+
+env:
+  NVIDIA_VISIBLE_DEVICES: all
+  NVIDIA_DISABLE_REQUIRE: true
+  NVIDIA_DRIVER_CAPABILITIES: compute,utility
+  RUSTFLAGS: "-C relocation-model=pic"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    container:
+      image: gitea.sutr.app/servers/rust-gpu-build:20250701
+      options: --gpus all
+      env:
+        NVIDIA_VISIBLE_DEVICES: all
+        NVIDIA_DISABLE_REQUIRE: true
+        RUSTFLAGS: "-C relocation-model=pic"
+
+    steps:
+    - name: Install Node.js for GitHub Actions
+      run: |
+        curl -fsSL https://deb.nodesource.com/setup_lts.x | bash -
+        apt-get install -y nodejs
+        node --version
+        npm --version
+
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+
+    - name: Cache Cargo dependencies
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-cargo-
+
+    - name: Display GPU information
+      run: |
+        /usr/bin/nvidia-smi
+        echo $PATH
+
+    - name: Clean previous builds
+      run: cargo clean
+
+    - name: Build project
+      run: cargo build --release
+
+    - name: Run tests
+      run: cargo test --release -- --test-threads=1
