@@ -9,12 +9,12 @@ environment:
 
 steps:
   - name: submodules
-    image: gitea.toris.dev/servers/drone-git-ssh:0.0.5
+    image: gitea.sutr.app/servers/drone-git-ssh:0.0.5
     commands:
       #      - cd github
       - git submodule update --init --recursive
   - name: test
-    image: gitea.toris.dev/servers/rust-gpu-build:20250320
+    image: gitea.sutr.app/servers/rust-gpu-build:20250701
     environment:
       NVIDIA_VISIBLE_DEVICES: all
       NVIDIA_DISABLE_REQUIRE: true
@@ -66,14 +66,14 @@ name: main_merge
 
 steps:
   - name: submodules
-    image: gitea.toris.dev/servers/drone-git-ssh:0.0.5
+    image: gitea.sutr.app/servers/drone-git-ssh:0.0.5
     commands:
       #      - cd github
       - git submodule update --init --recursive
 
   # release build(cuda)
   - name: build
-    image: gitea.toris.dev/servers/rust-gpu-build:20250320
+    image: gitea.sutr.app/servers/rust-gpu-build:20250701
     environment:
       CARGO_HOME: /usr/local/cargo
       NVIDIA_DISABLE_REQUIRE: true
@@ -97,7 +97,7 @@ steps:
       - cargo build --release #--features cuda
 
   - name: tagging
-    image: gitea.toris.dev/servers/drone-git-ssh:0.0.5
+    image: gitea.sutr.app/servers/drone-git-ssh:0.0.5
     commands:
       #      - TAG_VERSION=$(git show --no-patch --no-notes --pretty='%ci' HEAD | sed -e 's/^\(\w\+\)\-\(\w\+\)\-\(\w\+\)\s\(\w\+\):\(\w\+\):\(\w\+\).*$/\1\2\3_\4\5\6/')
       - git remote set-url origin $(git remote get-url origin | sed -e 's/^https:\\/\\/gitea/git@gitea-ssh/' | sed -e 's/\(.*\)\\/\(.*\)\\/\(.*\)/\1:\2\\/\3/')
@@ -105,11 +105,11 @@ steps:
       - git push origin --tags
 
   - name: publish_proto
-    image: gitea.toris.dev/servers/drone-git-ssh:0.0.5
+    image: gitea.sutr.app/servers/drone-git-ssh:0.0.5
     commands:
       - mkdir temp
       - cd temp
-      - git clone git@gitea-ssh.toris.dev:jobworkerp-rs/llama-protobuf.git
+      - git clone git@gitea-ssh.sutr.app:jobworkerp-rs/llama-protobuf.git
       - cd llama-protobuf
       - git fetch origin
       - git checkout main
@@ -128,12 +128,12 @@ steps:
 
   # for jobworkerp plugin
   - name: publish_plugin
-    image: gitea.toris.dev/servers/drone-git-ssh:0.0.5
+    image: gitea.sutr.app/servers/drone-git-ssh:0.0.5
     commands:
       # https://stackoverflow.com/questions/66366582/github-unexpected-disconnect-while-reading-sideband-packet
       - git config --global http.postBuffer 157286400
       - git config --global http.version HTTP/1.1
-      - git clone --depth 1 ssh://git@gitea-ssh.toris.dev/jobworkerp-rs/jobworkerp-plugins.git
+      - git clone --depth 1 ssh://git@gitea-ssh.sutr.app/jobworkerp-rs/jobworkerp-plugins.git
       - cd jobworkerp-plugins
       - git lfs install
       - git lfs pull
@@ -176,13 +176,13 @@ trigger:
 #
 #steps:
 #  - name: submodules
-#    image: gitea.toris.dev/servers/drone-git-ssh:0.0.5
+#    image: gitea.sutr.app/servers/drone-git-ssh:0.0.5
 #    commands:
 ##      - cd github
 #      - git submodule update --init --recursive
 #
 #  - name: build
-#    image: gitea.toris.dev/servers/rust-gpu-build:20250320
+#    image: gitea.sutr.app/servers/rust-gpu-build:20250320
 #    environment:
 #      CARGO_HOME: /usr/local/cargo
 #      NVIDIA_VISIBLE_DEVICES: all
@@ -201,14 +201,14 @@ trigger:
 #      - cargo build --release --features cuda
 #
 #  - name: publish_plugin_prepare_upload
-#    image: gitea.toris.dev/servers/drone-git-ssh:0.0.5
+#    image: gitea.sutr.app/servers/drone-git-ssh:0.0.5
 #    commands:
 #      # https://stackoverflow.com/a/69891948
 #      - git config --global http.postBuffer 524288000
 #      - cd github
 #      - mkdir -p upload
 #      # depth 1 (to avoid timeout error on clone)
-#      - git clone --depth 1 ssh://git@gitea-ssh.toris.dev/jobworkerp-rs/jobworkerp-plugins.git
+#      - git clone --depth 1 ssh://git@gitea-ssh.sutr.app/jobworkerp-rs/jobworkerp-plugins.git
 #      - cd jobworkerp-plugins
 #      - git checkout origin/main -- ./VERSION
 #      - git reset --soft origin/main
