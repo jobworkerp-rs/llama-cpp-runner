@@ -9,6 +9,13 @@ env:
   NVIDIA_DISABLE_REQUIRE: true
   NVIDIA_DRIVER_CAPABILITIES: compute,utility
   RUSTFLAGS: "-C relocation-model=pic"
+  CFLAGS: "-fPIC"
+  CXXFLAGS: "-fPIC"
+  NVCCFLAGS: "--compiler-options -fPIC"
+  CUDA_NVCC_FLAGS: "--compiler-options -fPIC"
+  CMAKE_POSITION_INDEPENDENT_CODE: "ON"
+  CMAKE_C_FLAGS: "-fPIC"
+  CMAKE_CXX_FLAGS: "-fPIC"
 
 jobs:
   build-and-publish:
@@ -24,6 +31,13 @@ jobs:
         NVIDIA_VISIBLE_DEVICES: all
         NVIDIA_DRIVER_CAPABILITIES: compute,utility
         RUSTFLAGS: "-C relocation-model=pic"
+        CFLAGS: "-fPIC"
+        CXXFLAGS: "-fPIC"
+        NVCCFLAGS: "--compiler-options -fPIC"
+        CUDA_NVCC_FLAGS: "--compiler-options -fPIC"
+        CMAKE_POSITION_INDEPENDENT_CODE: "ON"
+        CMAKE_C_FLAGS: "-fPIC"
+        CMAKE_CXX_FLAGS: "-fPIC"
 
     steps:
     - name: Install Node.js for GitHub Actions
@@ -63,7 +77,11 @@ jobs:
     - name: Clean previous builds
       run: cargo clean
 
-    - name: Build release
+    - name: Build release without CUDA (test)
+      run: cargo build --release
+      continue-on-error: true
+      
+    - name: Build release with CUDA
       run: cargo build --release --features cuda
 
     - name: Generate release tag
