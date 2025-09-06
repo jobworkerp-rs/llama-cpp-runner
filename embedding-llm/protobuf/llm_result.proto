@@ -1,0 +1,21 @@
+syntax = "proto3";
+
+package embedding_llm;
+
+message EmbeddingLlmResult {
+  message Embedding {
+    repeated float values = 1;
+    uint32 begin_position = 2;  // Original text start character position
+    uint32 end_position = 3;    // Original text end character position
+  }
+  repeated Embedding embeddings = 1;
+  
+  // Model metadata (optional)
+  optional ModelInfo model_info = 2;
+}
+
+message ModelInfo {
+  string model_name = 1;
+  uint32 embedding_dimension = 2;
+  string dtype_used = 3;
+}

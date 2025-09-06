@@ -1,0 +1,15 @@
+syntax = "proto3";
+
+package embedding_llm;
+
+message EmbeddingArgs {
+  // Input text/document to embed
+  string text = 1;
+  
+  // Instruction prefix for the embedding task
+  // Example: "Instruct: Given a web search query, retrieve relevant documents."
+  optional string instruction = 2;
+  
+  // Whether to apply L2 normalization to output embeddings
+  bool normalize_embeddings = 3;
+}
