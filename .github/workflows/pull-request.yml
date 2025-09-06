@@ -9,6 +9,13 @@ env:
   NVIDIA_DISABLE_REQUIRE: true
   NVIDIA_DRIVER_CAPABILITIES: compute,utility
   RUSTFLAGS: "-C relocation-model=pic"
+  CFLAGS: "-fPIC"
+  CXXFLAGS: "-fPIC"
+  NVCCFLAGS: "--compiler-options -fPIC"
+  CUDA_NVCC_FLAGS: "--compiler-options -fPIC"
+  CMAKE_POSITION_INDEPENDENT_CODE: "ON"
+  CMAKE_C_FLAGS: "-fPIC"
+  CMAKE_CXX_FLAGS: "-fPIC"
 
 jobs:
   test:
@@ -20,6 +27,13 @@ jobs:
         NVIDIA_VISIBLE_DEVICES: all
         NVIDIA_DISABLE_REQUIRE: true
         RUSTFLAGS: "-C relocation-model=pic"
+        CFLAGS: "-fPIC"
+        CXXFLAGS: "-fPIC"
+        NVCCFLAGS: "--compiler-options -fPIC"
+        CUDA_NVCC_FLAGS: "--compiler-options -fPIC"
+        CMAKE_POSITION_INDEPENDENT_CODE: "ON"
+        CMAKE_C_FLAGS: "-fPIC"
+        CMAKE_CXX_FLAGS: "-fPIC"
 
     steps:
     - name: Install Node.js for GitHub Actions
