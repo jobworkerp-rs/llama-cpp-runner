@@ -100,7 +100,7 @@ async fn run_embedding_test_with_config(settings: &EmbeddingLlmRunnerSettings) -
         
         if text.is_empty() {
             // 空のテキストは適切にエラーハンドリングされることを確認
-            let result = embedder.generate_embeddings_with_instruction(text, instruction.as_deref(), true, None);
+            let result = embedder.generate_embeddings_with_positions(text, instruction.as_deref(), true, None);
             match result {
                 Err(_) => println!("     ✓ Empty text handled correctly with error"),
                 Ok(embeddings) if embeddings.is_empty() => println!("     ✓ Empty text returned empty embeddings"),
@@ -111,17 +111,18 @@ async fn run_embedding_test_with_config(settings: &EmbeddingLlmRunnerSettings) -
         
         // 正常なケースの処理
         let start_time = std::time::Instant::now();
-        let result = embedder.generate_embeddings_with_instruction(text, instruction.as_deref(), true, None);
+        let result = embedder.generate_embeddings_with_positions(text, instruction.as_deref(), true, None);
         let duration = start_time.elapsed();
         
         match result {
-            Ok(embeddings) => {
-                println!("     ✓ Generated {} embeddings in {:?}", embeddings.len(), duration);
+            Ok(embeddings_with_pos) => {
+                println!("     ✓ Generated {} embeddings with positions in {:?}", embeddings_with_pos.len(), duration);
                 
                 // 基本的な検証
-                assert!(!embeddings.is_empty(), "No embeddings generated for: {}", description);
+                assert!(!embeddings_with_pos.is_empty(), "No embeddings generated for: {}", description);
                 
-                for (j, embedding) in embeddings.iter().enumerate() {
+                for (j, embedding_with_pos) in embeddings_with_pos.iter().enumerate() {
+                    let embedding = &embedding_with_pos.values;
                     assert_eq!(embedding.len(), model_info.embedding_dimension, 
                                "Wrong embedding dimension for embedding {} in: {}", j, description);
                     
@@ -134,11 +135,24 @@ async fn run_embedding_test_with_config(settings: &EmbeddingLlmRunnerSettings) -
                     // NaN/Infチェック  
                     assert!(!embedding.iter().any(|x| x.is_nan() || x.is_infinite()),
                            "Invalid values in embedding {} for: {}", j, description);
+                    
+                    // 位置情報の検証
+                    assert!(embedding_with_pos.char_end_pos >= embedding_with_pos.char_start_pos,
+                           "Invalid position range in embedding {}: start={}, end={}", 
+                           j, embedding_with_pos.char_start_pos, embedding_with_pos.char_end_pos);
+                    
+                    if j == 0 {
+                        assert_eq!(embedding_with_pos.char_start_pos, 0,
+                                 "First embedding should start at position 0");
+                    }
+                    
+                    println!("       - Position {}: chars[{}, {})", 
+                            j, embedding_with_pos.char_start_pos, embedding_with_pos.char_end_pos);
                 }
                 
-                println!("       - Embedding dimensions: {}x{}", embeddings.len(), embeddings[0].len());
-                println!("       - First 5 values: {:?}", &embeddings[0][..5.min(embeddings[0].len())]);
-                println!("       - L2 norm: {:.6}", embeddings[0].iter().map(|x| x * x).sum::<f32>().sqrt());
+                println!("       - Embedding dimensions: {}x{}", embeddings_with_pos.len(), embeddings_with_pos[0].values.len());
+                println!("       - First 5 values: {:?}", &embeddings_with_pos[0].values[..5.min(embeddings_with_pos[0].values.len())]);
+                println!("       - L2 norm: {:.6}", embeddings_with_pos[0].values.iter().map(|x| x * x).sum::<f32>().sqrt());
             },
             Err(e) => {
                 panic!("✗ Failed to generate embedding for '{}': {}", description, e);
@@ -155,10 +169,12 @@ async fn run_embedding_test_with_config(settings: &EmbeddingLlmRunnerSettings) -
     ];
     
     let individual_start = std::time::Instant::now();
-    let mut individual_embeddings = Vec::new();
+    let mut individual_embeddings: Vec<Vec<Vec<f32>>> = Vec::new();
     for text in &batch_texts {
-        let emb = embedder.generate_embeddings_with_instruction(text, None, true, None)
+        let emb_with_pos = embedder.generate_embeddings_with_positions(text, None, true, None)
             .map_err(|e| anyhow::anyhow!("Batch processing failed: {}", e))?;
+        // 位置情報を除去してembeddingのみを取得
+        let emb: Vec<Vec<f32>> = emb_with_pos.into_iter().map(|e| e.values).collect();
         individual_embeddings.push(emb);
     }
     let individual_duration = individual_start.elapsed();
@@ -174,10 +190,14 @@ async fn run_embedding_test_with_config(settings: &EmbeddingLlmRunnerSettings) -
     // 7. 同一テキストの一貫性テスト
     println!("\n7. Testing consistency...");
     let test_text = "Consistency test text";
-    let embedding1 = embedder.generate_embeddings_with_instruction(test_text, None, true, None)
+    let embedding1_with_pos = embedder.generate_embeddings_with_positions(test_text, None, true, None)
         .map_err(|e| anyhow::anyhow!("Consistency test failed: {}", e))?;
-    let embedding2 = embedder.generate_embeddings_with_instruction(test_text, None, true, None)
+    let embedding2_with_pos = embedder.generate_embeddings_with_positions(test_text, None, true, None)
         .map_err(|e| anyhow::anyhow!("Consistency test failed: {}", e))?;
+    
+    // 位置情報を除去してembeddingのみを比較
+    let embedding1: Vec<Vec<f32>> = embedding1_with_pos.into_iter().map(|e| e.values).collect();
+    let embedding2: Vec<Vec<f32>> = embedding2_with_pos.into_iter().map(|e| e.values).collect();
     
     assert_eq!(embedding1.len(), embedding2.len(), "Inconsistent number of embeddings");
     
@@ -393,19 +413,20 @@ async fn test_batch_vs_individual_embedding_consistency() {
     };
 
     println!("1. Generating embeddings with batch size 4...");
-    let mut batch_results = Vec::new();
+    let mut batch_results: Vec<Vec<f32>> = Vec::new();
     
     // 全てのテキストを一つずつ処理して結果を収集
     for (i, text) in short_texts.iter().enumerate() {
-        let embeddings = batch_embedder.generate_embeddings_with_instruction(
+        let embeddings_with_pos = batch_embedder.generate_embeddings_with_positions(
             text,
             Some("Generate embedding for this text"),
             false, // 正規化なし
             None,  // mergeなし
         ).expect(&format!("Batch embedding generation failed for text {}", i));
         
-        println!("   Text {}: Generated {} embeddings", i, embeddings.len());
-        batch_results.extend(embeddings);
+        println!("   Text {}: Generated {} embeddings", i, embeddings_with_pos.len());
+        // 位置情報を除去してembeddingのみを追加
+        batch_results.extend(embeddings_with_pos.into_iter().map(|e| e.values));
     }
 
     println!("Total batch embeddings: {}", batch_results.len());
@@ -413,11 +434,11 @@ async fn test_batch_vs_individual_embedding_consistency() {
     // 2. バッチサイズ1で処理（強制的に個別処理）
     let individual_settings = EmbeddingLlmRunnerSettings {
         max_batch_size: Some(1), // バッチサイズ1で強制個別処理
-        ..batch_settings.clone()
+        ..batch_settings
     };
 
     println!("2. Generating embeddings with batch size 1 (individual processing)...");
-    let mut individual_results = Vec::new();
+    let mut individual_results: Vec<Vec<f32>> = Vec::new();
     
     // プロセスを分離してBackendAlreadyInitializedエラーを回避
     drop(batch_embedder);
@@ -428,20 +449,36 @@ async fn test_batch_vs_individual_embedding_consistency() {
             println!("⚠ Individual embedder creation failed: {}. Using different approach.", e);
             
             // 異なるアプローチ: 同じembedderを使って個別呼び出しをシミュレート
-            let embedder = LlamaCppEmbedder::new_from_settings(&batch_settings)
+            let batch_settings_copy = EmbeddingLlmRunnerSettings {
+                use_cpu: true,
+                max_seq_length: 512,
+                model_type: ModelType::Gguf as i32,
+                model_id: "Qwen/Qwen3-Embedding-4B-GGUF".to_string(),
+                model_files: vec!["Qwen3-Embedding-4B-Q4_K_M.gguf".to_string()],
+                tokenizer_model_id: None,
+                dtype: Some(DType::F32 as i32),
+                sliding_window_config: Some(SlidingWindowConfig {
+                    window_stride: 256,
+                    min_window_size: 32,
+                }),
+                max_batch_size: Some(4), // バッチサイズ4
+            };
+            
+            let embedder = LlamaCppEmbedder::new_from_settings(&batch_settings_copy)
                 .expect("Failed to recreate embedder");
             
             for (i, text) in short_texts.iter().enumerate() {
                 // 各テキストを個別に処理
-                let embeddings = embedder.generate_embeddings_with_instruction(
+                let embeddings_with_pos = embedder.generate_embeddings_with_positions(
                     text,
                     Some("Generate embedding for this text"),
                     false,
                     None,
                 ).expect(&format!("Individual embedding generation failed for text {}", i));
                 
-                println!("   Text {}: Generated {} embeddings (simulated individual)", i, embeddings.len());
-                individual_results.extend(embeddings);
+                println!("   Text {}: Generated {} embeddings (simulated individual)", i, embeddings_with_pos.len());
+                // 位置情報を除去してembeddingのみを追加
+                individual_results.extend(embeddings_with_pos.into_iter().map(|e| e.values));
             }
             
             println!("Total individual embeddings: {} (simulated)", individual_results.len());
@@ -476,15 +513,16 @@ async fn test_batch_vs_individual_embedding_consistency() {
     };
     
     for (i, text) in short_texts.iter().enumerate() {
-        let embeddings = individual_embedder.generate_embeddings_with_instruction(
+        let embeddings_with_pos = individual_embedder.generate_embeddings_with_positions(
             text,
             Some("Generate embedding for this text"),
             false, // 正規化なし
             None,  // mergeなし
         ).expect(&format!("Individual embedding generation failed for text {}", i));
         
-        println!("   Text {}: Generated {} embeddings", i, embeddings.len());
-        individual_results.extend(embeddings);
+        println!("   Text {}: Generated {} embeddings", i, embeddings_with_pos.len());
+        // 位置情報を除去してembeddingのみを追加
+        individual_results.extend(embeddings_with_pos.into_iter().map(|e| e.values));
     }
 
     println!("Total individual embeddings: {}", individual_results.len());

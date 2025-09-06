@@ -179,6 +179,7 @@ impl TokenizationProcessor {
         }
     }
     
+    // TODO huggingface LLM でのembedding生成時に使用するため、cancleが直ったら統合する
     /// バッチテキストの左パディング処理（llama.cpp / embedding用）
     pub fn tokenize_batch_with_padding(
         &self,
@@ -251,7 +252,7 @@ impl TokenizationProcessor {
         self.max_seq_length
     }
     
-    /// トークンをテキストにデコード（デバッグ用）
+    /// トークンをテキストにデコード
     pub fn decode_tokens(&self, token_ids: &[u32]) -> Result<String> {
         // Priority 1: HuggingFace tokenizer (if explicitly specified)
         if let Some(tokenizer) = &self.fallback_tokenizer {
@@ -358,16 +359,5 @@ mod tests {
         assert_eq!(tokenized.len(), 0);
         assert!(tokenized.is_empty());
         assert!(tokenized.is_valid_length(10));
-    }
-    
-    #[test]
-    fn test_tokenizer_type_reporting() {
-        // Test tokenizer type reporting for fallback
-        let result = TokenizationProcessor::new_from_model_id("test", 512);
-        if let Ok(processor) = result {
-            // This would be "huggingface-fallback" if successful
-            let _tokenizer_type = processor.tokenizer_type();
-        }
-        // If creation failed, that's also fine for this test
     }
 }
