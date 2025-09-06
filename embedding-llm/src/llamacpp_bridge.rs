@@ -82,10 +82,6 @@ pub struct LlamaCppModel {
     _use_cpu: bool,      // Store for potential future use
 }
 
-// Safety: llama.cpp内部でのスレッド安全性は適切に処理される
-unsafe impl Send for LlamaCppModel {}
-unsafe impl Sync for LlamaCppModel {}
-
 impl LlamaCppModel {
     /// GGUFモデルの初期化（プロダクション実装）
     pub fn new(
@@ -507,11 +503,10 @@ pub mod helpers {
 
         // Try to parse as HuggingFace model (format: "repo/file.gguf" or just "file.gguf")
         if model_path.contains('/') && model_path.ends_with(".gguf") {
-            // Split into repo and filename
-            let parts: Vec<&str> = model_path.rsplitn(2, '/').collect();
-            if parts.len() == 2 {
-                let filename = parts[0];
-                let repo = parts[1];
+            // Split into repo and filename from the last '/'
+            if let Some(last_slash_pos) = model_path.rfind('/') {
+                let repo = &model_path[..last_slash_pos];
+                let filename = &model_path[last_slash_pos + 1..];
 
                 info!("Downloading model from HuggingFace: {}/{}", repo, filename);
 
@@ -588,11 +583,15 @@ mod tests {
     fn test_hf_model_path_parsing() {
         // Test HuggingFace model path parsing logic
         let model_path = "microsoft/phi-4-gguf/phi-4-q4.gguf";
-        let parts: Vec<&str> = model_path.rsplitn(2, '/').collect();
-
-        assert_eq!(parts.len(), 2);
-        assert_eq!(parts[0], "phi-4-q4.gguf"); // filename
-        assert_eq!(parts[1], "microsoft/phi-4-gguf"); // repo
+        if let Some(last_slash_pos) = model_path.rfind('/') {
+            let repo = &model_path[..last_slash_pos];
+            let filename = &model_path[last_slash_pos + 1..];
+            
+            assert_eq!(filename, "phi-4-q4.gguf");
+            assert_eq!(repo, "microsoft/phi-4-gguf");
+        } else {
+            panic!("Failed to find last slash");
+        }
     }
 
     #[test]

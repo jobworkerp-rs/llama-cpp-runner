@@ -6,6 +6,7 @@ pub mod tokenization;
 
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
+use command_utils::trace::Tracing;
 use jobworkerp_client::plugins::PluginRunner;
 use prost::Message;
 use std::collections::HashMap;
@@ -37,6 +38,8 @@ impl Default for EmbeddingLlmRunnerPlugin {
         Self::new().expect("Failed to create plugin")
     }
 }
+
+impl Tracing for EmbeddingLlmRunnerPlugin {}
 
 #[async_trait]
 impl PluginRunner for EmbeddingLlmRunnerPlugin {
@@ -80,7 +83,11 @@ impl PluginRunner for EmbeddingLlmRunnerPlugin {
         arg: Vec<u8>,
         metadata: HashMap<String, String>,
     ) -> (Result<Vec<u8>>, HashMap<String, String>) {
-        let mut result_metadata = metadata;
+        // OpenTelemetryスパンの作成（metadataから親コンテキストを抽出）
+        let mut span = EmbeddingLlmRunnerPlugin::otel_span_from_metadata(&metadata, "embedding-llm", "embedding.run");
+        
+        // metadataをそのまま通すため、変更しない
+        let result_metadata = metadata;
 
         let result: Result<Vec<u8>> = (|| -> Result<Vec<u8>> {
             let args = protobuf::embedding_llm::EmbeddingArgs::decode(&arg[..])?;
@@ -99,14 +106,6 @@ impl PluginRunner for EmbeddingLlmRunnerPlugin {
             )?;
 
             let model_info = embedder.model_info();
-
-            // メタデータに統計情報を追加
-            result_metadata.insert("embedding_count".to_string(), embeddings.len().to_string());
-            result_metadata.insert(
-                "embedding_dimension".to_string(),
-                model_info.embedding_dimension.to_string(),
-            );
-            result_metadata.insert("model_path".to_string(), model_info.model_path.clone());
 
             let result = protobuf::embedding_llm::EmbeddingLlmResult {
                 embeddings: embeddings
@@ -128,6 +127,16 @@ impl PluginRunner for EmbeddingLlmRunnerPlugin {
             result.encode(&mut buf)?;
             Ok(buf)
         })();
+
+        // トレーシング情報の記録
+        match &result {
+            Ok(result_buf) => {
+                EmbeddingLlmRunnerPlugin::trace_response(&mut span, result_buf);
+            }
+            Err(e) => {
+                EmbeddingLlmRunnerPlugin::trace_error(&mut span, e.as_ref());
+            }
+        }
 
         (result, result_metadata)
     }

@@ -1,6 +1,7 @@
 # embedding-llm
 
 LLM ベースの embedding 生成プラグイン（llama.cpp 統合版）
+(ほぼclaude codeが作成したもの)
 
 ## 概要
 

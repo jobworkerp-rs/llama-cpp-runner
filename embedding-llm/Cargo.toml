@@ -21,6 +21,7 @@ hf-hub = { workspace = true }
 itertools = { workspace = true }
 llama-cpp-2 = { workspace = true }
 once_cell = { workspace = true }
+opentelemetry = { version = "0.26" }
 prost = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 thiserror = { workspace = true }
@@ -42,3 +43,4 @@ openmp = ["llama-cpp-2/openmp"]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
+chrono = { version = "0.4", features = ["serde"] }
