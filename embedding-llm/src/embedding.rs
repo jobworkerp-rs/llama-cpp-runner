@@ -24,6 +24,14 @@ pub struct ModelInfo {
     pub dtype: String,
 }
 
+/// Embedding result with character position information
+#[derive(Debug, Clone)]
+pub struct EmbeddingWithPosition {
+    pub values: Vec<f32>,
+    pub char_start_pos: usize,
+    pub char_end_pos: usize,
+}
+
 impl LlamaCppEmbedder {
     /// 設定からEmbedderを初期化
     pub fn new_from_settings(settings: &EmbeddingLlmRunnerSettings) -> Result<Self> {
@@ -148,6 +156,90 @@ impl LlamaCppEmbedder {
         })
     }
     
+    /// instruction付きembedding生成（位置情報付き）
+    pub fn generate_embeddings_with_positions(
+        &self,
+        text: &str,
+        instruction: Option<&str>,
+        normalize: bool,
+        merge_strategy: Option<MergeStrategy>,
+    ) -> Result<Vec<EmbeddingWithPosition>> {
+        debug!("Generating embeddings with positions for text of {} chars", text.len());
+        
+        // テキストをウィンドウに分割（文字位置情報付き）
+        let windows = self.sliding_window.process_long_text(text, instruction)
+            .map_err(|e| EmbeddingLlmError::tokenization(format!("Sliding window processing failed: {}", e)))?;
+        
+        info!("Processing {} windows for embedding generation", windows.len());
+        
+        // バッチ処理でembeddingを効率的に生成
+        let token_sequences: Vec<&[u32]> = windows.iter().map(|w| w.token_ids.as_slice()).collect();
+        
+        let mut model = self.model.lock()
+            .map_err(|_| EmbeddingLlmError::inference("Failed to acquire model lock".to_string()))?;
+        
+        let mut all_embeddings = if token_sequences.len() > 1 {
+            debug!("Using batch processing for {} windows", token_sequences.len());
+            model.generate_batch_embeddings(&token_sequences)?
+        } else {
+            debug!("Using single embedding generation for 1 window");
+            let embedding = model.generate_embedding(&windows[0].token_ids)?;
+            vec![embedding]
+        };
+        
+        // L2正規化（オプション）
+        if normalize {
+            info!("Applying L2 normalization to {} embeddings", all_embeddings.len());
+            for (i, embedding) in all_embeddings.iter_mut().enumerate() {
+                *embedding = self.l2_normalize(embedding)
+                    .map_err(|e| EmbeddingLlmError::inference(format!("Normalization failed for window {}: {}", i, e)))?;
+                debug!("Applied L2 normalization to window {} embedding", i);
+            }
+        }
+        
+        // merge_strategy指定がある場合のみ統合
+        let final_embeddings = if let Some(strategy) = merge_strategy {
+            if all_embeddings.len() > 1 {
+                info!("Merging {} window embeddings using {:?}", all_embeddings.len(), strategy);
+                let merged = self.sliding_window
+                    .merge_embeddings(&all_embeddings, strategy)
+                    .map_err(|e| EmbeddingLlmError::inference(format!("Embedding merge failed: {}", e)))?;
+                
+                // For merged embeddings, use the span of all windows
+                let overall_start = windows.iter().map(|w| w.char_start_pos).min().unwrap_or(0);
+                let overall_end = windows.iter().map(|w| w.char_end_pos).max().unwrap_or(text.chars().count());
+                
+                vec![EmbeddingWithPosition {
+                    values: merged,
+                    char_start_pos: overall_start,
+                    char_end_pos: overall_end,
+                }]
+            } else {
+                // 単一embeddingの場合
+                vec![EmbeddingWithPosition {
+                    values: all_embeddings.into_iter().next().unwrap(),
+                    char_start_pos: windows[0].char_start_pos,
+                    char_end_pos: windows[0].char_end_pos,
+                }]
+            }
+        } else {
+            // merge_strategyがNoneの場合は全embeddingを個別に返す
+            info!("Returning {} individual window embeddings with positions", all_embeddings.len());
+            all_embeddings
+                .into_iter()
+                .zip(windows.iter())
+                .map(|(embedding, window)| EmbeddingWithPosition {
+                    values: embedding,
+                    char_start_pos: window.char_start_pos,
+                    char_end_pos: window.char_end_pos,
+                })
+                .collect()
+        };
+        
+        info!("Generated {} final embeddings with positions", final_embeddings.len());
+        Ok(final_embeddings)
+    }
+
     /// instruction付きembedding生成（メイン機能）
     pub fn generate_embeddings_with_instruction(
         &self,

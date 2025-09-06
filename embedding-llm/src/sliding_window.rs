@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use crate::error::{EmbeddingLlmError, Result};
 use crate::tokenization::TokenizationProcessor;
+use crate::token_position::TokenPositionMapper;
 use tracing::{debug, info, warn};
 
 /// Sliding Window processing configuration
@@ -27,6 +28,7 @@ pub struct SlidingWindowProcessor {
     max_seq_length: usize,
     config: SlidingWindowConfig,
     tokenizer_processor: Arc<TokenizationProcessor>,
+    position_mapper: TokenPositionMapper,
 }
 
 impl SlidingWindowProcessor {
@@ -94,10 +96,13 @@ impl SlidingWindowProcessor {
                   config.window_stride, max_seq_length);
         }
         
+        let position_mapper = TokenPositionMapper::new(tokenizer_processor.clone());
+        
         Self {
             max_seq_length,
             config,
             tokenizer_processor,
+            position_mapper,
         }
     }
     
@@ -110,10 +115,13 @@ impl SlidingWindowProcessor {
         debug!("Processing text of {} characters", text.len());
         
         // Step 1: Tokenize input text and instruction separately
-        let (text_tokens, instruction_tokens) = self.tokenize_text_and_instruction(text, instruction)?;
+        let (text_tokens, instruction_tokens, text_tokenized) = self.tokenize_text_and_instruction(text, instruction)?;
         
         // Step 2: Split tokenized text into sliding windows with instruction consideration
-        let windows = self.split_tokens_into_windows(&text_tokens, &instruction_tokens)?;
+        let mut windows = self.split_tokens_into_windows(&text_tokens, &instruction_tokens)?;
+        
+        // Step 3: Calculate character positions for each window (reuse tokenization)
+        self.calculate_character_positions_with_tokenized(text, &text_tokenized, &mut windows)?;
         
         info!("Created {} windows for long text processing", windows.len());
         Ok(windows)
@@ -124,13 +132,13 @@ impl SlidingWindowProcessor {
         &self,
         text: &str,
         instruction: Option<&str>,
-    ) -> Result<(Vec<u32>, Vec<u32>)> {
+    ) -> Result<(Vec<u32>, Vec<u32>, crate::tokenization::TokenizedText)> {
         debug!("Tokenizing text and instruction separately");
         
-        // Tokenize text only
+        // Tokenize text only - this will be reused for character position calculation
         let text_tokenized = self.tokenizer_processor
             .tokenize_with_instruction(text, None)?;
-        let text_tokens = text_tokenized.token_ids;
+        let text_tokens = text_tokenized.token_ids.clone();
         
         // Tokenize instruction if present
         let instruction_tokens = if let Some(inst) = instruction {
@@ -143,7 +151,8 @@ impl SlidingWindowProcessor {
         
         debug!("Text tokens: {}, Instruction tokens: {}", text_tokens.len(), instruction_tokens.len());
         
-        Ok((text_tokens, instruction_tokens))
+        // Return the TokenizedText for reuse in character position calculation
+        Ok((text_tokens, instruction_tokens, text_tokenized))
     }
     
     /// Step 2: Split tokenized text into sliding windows considering instruction length
@@ -180,12 +189,50 @@ impl SlidingWindowProcessor {
                 start_pos: *start_pos,
                 end_pos: *end_pos,
                 window_index,
+                char_start_pos: 0, // Will be calculated later
+                char_end_pos: 0,   // Will be calculated later
             });
         }
         
         Ok(windows)
     }
     
+    /// Step 3: Calculate character positions for each window using pre-tokenized text
+    fn calculate_character_positions_with_tokenized(
+        &self,
+        text: &str,
+        text_tokenized: &crate::tokenization::TokenizedText,
+        windows: &mut [TokenizedWindow],
+    ) -> Result<()> {
+        debug!("Calculating character positions for {} windows", windows.len());
+        
+        // Collect token positions for batch calculation
+        let window_positions: Vec<(usize, usize)> = windows
+            .iter()
+            .map(|w| (w.start_pos, w.end_pos))
+            .collect();
+        
+        // Calculate all character positions at once using pre-tokenized text
+        let char_positions = self.position_mapper
+            .calculate_cumulative_positions_with_tokenized(text, text_tokenized, &window_positions)?;
+        
+        // Update each window with its calculated character positions
+        for (window, (char_start, char_end)) in windows.iter_mut().zip(char_positions.iter()) {
+            window.char_start_pos = *char_start;
+            window.char_end_pos = *char_end;
+            
+            debug!(
+                "Window {}: tokens[{}, {}) -> chars[{}, {})",
+                window.window_index, 
+                window.start_pos, 
+                window.end_pos, 
+                window.char_start_pos, 
+                window.char_end_pos
+            );
+        }
+        
+        Ok(())
+    }
     
     /// Static utility: Merge embeddings from multiple windows
     pub fn merge_embeddings_static(
@@ -327,6 +374,10 @@ pub struct TokenizedWindow {
     pub end_pos: usize,
     /// Window index (0-based)
     pub window_index: usize,
+    /// Start character position in the original text
+    pub char_start_pos: usize,
+    /// End character position in the original text
+    pub char_end_pos: usize,
 }
 
 impl TokenizedWindow {

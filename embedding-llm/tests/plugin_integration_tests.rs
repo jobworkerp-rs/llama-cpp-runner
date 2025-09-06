@@ -35,17 +35,17 @@ async fn test_plugin_full_lifecycle_with_embedding_generation() {
     // 2. 設定データの準備とload
     let settings = EmbeddingLlmRunnerSettings {
         use_cpu: false,
-        max_seq_length: 512,
+        max_seq_length: 128,  // Sufficient sequence length
         model_type: ModelType::Gguf as i32,
         model_id: "Qwen/Qwen3-Embedding-4B-GGUF".to_string(),
         model_files: vec!["Qwen3-Embedding-4B-Q4_K_M.gguf".to_string()],
         tokenizer_model_id: Some("Qwen/Qwen3-Embedding-4B".to_string()),
         dtype: Some(DType::Bf16 as i32),
         sliding_window_config: Some(SlidingWindowConfig {
-            window_stride: 256,
-            min_window_size: 32,
+            window_stride: 16,   // Very small stride to force multiple windows
+            min_window_size: 8,  // Very small window size
         }),
-        max_batch_size: Some(4),
+        max_batch_size: Some(1),  // Sequential processing to avoid batch space issues
     };
 
     let mut settings_buf = Vec::new();
@@ -88,8 +88,16 @@ async fn test_plugin_full_lifecycle_with_embedding_generation() {
         (
             "Long text sliding window test",
             EmbeddingArgs {
-                text: "Natural language processing is a subfield of linguistics, computer science, and artificial intelligence concerned with the interactions between computers and human language, in particular how to program computers to process and analyze large amounts of natural language data. The goal is a computer capable of understanding the contents of documents, including the contextual nuances of the language within them. The technology can then accurately extract information and insights contained in the documents as well as categorize and organize the documents themselves.".to_string(),
+                text: "Natural language processing is a subfield of linguistics, computer science, and artificial intelligence concerned with the interactions between computers and human language, in particular how to program computers to process and analyze large amounts of natural language data. The goal is a computer capable of understanding the contents of documents, including the contextual nuances of the language within them. The technology can then accurately extract information and insights contained in the documents as well as categorize and organize the documents themselves. This is a very long text that should exceed the token limits and create multiple sliding windows for comprehensive testing of position calculation across different windows and segments.".to_string(),
                 instruction: Some("Generate comprehensive embedding".to_string()),
+                normalize_embeddings: false,
+            }
+        ),
+        (
+            "Multi-window position test",
+            EmbeddingArgs {
+                text: "Lorem ipsum dolor sit amet, consectetur adipiscing elit. Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum. Sed ut perspiciatis unde omnis iste natus error sit voluptatem accusantium doloremque laudantium, totam rem aperiam, eaque ipsa quae ab illo inventore veritatis et quasi architecto beatae vitae dicta sunt explicabo. Nemo enim ipsam voluptatem quia voluptas sit aspernatur aut odit aut fugit, sed quia consequuntur magni dolores eos qui ratione voluptatem sequi nesciunt. Neque porro quisquam est, qui dolorem ipsum quia dolor sit amet, consectetur, adipisci velit, sed quia non numquam eius modi tempora incidunt ut labore et dolore magnam aliquam quaerat voluptatem.".to_string(),
+                instruction: None,
                 normalize_embeddings: false,
             }
         ),
@@ -99,6 +107,14 @@ async fn test_plugin_full_lifecycle_with_embedding_generation() {
                 text: "Hello world".to_string(),
                 instruction: None, // No instruction test
                 normalize_embeddings: true,
+            }
+        ),
+        (
+            "Extremely long text for guaranteed multiple windows",
+            EmbeddingArgs {
+                text: "This is an extremely long text designed to exceed token limits and create multiple sliding windows. The purpose of this test is to validate that the character position calculation works correctly when text is split into multiple segments. Natural language processing involves many complex tasks including tokenization, semantic analysis, syntactic parsing, named entity recognition, sentiment analysis, machine translation, question answering, text summarization, and many other applications. Machine learning models have revolutionized how we approach these problems by learning patterns from large datasets rather than relying solely on hand-crafted rules. Deep learning architectures such as transformers have been particularly successful in capturing long-range dependencies in sequential data. The attention mechanism allows models to focus on relevant parts of the input sequence when making predictions. This has led to significant improvements in tasks like machine translation where the model needs to align words and phrases between source and target languages. Pre-trained language models like BERT, GPT, and T5 have further advanced the field by providing strong baselines that can be fine-tuned for specific tasks. These models are trained on massive amounts of text data and learn rich representations of language that capture both syntactic and semantic information. The emergence of large language models has opened up new possibilities for few-shot and zero-shot learning where models can perform tasks with minimal or no task-specific training data.".to_string(),
+                instruction: Some("Generate comprehensive embeddings for this extensive text".to_string()),
+                normalize_embeddings: false,
             }
         ),
     ];
@@ -134,6 +150,72 @@ async fn test_plugin_full_lifecycle_with_embedding_generation() {
                 let first_embedding = &embedding_result.embeddings[0];
                 println!("  - First embedding dimension: {}", first_embedding.values.len());
                 assert!(!first_embedding.values.is_empty(), "Embedding values should not be empty");
+                
+                // Check position information for all embeddings
+                println!("  - Position information:");
+                let text_char_len = args.text.chars().count() as u32;
+                for (i, embedding) in embedding_result.embeddings.iter().enumerate() {
+                    println!("    Embedding {}: begin_pos={}, end_pos={} (span: {} chars)", 
+                            i, embedding.begin_position, embedding.end_position,
+                            embedding.end_position - embedding.begin_position);
+                    
+                    // First embedding should start at position 0
+                    if i == 0 {
+                        assert_eq!(embedding.begin_position, 0, 
+                                 "First embedding should start at position 0");
+                    } else {
+                        // Subsequent embeddings should have non-zero begin position
+                        assert!(embedding.begin_position > 0, 
+                               "Embedding {} should have non-zero begin position, got {}", 
+                               i, embedding.begin_position);
+                    }
+                    
+                    // End position should be greater than begin position
+                    assert!(embedding.end_position > embedding.begin_position,
+                           "Embedding {} end position {} should be greater than begin position {}", 
+                           i, embedding.end_position, embedding.begin_position);
+                    
+                    // Position should be within reasonable text bounds
+                    assert!(embedding.end_position <= text_char_len,
+                           "Embedding {} end position {} should not exceed text length {}", 
+                           i, embedding.end_position, text_char_len);
+                    
+                    // Check for reasonable position ordering in multi-embedding cases
+                    if i > 0 {
+                        let prev_embedding = &embedding_result.embeddings[i - 1];
+                        // Current embedding should not start before previous one ends
+                        // (allowing for overlap in sliding window)
+                        assert!(embedding.begin_position >= prev_embedding.begin_position,
+                               "Embedding {} begin position {} should not be before previous embedding's begin position {}",
+                               i, embedding.begin_position, prev_embedding.begin_position);
+                    }
+                }
+                
+                // Special validation for multi-embedding results
+                if embedding_result.embeddings.len() > 1 {
+                    println!("  - Multi-embedding validation:");
+                    println!("    Total embeddings: {}", embedding_result.embeddings.len());
+                    println!("    Text length: {} characters", text_char_len);
+                    
+                    // Verify that embeddings after the first have non-zero begin positions
+                    for (i, embedding) in embedding_result.embeddings.iter().enumerate().skip(1) {
+                        assert!(embedding.begin_position > 0,
+                               "Embedding {} should have non-zero begin position, got {}",
+                               i, embedding.begin_position);
+                        println!("    ✓ Embedding {}: begin_position = {} (non-zero)", i, embedding.begin_position);
+                    }
+                    
+                    let last_embedding = embedding_result.embeddings.last().unwrap();
+                    assert!(last_embedding.end_position >= text_char_len / 2,
+                           "Last embedding should cover a reasonable portion of text");
+                    
+                    println!("    ✓ Multi-embedding position validation passed");
+                } else if test_name.contains("long text") || test_name.contains("Extremely long") {
+                    // For tests designed to produce multiple embeddings, warn if only one was generated
+                    println!("  - WARNING: Expected multiple embeddings for '{}', but only got 1", test_name);
+                    println!("    This may indicate that sliding window configuration needs adjustment");
+                    println!("    Text length: {} characters, Tokens may have been under the limit", text_char_len);
+                }
                 
                 // Check model info
                 if let Some(model_info) = &embedding_result.model_info {

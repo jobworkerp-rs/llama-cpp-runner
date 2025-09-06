@@ -3,6 +3,7 @@ pub mod error;
 pub mod llamacpp_bridge;
 pub mod sliding_window;
 pub mod tokenization;
+pub mod token_position;
 
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
@@ -97,8 +98,8 @@ impl PluginRunner for EmbeddingLlmRunnerPlugin {
                 .as_ref()
                 .ok_or(anyhow!("Embedder not initialized"))?;
 
-            // llama.cppベースのembedding生成
-            let embeddings = embedder.generate_embeddings_with_instruction(
+            // llama.cppベースのembedding生成（位置情報付き）
+            let embeddings_with_positions = embedder.generate_embeddings_with_positions(
                 &args.text,
                 args.instruction.as_deref(),
                 args.normalize_embeddings,
@@ -108,11 +109,13 @@ impl PluginRunner for EmbeddingLlmRunnerPlugin {
             let model_info = embedder.model_info();
 
             let result = protobuf::embedding_llm::EmbeddingLlmResult {
-                embeddings: embeddings
+                embeddings: embeddings_with_positions
                     .into_iter()
                     .map(
-                        |values| protobuf::embedding_llm::embedding_llm_result::Embedding {
-                            values,
+                        |embedding_with_pos| protobuf::embedding_llm::embedding_llm_result::Embedding {
+                            values: embedding_with_pos.values,
+                            begin_position: embedding_with_pos.char_start_pos as u32,
+                            end_position: embedding_with_pos.char_end_pos as u32,
                         },
                     )
                     .collect(),
