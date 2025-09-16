@@ -51,7 +51,7 @@ impl PluginRunner for EmbeddingLlmRunnerPlugin {
     }
 
     fn description(&self) -> String {
-        String::from("Generate embeddings using LLM via llama.cpp with LLM hidden states")
+        String::from("Generate text embeddings with positional information and optional instruction prefixes")
     }
 
     fn load(&mut self, settings: Vec<u8>) -> Result<()> {
@@ -206,7 +206,7 @@ mod tests {
 
         let plugin = plugin.unwrap();
         assert_eq!(plugin.name(), "EmbeddingLlmRunner");
-        assert!(plugin.description().contains("embedding"));
+        assert!(plugin.description().contains("embeddings"));
     }
 
     #[test]
