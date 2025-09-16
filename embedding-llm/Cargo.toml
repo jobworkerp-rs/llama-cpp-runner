@@ -21,7 +21,7 @@ hf-hub = { workspace = true }
 itertools = { workspace = true }
 llama-cpp-2 = { workspace = true }
 once_cell = { workspace = true }
-opentelemetry = { version = "0.30" }
+opentelemetry = { workspace = true}
 prost = { workspace = true }
 schemars = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
