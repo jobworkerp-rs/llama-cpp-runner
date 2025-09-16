@@ -2,13 +2,15 @@ pub mod embedding;
 pub mod error;
 pub mod llamacpp_bridge;
 pub mod sliding_window;
-pub mod tokenization;
 pub mod token_position;
+pub mod tokenization;
 
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use command_utils::trace::Tracing;
-use jobworkerp_client::plugins::PluginRunner;
+use jobworkerp_client::{
+    plugins::PluginRunner, schema_to_json_string, schema_to_json_string_option,
+};
 use prost::Message;
 use std::collections::HashMap;
 
@@ -85,8 +87,12 @@ impl PluginRunner for EmbeddingLlmRunnerPlugin {
         metadata: HashMap<String, String>,
     ) -> (Result<Vec<u8>>, HashMap<String, String>) {
         // OpenTelemetryスパンの作成（metadataから親コンテキストを抽出）
-        let mut span = EmbeddingLlmRunnerPlugin::otel_span_from_metadata(&metadata, "embedding-llm", "embedding.run");
-        
+        let mut span = EmbeddingLlmRunnerPlugin::otel_span_from_metadata(
+            &metadata,
+            "embedding-llm",
+            "embedding.run",
+        );
+
         // metadataをそのまま通すため、変更しない
         let result_metadata = metadata;
 
@@ -111,13 +117,13 @@ impl PluginRunner for EmbeddingLlmRunnerPlugin {
             let result = protobuf::embedding_llm::EmbeddingLlmResult {
                 embeddings: embeddings_with_positions
                     .into_iter()
-                    .map(
-                        |embedding_with_pos| protobuf::embedding_llm::embedding_llm_result::Embedding {
+                    .map(|embedding_with_pos| {
+                        protobuf::embedding_llm::embedding_llm_result::Embedding {
                             values: embedding_with_pos.values,
                             begin_position: embedding_with_pos.char_start_pos as u32,
                             end_position: embedding_with_pos.char_end_pos as u32,
-                        },
-                    )
+                        }
+                    })
                     .collect(),
                 model_info: Some(protobuf::embedding_llm::ModelInfo {
                     model_name: format!("llama.cpp-{}", model_info.model_path),
@@ -161,6 +167,18 @@ impl PluginRunner for EmbeddingLlmRunnerPlugin {
 
     fn result_output_proto(&self) -> Option<String> {
         Some(include_str!("../protobuf/llm_result.proto").to_string())
+    }
+    fn settings_schema(&self) -> String {
+        schema_to_json_string!(
+            protobuf::embedding_llm::EmbeddingLlmRunnerSettings,
+            "settings_schema"
+        )
+    }
+    fn arguments_schema(&self) -> String {
+        schema_to_json_string!(protobuf::embedding_llm::EmbeddingArgs, "arguments_schema")
+    }
+    fn output_json_schema(&self) -> Option<String> {
+        schema_to_json_string_option!(protobuf::embedding_llm::EmbeddingLlmResult, "output_schema")
     }
 }
 

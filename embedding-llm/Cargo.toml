@@ -21,9 +21,11 @@ hf-hub = { workspace = true }
 itertools = { workspace = true }
 llama-cpp-2 = { workspace = true }
 once_cell = { workspace = true }
-opentelemetry = { version = "0.26" }
+opentelemetry = { version = "0.30" }
 prost = { workspace = true }
+schemars = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokenizers = { workspace = true }
 tracing = { workspace = true }

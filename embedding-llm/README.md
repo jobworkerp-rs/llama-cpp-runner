@@ -61,7 +61,7 @@ let settings = EmbeddingLlmRunnerSettings {
     max_seq_length: 512,
     model_type: ModelType::Gguf as i32,
     model_files: vec!["Qwen3-Embedding-4B-Q8_0.gguf".to_string()],
-    tokenizer_model_id: Some("Qwen/Qwen3-Embedding-0.6B".to_string()),
+    tokenizer_model_id: Some("Qwen/Qwen3-Embedding-4B".to_string()),
     sliding_window_config: Some(SlidingWindowConfig {
         window_stride: 128,
         min_window_size: 64,

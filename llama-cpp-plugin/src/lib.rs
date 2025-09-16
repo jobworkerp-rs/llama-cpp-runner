@@ -142,7 +142,7 @@ impl PluginRunner for LlamaCppPlugin {
         schema_to_json_string!(LlamaArg, "arguments_schema")
     }
     fn output_json_schema(&self) -> Option<String> {
-        schema_to_json_string_option!(LlamaRunnerSettings, "settings_schema")
+        schema_to_json_string_option!(LlamaArg, "output_schema")
     }
 }
 

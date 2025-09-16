@@ -502,7 +502,7 @@ impl PluginRunner for OllamaPlugin {
         schema_to_json_string!(LlamaArg, "arguments_schema")
     }
     fn output_json_schema(&self) -> Option<String> {
-        schema_to_json_string_option!(LlamaArg, "arguments_schema")
+        schema_to_json_string_option!(LlamaArg, "output_schema")
     }
     fn output_type(&self) -> jobworkerp_client::jobworkerp::data::StreamingOutputType {
         jobworkerp_client::jobworkerp::data::StreamingOutputType::NonStreaming
