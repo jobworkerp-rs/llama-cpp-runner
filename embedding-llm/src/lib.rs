@@ -118,10 +118,18 @@ impl PluginRunner for EmbeddingLlmRunnerPlugin {
                 embeddings: embeddings_with_positions
                     .into_iter()
                     .map(|embedding_with_pos| {
+                        // Extract content from original text using character positions
+                        let content = args.text
+                            .chars()
+                            .skip(embedding_with_pos.char_start_pos)
+                            .take(embedding_with_pos.char_end_pos - embedding_with_pos.char_start_pos)
+                            .collect::<String>();
+
                         protobuf::embedding_llm::embedding_llm_result::Embedding {
                             values: embedding_with_pos.values,
                             begin_position: embedding_with_pos.char_start_pos as u32,
                             end_position: embedding_with_pos.char_end_pos as u32,
+                            content,
                         }
                     })
                     .collect(),
