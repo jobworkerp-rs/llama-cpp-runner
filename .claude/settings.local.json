@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//Users/sutr/works/rust/jobworkerp-rs/llama-cpp-plugin/**)",
+      "WebFetch(domain:github.com)",
+      "WebSearch",
+      "WebFetch(domain:docs.rs)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}

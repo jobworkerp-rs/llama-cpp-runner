@@ -152,14 +152,16 @@ impl LlamaCppEmbedder {
         );
 
         // Sliding Window Processorの初期化
-        let sliding_window_config =
-            settings
-                .sliding_window_config
-                .as_ref()
-                .map(|config| SlidingWindowConfig {
-                    window_stride: config.window_stride as usize,
-                    min_window_size: config.min_window_size as usize,
-                });
+        let sliding_window_config = if let Some(config) = settings.sliding_window_config.as_ref() {
+            // 設定が指定されている場合は、その設定を使用
+            Some(SlidingWindowConfig {
+                window_stride: config.window_stride as usize,
+                min_window_size: config.min_window_size as usize,
+            })
+        } else {
+            // 設定が未指定の場合は、max_seq_lengthベースのデフォルト設定を使用
+            Some(SlidingWindowConfig::new(settings.max_seq_length as usize))
+        };
 
         let sliding_window = SlidingWindowProcessor::new(
             settings.max_seq_length as usize,
