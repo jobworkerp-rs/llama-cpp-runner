@@ -61,7 +61,4 @@ message HierarchicalChunkingConfig {
 
   // Enable forced splitting as last resort
   bool enable_forced_splitting = 5;
-
-  // Preserve paragraph boundaries when possible
-  bool preserve_paragraph_boundaries = 6;
 }

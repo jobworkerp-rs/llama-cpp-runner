@@ -45,7 +45,6 @@ async fn test_plugin_full_lifecycle_with_embedding_generation() {
             enable_paragraph_merging: true,
             enable_sentence_splitting: true,
             enable_forced_splitting: true,
-            preserve_paragraph_boundaries: true,
         }),
         max_batch_size: Some(1), // Sequential processing to avoid batch space issues
     };

@@ -160,8 +160,6 @@ impl LlamaCppEmbedder {
                 enable_paragraph_merging: config.enable_paragraph_merging,
                 enable_sentence_splitting: config.enable_sentence_splitting,
                 enable_forced_splitting: config.enable_forced_splitting,
-                preserve_paragraph_boundaries: config.preserve_paragraph_boundaries,
-                max_char_length_fallback: Some(config.max_chunk_tokens as usize * 4), // Default heuristic
             };
 
             TextChunkingConfig {

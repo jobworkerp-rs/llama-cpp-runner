@@ -334,7 +334,6 @@ fn get_test_model_configs() -> Vec<(&'static str, EmbeddingLlmRunnerSettings)> {
                     enable_paragraph_merging: true,
                     enable_sentence_splitting: true,
                     enable_forced_splitting: true,
-                    preserve_paragraph_boundaries: true,
                 }),
                 max_batch_size: Some(6),
             },
@@ -407,7 +406,6 @@ async fn integration_test_qwen3_embedding_gguf_tokenizer() {
             enable_paragraph_merging: true,
             enable_sentence_splitting: true,
             enable_forced_splitting: true,
-            preserve_paragraph_boundaries: true,
         }),
         max_batch_size: Some(4), // GGUF内蔵tokenizer用バッチサイズ
     };
@@ -519,7 +517,6 @@ async fn test_hierarchical_chunking_and_batch_consistency() {
             enable_paragraph_merging: true,
             enable_sentence_splitting: true,
             enable_forced_splitting: true,
-            preserve_paragraph_boundaries: true,
         }),
         max_batch_size: Some(1), // 個別処理用
     };
