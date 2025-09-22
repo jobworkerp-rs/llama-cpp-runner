@@ -83,7 +83,7 @@ impl PluginRunner for LlamaCppPlugin {
     }
     fn load(&mut self, settings: Vec<u8>) -> Result<()> {
         let settings = LlamaRunnerSettings::decode(&mut Cursor::new(settings))
-            .map_err(|e| anyhow!("decode error: {}", e))?;
+            .map_err(|e| anyhow!("decode error: {e}"))?;
         tracing::debug!("LLMRunner load: {settings:?}",);
         self.load_model(settings.into())?;
         Ok(())
@@ -96,7 +96,7 @@ impl PluginRunner for LlamaCppPlugin {
         let res = || -> Result<Vec<u8>> {
             if let Some(llama_model) = self.llama_model.as_mut() {
                 let args = LlamaArg::decode(&mut Cursor::new(arg))
-                    .map_err(|e| anyhow!("decode error: {}", e))?;
+                    .map_err(|e| anyhow!("decode error: {e}"))?;
                 tracing::debug!("LLMRunner run: {args:?}",);
                 let text = llama_model
                     .run(args.clone().into())
@@ -156,8 +156,8 @@ mod test {
     async fn test_plugin_runner() {
         tracing_subscriber::fmt::init();
         let env = "
-LLAMA_MODEL=phi-4-Q4_0.gguf #Llama-3-ELYZA-JP-8B-q4_k_m.gguf # Phi-3-medium-128k-instruct.Q4_K.gguf # Meta-Llama-3.1-8B-Instruct-Q4_K_L.gguf #llama-2-7b-chat.Q4_K_M.gguf
-LLAMA_HF_REPO=microsoft/phi-4-gguf #elyza/Llama-3-ELYZA-JP-8B-GGUF # legraphista/Phi-3-medium-128k-instruct-IMat-GGUF # bartowski/Meta-Llama-3.1-8B-Instruct-GGUF #TheBloke/Llama-2-7B-Chat-GGUF
+LLAMA_MODEL=Qwen3-0.6B-Q4_K_M.gguf #Llama-3-ELYZA-JP-8B-q4_k_m.gguf # Phi-3-medium-128k-instruct.Q4_K.gguf # Meta-Llama-3.1-8B-Instruct-Q4_K_L.gguf #llama-2-7b-chat.Q4_K_M.gguf
+LLAMA_HF_REPO=unsloth/Qwen3-0.6B-GGUF #elyza/Llama-3-ELYZA-JP-8B-GGUF # legraphista/Phi-3-medium-128k-instruct-IMat-GGUF # bartowski/Meta-Llama-3.1-8B-Instruct-GGUF #TheBloke/Llama-2-7B-Chat-GGUF
 #LLAMA_MODEL=tokyotech-llm-Llama-3.1-Swallow-70B-Instruct-v0.1-Q4_K_M.gguf # Phi-3-medium-128k-instruct.Q4_K.gguf # Meta-Llama-3.1-8B-Instruct-Q4_K_L.gguf #llama-2-7b-chat.Q4_K_M.gguf
 #LLAMA_HF_REPO=mmnga/tokyotech-llm-Llama-3.1-Swallow-70B-Instruct-v0.1-gguf # legraphista/Phi-3-medium-128k-instruct-IMat-GGUF # bartowski/Meta-Llama-3.1-8B-Instruct-GGUF #TheBloke/Llama-2-7B-Chat-GGUF
 #LLAMA_MODEL=c4ai-command-r-plus-08-2024-Q4_K_M-00001-of-00002.gguf,c4ai-command-r-plus-08-2024-Q4_K_M-00002-of-00002.gguf # Phi-3-medium-128k-instruct.Q4_K.gguf # Meta-Llama-3.1-8B-Instruct-Q4_K_L.gguf #llama-2-7b-chat.Q4_K_M.gguf
@@ -204,11 +204,11 @@ Good luck in the competition and in advancing AI research!
         let request = LlamaArg {
             prompt,
             sample_len: 2048,
-            temperature: Some(0.8),
+            temperature: Some(0.3),
             top_p: Some(0.9),
             repeat_penalty: Some(0.9),
             repeat_last_n: Some(8),
-            seed: Some(32),
+            seed: Some(30),
             need_print: true,
         };
         let mut buf = Vec::with_capacity(request.encoded_len());
@@ -218,7 +218,7 @@ Good luck in the competition and in advancing AI research!
             .0
             .expect("failed to run plugin");
         let res = LlamaArg::decode(&mut Cursor::new(res.clone()))
-            .map_err(|e| anyhow!("decode error: {}", e))
+            .map_err(|e| anyhow!("decode error: {e}"))
             .unwrap();
         println!("response: {:?}", res.prompt);
         assert!(res.prompt.len() > 10 && res.prompt.len() < 4096);

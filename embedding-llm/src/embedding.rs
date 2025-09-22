@@ -1,17 +1,18 @@
 use crate::error::{EmbeddingLlmError, Result};
 use crate::llamacpp_bridge::LlamaCppModel;
 use crate::protobuf::embedding_llm::{DType, EmbeddingLlmRunnerSettings};
-use crate::sliding_window::{MergeStrategy, SlidingWindowConfig, SlidingWindowProcessor};
+use crate::text_processing::{TextChunkingConfig, TextProcessor};
 use crate::tokenization::TokenizationProcessor;
+use command_utils::text::chunking::{HierarchicalChunkingConfig, MergeStrategy};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 /// llama.cppベースのLLM Embedder
 pub struct LlamaCppEmbedder {
     model: Arc<Mutex<LlamaCppModel>>,
     tokenization_processor: Arc<TokenizationProcessor>,
-    sliding_window: SlidingWindowProcessor,
+    text_processor: TextProcessor,
     model_info: ModelInfo,
 }
 
@@ -77,7 +78,7 @@ impl LlamaCppEmbedder {
             settings.max_seq_length as usize,
             settings.max_batch_size,
         )
-        .map_err(|e| EmbeddingLlmError::model_loading(format!("Failed to load model: {}", e)))?;
+        .map_err(|e| EmbeddingLlmError::model_loading(format!("Failed to load model: {e}")))?;
 
         // dtypeのデフォルト値設定
         let dtype_enum = settings
@@ -126,8 +127,7 @@ impl LlamaCppEmbedder {
                 )
                 .map_err(|e| {
                     EmbeddingLlmError::tokenization(format!(
-                        "Failed to load specified tokenizer {}: {}",
-                        tokenizer_id, e
+                        "Failed to load specified tokenizer {tokenizer_id}: {e}"
                     ))
                 })?
             } else {
@@ -142,7 +142,7 @@ impl LlamaCppEmbedder {
                         // 3. GGUF内蔵tokenizerが失敗した場合はエラー
                         let err_msg = format!(
                         "GGUF built-in tokenizer failed and no tokenizer_model_id specified. \
-                         Either use a GGUF with built-in tokenizer or specify tokenizer_model_id. Error: {}", e
+                         Either use a GGUF with built-in tokenizer or specify tokenizer_model_id. Error: {e}"
                     );
                         error!("{}", err_msg);
                         return Err(EmbeddingLlmError::configuration(err_msg));
@@ -151,28 +151,33 @@ impl LlamaCppEmbedder {
             },
         );
 
-        // Sliding Window Processorの初期化
-        let sliding_window_config = if let Some(config) = settings.sliding_window_config.as_ref() {
-            // 設定が指定されている場合は、その設定を使用
-            Some(SlidingWindowConfig {
-                window_stride: config.window_stride as usize,
-                min_window_size: config.min_window_size as usize,
-            })
+        // Text Processorの初期化
+        let text_chunking_config = if let Some(config) = settings.chunking_config.as_ref() {
+            // HierarchicalChunkingConfigが指定されている場合
+            let hierarchical_config = HierarchicalChunkingConfig {
+                max_chunk_tokens: config.max_chunk_tokens as usize,
+                min_chunk_tokens: config.min_chunk_tokens as usize,
+                enable_paragraph_merging: config.enable_paragraph_merging,
+                enable_sentence_splitting: config.enable_sentence_splitting,
+                enable_forced_splitting: config.enable_forced_splitting,
+            };
+
+            TextChunkingConfig {
+                max_seq_length: settings.max_seq_length as usize,
+                hierarchical_config,
+            }
         } else {
             // 設定が未指定の場合は、max_seq_lengthベースのデフォルト設定を使用
-            Some(SlidingWindowConfig::new(settings.max_seq_length as usize))
+            TextChunkingConfig::for_embedding(settings.max_seq_length as usize)
         };
 
-        let sliding_window = SlidingWindowProcessor::new(
-            settings.max_seq_length as usize,
-            tokenization_processor.clone(),
-            sliding_window_config,
-        );
+        let text_processor =
+            TextProcessor::new(tokenization_processor.clone(), text_chunking_config);
 
         Ok(Self {
             model: model_arc,
             tokenization_processor,
-            sliding_window,
+            text_processor,
             model_info,
         })
     }
@@ -192,19 +197,32 @@ impl LlamaCppEmbedder {
 
         // テキストをウィンドウに分割（文字位置情報付き）
         let windows = self
-            .sliding_window
-            .process_long_text(text, instruction)
-            .map_err(|e| {
-                EmbeddingLlmError::tokenization(format!("Sliding window processing failed: {}", e))
-            })?;
+            .text_processor
+            .process_text_for_embedding(text, instruction)
+            .map_err(|e| EmbeddingLlmError::tokenization(format!("Text processing failed: {e}")))?;
 
         info!(
             "Processing {} windows for embedding generation",
             windows.len()
         );
 
+        // チェック: windowsが空でないことを確認
+        if windows.is_empty() {
+            warn!("No text windows available for embedding generation");
+            return Ok(vec![]);
+        }
+
         // バッチ処理でembeddingを効率的に生成
-        let token_sequences: Vec<&[u32]> = windows.iter().map(|w| w.token_ids.as_slice()).collect();
+        // まずすべてのウィンドウテキストをトークン化
+        let mut tokenized_windows = Vec::new();
+        for window in &windows {
+            let tokenized = self
+                .tokenization_processor
+                .tokenize_with_instruction(&window.text, None)?;
+            tokenized_windows.push(tokenized.token_ids);
+        }
+
+        let token_sequences: Vec<&[u32]> = tokenized_windows.iter().map(|w| w.as_slice()).collect();
 
         let mut model = self.model.lock().map_err(|_| {
             EmbeddingLlmError::inference("Failed to acquire model lock".to_string())
@@ -216,10 +234,14 @@ impl LlamaCppEmbedder {
                 token_sequences.len()
             );
             model.generate_batch_embeddings(&token_sequences)?
-        } else {
+        } else if token_sequences.len() == 1 {
             debug!("Using single embedding generation for 1 window");
-            let embedding = model.generate_embedding(&windows[0].token_ids)?;
+            let embedding = model.generate_embedding(&tokenized_windows[0])?;
             vec![embedding]
+        } else {
+            // windows.is_empty()のチェックでカバーされるはずだが、念のため
+            warn!("No tokenized windows available for embedding generation");
+            return Ok(vec![]);
         };
 
         // L2正規化（オプション）
@@ -231,8 +253,7 @@ impl LlamaCppEmbedder {
             for (i, embedding) in all_embeddings.iter_mut().enumerate() {
                 *embedding = self.l2_normalize(embedding).map_err(|e| {
                     EmbeddingLlmError::inference(format!(
-                        "Normalization failed for window {}: {}",
-                        i, e
+                        "Normalization failed for window {i}: {e}"
                     ))
                 })?;
                 debug!("Applied L2 normalization to window {} embedding", i);
@@ -247,11 +268,9 @@ impl LlamaCppEmbedder {
                     all_embeddings.len(),
                     strategy
                 );
-                let merged = self
-                    .sliding_window
-                    .merge_embeddings(&all_embeddings, strategy)
+                let merged = TextProcessor::merge_embeddings_static(&all_embeddings, strategy)
                     .map_err(|e| {
-                        EmbeddingLlmError::inference(format!("Embedding merge failed: {}", e))
+                        EmbeddingLlmError::inference(format!("Embedding merge failed: {e}"))
                     })?;
 
                 // For merged embeddings, use the span of all windows
@@ -464,7 +483,7 @@ mod tests {
     #[test]
     fn test_l2_normalize() {
         // Create a minimal embedder for testing normalization logic
-        let embedding = vec![3.0, 4.0]; // L2 norm = 5.0
+        let embedding = [3.0, 4.0]; // L2 norm = 5.0
 
         // Calculate L2 norm
         let norm_squared: f32 = embedding.iter().map(|x| x * x).sum();
@@ -482,7 +501,7 @@ mod tests {
 
     #[test]
     fn test_zero_vector_normalization() {
-        let embedding = vec![0.0, 0.0, 0.0];
+        let embedding = [0.0, 0.0, 0.0];
         let norm_squared: f32 = embedding.iter().map(|x| x * x).sum();
 
         // Zero vector cannot be normalized
@@ -511,7 +530,7 @@ mod tests {
 
     #[test]
     fn test_merge_strategy_behavior() {
-        use crate::sliding_window::MergeStrategy;
+        use command_utils::text::chunking::MergeStrategy;
 
         // Test embeddings (simulating multiple windows)
         let embeddings = vec![
@@ -530,7 +549,7 @@ mod tests {
 
         // Test with Some strategy (should return single merged embedding)
         // Using static function to simulate merging
-        let result_merged = crate::sliding_window::SlidingWindowProcessor::merge_embeddings_static(
+        let result_merged = crate::text_processing::TextProcessor::merge_embeddings_static(
             &embeddings,
             MergeStrategy::Average,
         )

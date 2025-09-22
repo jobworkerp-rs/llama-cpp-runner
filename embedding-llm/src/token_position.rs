@@ -42,8 +42,7 @@ impl TokenPositionMapper {
 
         if token_start_pos >= token_end_pos {
             return Err(EmbeddingLlmError::tokenization(format!(
-                "Invalid token range: start {} >= end {}",
-                token_start_pos, token_end_pos
+                "Invalid token range: start {token_start_pos} >= end {token_end_pos}"
             )));
         }
 
@@ -54,7 +53,8 @@ impl TokenPositionMapper {
             self.calculate_char_position_for_token_index(&tokenized.token_ids, token_start_pos)?
         };
 
-        let char_end = self.calculate_char_position_for_token_index(&tokenized.token_ids, token_end_pos)?;
+        let char_end =
+            self.calculate_char_position_for_token_index(&tokenized.token_ids, token_end_pos)?;
 
         // Ensure positions don't exceed original text length
         let text_char_len = original_text.chars().count();
@@ -86,7 +86,7 @@ impl TokenPositionMapper {
         // Decode tokens up to the target index to get character count
         let tokens_slice = &all_tokens[..token_index];
         let decoded_text = self.tokenizer.decode_tokens(tokens_slice)?;
-        
+
         Ok(decoded_text.chars().count())
     }
 
@@ -123,8 +123,10 @@ impl TokenPositionMapper {
             let char_start = if let Some(&cached) = token_to_char_cache.get(token_start) {
                 cached
             } else {
-                let char_pos = self
-                    .calculate_char_position_for_token_index(&text_tokenized.token_ids, *token_start)?;
+                let char_pos = self.calculate_char_position_for_token_index(
+                    &text_tokenized.token_ids,
+                    *token_start,
+                )?;
                 token_to_char_cache.insert(*token_start, char_pos);
                 char_pos
             };
@@ -132,8 +134,10 @@ impl TokenPositionMapper {
             let char_end = if let Some(&cached) = token_to_char_cache.get(token_end) {
                 cached
             } else {
-                let char_pos = self
-                    .calculate_char_position_for_token_index(&text_tokenized.token_ids, *token_end)?;
+                let char_pos = self.calculate_char_position_for_token_index(
+                    &text_tokenized.token_ids,
+                    *token_end,
+                )?;
                 token_to_char_cache.insert(*token_end, char_pos);
                 char_pos
             };
@@ -200,8 +204,8 @@ impl TokenPositionMapper {
             let char_end = if let Some(&cached) = token_to_char_cache.get(token_end) {
                 cached
             } else {
-                let char_pos = self
-                    .calculate_char_position_for_token_index(&tokenized.token_ids, *token_end)?;
+                let char_pos =
+                    self.calculate_char_position_for_token_index(&tokenized.token_ids, *token_end)?;
                 token_to_char_cache.insert(*token_end, char_pos);
                 char_pos
             };
@@ -231,7 +235,8 @@ mod tests {
     #[cfg(test)]
     fn create_test_tokenizer() -> Option<Arc<crate::tokenization::TokenizationProcessor>> {
         match crate::tokenization::TokenizationProcessor::new_from_model_id(
-            "Qwen/Qwen3-Embedding-4B", 512
+            "Qwen/Qwen3-Embedding-4B",
+            512,
         ) {
             Ok(processor) => Some(Arc::new(processor)),
             Err(_) => None,
@@ -253,7 +258,7 @@ mod tests {
         // Test with simple English text
         let text = "Hello world";
         let tokenized = tokenizer.tokenize_with_instruction(text, None).unwrap();
-        
+
         // Test calculate_char_position_for_token_index function directly
         let result = mapper.calculate_char_position_for_token_index(&tokenized.token_ids, 0);
         assert!(result.is_ok());
@@ -266,7 +271,7 @@ mod tests {
         // Test with Japanese text
         let text = "こんにちは";
         let tokenized = tokenizer.tokenize_with_instruction(text, None).unwrap();
-        
+
         let result = mapper.calculate_char_position_for_token_index(&tokenized.token_ids, 0);
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), 0);
@@ -280,7 +285,7 @@ mod tests {
         // Test with emoji
         let text = "😀😊";
         let tokenized = tokenizer.tokenize_with_instruction(text, None).unwrap();
-        
+
         let result = mapper.calculate_char_position_for_token_index(&tokenized.token_ids, 0);
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), 0);
@@ -334,7 +339,7 @@ mod tests {
         assert!(result.is_ok());
         let positions = result.unwrap();
         assert_eq!(positions.len(), 2);
-        
+
         // Verify first position starts at 0
         assert_eq!(positions[0].0, 0);
         // Verify positions are monotonic
@@ -357,12 +362,16 @@ mod tests {
         let window_positions = vec![(0, 1), (1, 2)];
 
         // Test calculate_cumulative_positions_with_tokenized function directly
-        let result = mapper.calculate_cumulative_positions_with_tokenized(text, &tokenized, &window_positions);
-        println!("====== Result: {:?}", result);
+        let result = mapper.calculate_cumulative_positions_with_tokenized(
+            text,
+            &tokenized,
+            &window_positions,
+        );
+        println!("====== Result: {result:?}");
         assert!(result.is_ok());
         let positions = result.unwrap();
         assert_eq!(positions.len(), 2);
-        
+
         // Verify first position starts at 0
         assert_eq!(positions[0].0, 0);
         // Verify positions are within text bounds
@@ -371,7 +380,7 @@ mod tests {
         assert!(positions[1].1 <= text_len);
     }
 
-    #[test] 
+    #[test]
     fn test_tokenization_error_handling() {
         let tokenizer = match create_test_tokenizer() {
             Some(t) => t,
@@ -386,7 +395,10 @@ mod tests {
         let tokenized = tokenizer.tokenize_with_instruction(text, None).unwrap();
 
         // Test with invalid token index (beyond bounds)
-        let result = mapper.calculate_char_position_for_token_index(&tokenized.token_ids, tokenized.token_ids.len() + 10);
+        let result = mapper.calculate_char_position_for_token_index(
+            &tokenized.token_ids,
+            tokenized.token_ids.len() + 10,
+        );
         assert!(result.is_ok()); // Should return text length, not error
 
         // Test calculate_char_positions with invalid range
@@ -414,47 +426,63 @@ mod tests {
         // Test complex Unicode: flag emoji
         let text = "🇯🇵";
         println!("=== Flag Emoji Test ===");
-        println!("Original text: '{}' (char count: {})", text, text.chars().count());
+        println!(
+            "Original text: '{}' (char count: {})",
+            text,
+            text.chars().count()
+        );
         println!("Bytes: {:?}", text.as_bytes());
         println!("Chars: {:?}", text.chars().collect::<Vec<_>>());
-        
+
         let tokenized = tokenizer.tokenize_with_instruction(text, None).unwrap();
         println!("Token count: {}", tokenized.token_ids.len());
         println!("Token IDs: {:?}", tokenized.token_ids);
-        
+
         // Test incremental decoding
         for i in 0..=tokenized.token_ids.len() {
             let result = mapper.calculate_char_position_for_token_index(&tokenized.token_ids, i);
             assert!(result.is_ok());
             let char_pos = result.unwrap();
-            
+
             if i < tokenized.token_ids.len() {
                 let decoded_slice = tokenizer.decode_tokens(&tokenized.token_ids[..i]).unwrap();
-                println!("Token[0..{}]: decoded='{}', char_count={}, calc_pos={}", 
-                         i, decoded_slice, decoded_slice.chars().count(), char_pos);
+                println!(
+                    "Token[0..{}]: decoded='{}', char_count={}, calc_pos={}",
+                    i,
+                    decoded_slice,
+                    decoded_slice.chars().count(),
+                    char_pos
+                );
             } else {
-                println!("Token[0..{}]: calc_pos={}", i, char_pos);
+                println!("Token[0..{i}]: calc_pos={char_pos}");
             }
         }
-        
+
         let result = mapper.calculate_char_position_for_token_index(&tokenized.token_ids, 0);
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), 0);
 
-        let result = mapper.calculate_char_position_for_token_index(&tokenized.token_ids, tokenized.token_ids.len());
+        let result = mapper.calculate_char_position_for_token_index(
+            &tokenized.token_ids,
+            tokenized.token_ids.len(),
+        );
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), text.chars().count()); // Should be 2 for flag emoji
 
         // Test mixed Unicode
         let text = "Hello😀こんにちは";
         println!("\n=== Mixed Unicode Test ===");
-        println!("Original text: '{}' (char count: {})", text, text.chars().count());
-        
+        println!(
+            "Original text: '{}' (char count: {})",
+            text,
+            text.chars().count()
+        );
+
         let result = mapper.calculate_char_positions(text, 0, 1);
         assert!(result.is_ok());
         let (start, end) = result.unwrap();
         assert_eq!(start, 0);
         assert!(end <= text.chars().count());
-        println!("First token span: [{}, {}) chars", start, end);
+        println!("First token span: [{start}, {end}) chars");
     }
 }

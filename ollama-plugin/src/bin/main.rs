@@ -20,7 +20,7 @@ async fn main() -> Result<()> {
     //     println!("Usage: {} <directory_path> [separator]", args[0]);
     //     std::process::exit(1);
     // }
-    let args = vec![
+    let args = [
         "summary".to_string(),
         "/Users/sutr/mnt/Documents/obsidian/日記/2024/11/".to_string(),
     ];
@@ -90,7 +90,7 @@ fn collect_markdown_files(dir: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
                 && path
                     .file_name()
                     .is_some_and(|f| !f.to_string_lossy().starts_with("._"))
-                && path.extension().map_or(false, |ext| ext == "md")
+                && path.extension().is_some_and(|ext| ext == "md")
             {
                 files.push(path);
             }
@@ -108,7 +108,7 @@ fn collect_and_combine_markdown_files(directory: &str, separator: &str) -> Resul
     let mut combined_content = String::new();
     for (i, path) in markdown_files.iter().enumerate() {
         let content =
-            fs::read_to_string(path).with_context(|| format!("Failed to read file: {:?}", path))?;
+            fs::read_to_string(path).with_context(|| format!("Failed to read file: {path:?}"))?;
 
         if i > 0 {
             combined_content.push_str(separator);

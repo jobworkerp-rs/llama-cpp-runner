@@ -55,6 +55,12 @@ pub struct OllamaPlugin {
 // static DATA: OnceCell<Bytes> = OnceCell::new();
 
 static INIT: std::sync::Once = std::sync::Once::new();
+impl Default for OllamaPlugin {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl OllamaPlugin {
     const URL_BASE: &'static str = "http://localhost:11434";
     pub fn new() -> Self {
@@ -99,7 +105,7 @@ impl OllamaPlugin {
             let pull = llama
                 .pull_model(settings.model.clone(), false)
                 .await
-                .map_err(|e| anyhow!("{}", e))?;
+                .map_err(|e| anyhow!("{e}"))?;
             tracing::debug!("model loaded: result = {:?}", pull);
         };
         self.ollama = Some(llama);
@@ -192,11 +198,8 @@ impl OllamaPlugin {
     pub fn request_chat_with_history(&mut self, args: OllamaArgs) -> Result<OllamaArgs> {
         if let Some(ollama) = self.ollama.as_mut() {
             let options = Self::create_options(&args);
-            let mut histories: Vec<chat::ChatMessage> = args
-                .histories
-                .iter()
-                .map(|c| Self::to_ollama_chat(c))
-                .collect();
+            let mut histories: Vec<chat::ChatMessage> =
+                args.histories.iter().map(Self::to_ollama_chat).collect();
             if !histories
                 .first()
                 .is_some_and(|m| m.role == chat::MessageRole::System)
@@ -217,7 +220,7 @@ impl OllamaPlugin {
             let res = tokio::runtime::Runtime::new()
                 .unwrap()
                 .block_on(ollama.send_chat_messages_with_history(&mut histories, request))
-                .map_err(|e| anyhow!("Generation error(chat_with_history): {}", e))?;
+                .map_err(|e| anyhow!("Generation error(chat_with_history): {e}"))?;
             tracing::debug!(
                 "END OF chat {}: created_at: {}",
                 OLLAMA_PROMPT,
@@ -225,7 +228,7 @@ impl OllamaPlugin {
             );
             let histories = histories
                 .into_iter()
-                .zip_longest(args.histories.into_iter())
+                .zip_longest(args.histories)
                 .flat_map(|pair| match pair {
                     itertools::EitherOrBoth::Both(m, h) => {
                         assert_eq!(m.content, h.content);
@@ -301,11 +304,8 @@ impl OllamaPlugin {
         if let Some(ollama) = self.ollama.as_mut() {
             let options = Self::create_options(&args);
             // history to messages (refreshed)
-            let mut messages: Vec<chat::ChatMessage> = args
-                .histories
-                .iter()
-                .map(|c| Self::to_ollama_chat(c))
-                .collect();
+            let mut messages: Vec<chat::ChatMessage> =
+                args.histories.iter().map(Self::to_ollama_chat).collect();
             if messages
                 .first()
                 .is_some_and(|m| m.role == chat::MessageRole::System)
@@ -344,7 +344,7 @@ impl OllamaPlugin {
                     .unwrap()
                     .block_on(ollama.send_chat_messages(request))
             }
-            .map_err(|e| anyhow!("Generation error(chat_with_history_refleshed): {}", e))?;
+            .map_err(|e| anyhow!("Generation error(chat_with_history_refleshed): {e}"))?;
             tracing::debug!(
                 "END OF chat {}: created_at: {}",
                 OLLAMA_PROMPT,
@@ -402,7 +402,7 @@ impl OllamaPlugin {
             let res: GenerationResponse = tokio::runtime::Runtime::new()
                 .unwrap()
                 .block_on(ollama.generate(request))
-                .map_err(|e| anyhow!("Generation error(generation): {}", e))?;
+                .map_err(|e| anyhow!("Generation error(generation): {e}"))?;
             tracing::debug!(
                 "END OF generation {}: duration: {}",
                 OLLAMA_PROMPT,
@@ -449,7 +449,7 @@ impl PluginRunner for OllamaPlugin {
     }
     fn load(&mut self, settings: Vec<u8>) -> Result<()> {
         let settings = OllamaRunnerSettings::decode(&mut Cursor::new(settings))
-            .map_err(|e| anyhow!("decode error: {}", e))?;
+            .map_err(|e| anyhow!("decode error: {e}"))?;
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async { self.load_model(settings).await })?;
         tracing::info!("{} loaded", OLLAMA_PROMPT);
@@ -462,7 +462,7 @@ impl PluginRunner for OllamaPlugin {
     ) -> (Result<Vec<u8>>, HashMap<String, String>) {
         let res = || -> Result<Vec<u8>> {
             let args = OllamaArgs::decode(&mut Cursor::new(arg))
-                .map_err(|e| anyhow!("decode error: {}", e))?;
+                .map_err(|e| anyhow!("decode error: {e}"))?;
             let res = if args.use_chat {
                 if args.refresh_history {
                     self.request_with_history_refreshed(args)
@@ -589,7 +589,6 @@ Good luck in the competition and in advancing AI research!
                 repeat_penalty: Some(0.9),
                 repeat_last_n: Some(8),
                 seed: Some(32),
-                ..Default::default()
             }),
             ..Default::default()
         };
@@ -600,7 +599,7 @@ Good luck in the competition and in advancing AI research!
             .0
             .expect("failed to run plugin");
         let res = OllamaArgs::decode(&mut Cursor::new(res.clone()))
-            .map_err(|e| anyhow!("decode error: {}", e))
+            .map_err(|e| anyhow!("decode error: {e}"))
             .unwrap();
         println!("response: {:?}", res.prompt);
         assert!(res.prompt.len() > 10 && res.prompt.len() < 4096);

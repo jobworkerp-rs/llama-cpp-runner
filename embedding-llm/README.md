@@ -28,7 +28,7 @@ embedding-llm/
 │   ├── embedding.rs        # メインのembedding生成器
 │   ├── llamacpp_bridge.rs  # llama.cppとの統合レイヤー
 │   ├── tokenization.rs     # 独立したトークナイザー処理
-│   ├── sliding_window.rs   # 長文処理用スライディングウィンドウ
+│   ├── text_processing.rs  # テキスト処理（スライディングウィンドウ等）
 │   └── error.rs            # エラー定義
 ├── protobuf/
 │   ├── llm_runner_settings.proto  # 初期化設定

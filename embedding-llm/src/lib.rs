@@ -1,7 +1,10 @@
+#![allow(improper_ctypes_definitions)]
+
+pub mod chunking_adapter;
 pub mod embedding;
 pub mod error;
 pub mod llamacpp_bridge;
-pub mod sliding_window;
+pub mod text_processing;
 pub mod token_position;
 pub mod tokenization;
 
@@ -119,10 +122,15 @@ impl PluginRunner for EmbeddingLlmRunnerPlugin {
                     .into_iter()
                     .map(|embedding_with_pos| {
                         // Extract content from original text using character positions
-                        let content = args.text
+                        let content = args
+                            .text
                             .chars()
                             .skip(embedding_with_pos.char_start_pos)
-                            .take(embedding_with_pos.char_end_pos - embedding_with_pos.char_start_pos)
+                            .take(
+                                embedding_with_pos
+                                    .char_end_pos
+                                    .saturating_sub(embedding_with_pos.char_start_pos),
+                            )
                             .collect::<String>();
 
                         protobuf::embedding_llm::embedding_llm_result::Embedding {

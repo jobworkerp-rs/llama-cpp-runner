@@ -13,6 +13,7 @@ use llama_cpp_2::{
     sampling::LlamaSampler,
     token::LlamaToken,
 };
+use llama_cpp_sys_2::{LLAMA_FLASH_ATTN_TYPE_DISABLED, LLAMA_FLASH_ATTN_TYPE_ENABLED};
 use serde::{Deserialize, Serialize};
 use std::{ffi::CString, num::NonZeroU32, path::PathBuf, time::Duration};
 
@@ -233,7 +234,11 @@ impl LlamaModelWrapper {
         let mut ctx_params = LlamaContextParams::default()
             .with_n_ctx(config.ctx_size)
             // .with_seed(config.seed.unwrap_or(1234))
-            .with_flash_attention(config.use_flash_attention.unwrap_or(true));
+            .with_flash_attention_policy(if config.use_flash_attention.unwrap_or(true) {
+                LLAMA_FLASH_ATTN_TYPE_ENABLED
+            } else {
+                LLAMA_FLASH_ATTN_TYPE_DISABLED
+            });
         if let Some(threads) = config.threads {
             ctx_params = ctx_params.with_n_threads(threads as i32);
         }
@@ -245,7 +250,7 @@ impl LlamaModelWrapper {
             model,
             backend,
             ctx_params,
-            system_prompt: config.system_prompt.unwrap_or_else(|| "".to_string()),
+            system_prompt: config.system_prompt.unwrap_or_default(),
         })
     }
 

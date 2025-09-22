@@ -7,6 +7,7 @@ use llama_cpp_2::{
     model::{params::LlamaModelParams, AddBos, LlamaModel},
     token::LlamaToken,
 };
+use llama_cpp_sys_2::{LLAMA_FLASH_ATTN_TYPE_AUTO, LLAMA_FLASH_ATTN_TYPE_DISABLED};
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use tracing::{debug, info};
@@ -33,7 +34,7 @@ fn get_system_memory_gb() -> Option<usize> {
     {
         use std::process::Command;
         Command::new("sysctl")
-            .args(&["-n", "hw.memsize"])
+            .args(["-n", "hw.memsize"])
             .output()
             .ok()
             .and_then(|output| {
@@ -95,7 +96,7 @@ impl LlamaCppModel {
 
         info!("Initializing llama.cpp backend");
         let mut backend = LlamaBackend::init()
-            .map_err(|e| EmbeddingLlmError::llamacpp(format!("Failed to init backend: {}", e)))?;
+            .map_err(|e| EmbeddingLlmError::llamacpp(format!("Failed to init backend: {e}")))?;
         backend.void_logs(); // Disable llama.cpp logs
 
         // Resolve model path (may download from HF if needed)
@@ -109,10 +110,8 @@ impl LlamaCppModel {
         };
 
         info!("Loading model from: {}", resolved_path.display());
-        let model =
-            LlamaModel::load_from_file(&backend, &resolved_path, &model_params).map_err(|e| {
-                EmbeddingLlmError::model_loading(format!("Failed to load model: {}", e))
-            })?;
+        let model = LlamaModel::load_from_file(&backend, &resolved_path, &model_params)
+            .map_err(|e| EmbeddingLlmError::model_loading(format!("Failed to load model: {e}")))?;
 
         // コンテキストパラメータの設定（パフォーマンス最適化）
         let ctx_size = NonZeroU32::new(max_seq_length as u32).ok_or_else(|| {
@@ -141,7 +140,11 @@ impl LlamaCppModel {
         let ctx_params = LlamaContextParams::default()
             .with_n_ctx(Some(ctx_size))
             .with_embeddings(true) // Enable embedding mode
-            .with_flash_attention(!use_cpu); // Flash attention only for GPU
+            .with_flash_attention_policy(if use_cpu {
+                LLAMA_FLASH_ATTN_TYPE_DISABLED
+            } else {
+                LLAMA_FLASH_ATTN_TYPE_AUTO
+            });
 
         // モデル情報の取得
         let n_embd = model.n_embd() as usize;
@@ -154,7 +157,7 @@ impl LlamaCppModel {
         info!("  vocab_size: {}", vocab_size);
         info!("  use_cpu: {}", use_cpu);
         let memory_info = if let Some(configured) = max_batch_size {
-            format!("configured: {}", configured)
+            format!("configured: {configured}")
         } else {
             format!(
                 "adaptive based on {}GB system memory",
@@ -199,7 +202,7 @@ impl LlamaCppModel {
         let mut ctx = self
             .model
             .new_context(&self.backend, self.ctx_params.clone())
-            .map_err(|e| EmbeddingLlmError::llamacpp(format!("Failed to create context: {}", e)))?;
+            .map_err(|e| EmbeddingLlmError::llamacpp(format!("Failed to create context: {e}")))?;
 
         // Convert u32 to LlamaToken（公式実装と同じ方式）
         let llama_tokens: Vec<LlamaToken> = token_ids
@@ -211,7 +214,7 @@ impl LlamaCppModel {
         let n_ctx = self.n_ctx;
         let mut batch = LlamaBatch::new(n_ctx, 1); // n_embd = 1 sequence
         batch.add_sequence(&llama_tokens, 0, false).map_err(|e| {
-            EmbeddingLlmError::inference(format!("Failed to add sequence to batch: {}", e))
+            EmbeddingLlmError::inference(format!("Failed to add sequence to batch: {e}"))
         })?;
 
         debug!("Added {} tokens to batch as sequence", llama_tokens.len());
@@ -221,7 +224,7 @@ impl LlamaCppModel {
 
         // 推論実行
         ctx.decode(&mut batch)
-            .map_err(|e| EmbeddingLlmError::inference(format!("Context decode failed: {}", e)))?;
+            .map_err(|e| EmbeddingLlmError::inference(format!("Context decode failed: {e}")))?;
 
         // embeddings の取得（公式実装と同じ方式: embeddings_seq_ithを使用）
         debug!("Getting sequence embeddings...");
@@ -230,8 +233,7 @@ impl LlamaCppModel {
             Ok(emb) => emb.to_vec(),
             Err(e) => {
                 return Err(EmbeddingLlmError::inference(format!(
-                    "Failed to get sequence embeddings: {:?}",
-                    e
+                    "Failed to get sequence embeddings: {e:?}"
                 )))
             }
         };
@@ -320,8 +322,7 @@ impl LlamaCppModel {
             }
             if tokens.is_empty() {
                 return Err(EmbeddingLlmError::inference(format!(
-                    "Empty token sequence at index {}",
-                    i
+                    "Empty token sequence at index {i}"
                 )));
             }
         }
@@ -330,7 +331,7 @@ impl LlamaCppModel {
         let mut ctx = self
             .model
             .new_context(&self.backend, self.ctx_params.clone())
-            .map_err(|e| EmbeddingLlmError::llamacpp(format!("Failed to create context: {}", e)))?;
+            .map_err(|e| EmbeddingLlmError::llamacpp(format!("Failed to create context: {e}")))?;
 
         // バッチの準備（複数シーケンス対応）
         let n_ctx = self.n_ctx;
@@ -355,8 +356,7 @@ impl LlamaCppModel {
                 .add_sequence(&llama_tokens, seq_id as i32, false)
                 .map_err(|e| {
                     EmbeddingLlmError::inference(format!(
-                        "Failed to add sequence {} to batch: {}",
-                        seq_id, e
+                        "Failed to add sequence {seq_id} to batch: {e}"
                     ))
                 })?;
         }
@@ -368,7 +368,7 @@ impl LlamaCppModel {
 
         // 推論実行
         ctx.decode(&mut batch)
-            .map_err(|e| EmbeddingLlmError::inference(format!("Batch decode failed: {}", e)))?;
+            .map_err(|e| EmbeddingLlmError::inference(format!("Batch decode failed: {e}")))?;
 
         // 各シーケンスのembeddingsを取得
         let mut embeddings = Vec::with_capacity(n_sequences);
@@ -378,8 +378,7 @@ impl LlamaCppModel {
                 Ok(emb) => emb.to_vec(),
                 Err(e) => {
                     return Err(EmbeddingLlmError::inference(format!(
-                        "Failed to get embeddings for sequence {}: {:?}",
-                        seq_id, e
+                        "Failed to get embeddings for sequence {seq_id}: {e:?}"
                     )))
                 }
             };
@@ -422,7 +421,7 @@ impl LlamaCppModel {
                     AddBos::Never
                 },
             )
-            .map_err(|e| EmbeddingLlmError::tokenization(format!("Failed to tokenize: {}", e)))?;
+            .map_err(|e| EmbeddingLlmError::tokenization(format!("Failed to tokenize: {e}")))?;
 
         Ok(tokens.into_iter().map(|t| t.0 as u32).collect())
     }
@@ -433,7 +432,7 @@ impl LlamaCppModel {
             tokens.iter().map(|&t| LlamaToken::new(t as i32)).collect();
         self.model
             .token_to_str(llama_tokens[0], llama_cpp_2::model::Special::Tokenize)
-            .map_err(|e| EmbeddingLlmError::tokenization(format!("Failed to detokenize: {}", e)))
+            .map_err(|e| EmbeddingLlmError::tokenization(format!("Failed to detokenize: {e}")))
     }
 
     /// embedding次元数を取得
@@ -481,8 +480,7 @@ pub mod helpers {
                 return Ok(());
             } else {
                 return Err(EmbeddingLlmError::configuration(format!(
-                    "File exists but is not a GGUF file: {}",
-                    model_path
+                    "File exists but is not a GGUF file: {model_path}"
                 )));
             }
         }
@@ -514,12 +512,12 @@ pub mod helpers {
                     .with_progress(true)
                     .build()
                     .map_err(|e| {
-                        EmbeddingLlmError::hf_hub(format!("Failed to create HF API: {}", e))
+                        EmbeddingLlmError::hf_hub(format!("Failed to create HF API: {e}"))
                     })?
                     .model(repo.to_string());
 
                 let downloaded_path = api.get(filename).map_err(|e| {
-                    EmbeddingLlmError::hf_hub(format!("Failed to download model: {}", e))
+                    EmbeddingLlmError::hf_hub(format!("Failed to download model: {e}"))
                 })?;
 
                 info!("Downloaded model to: {}", downloaded_path.display());
@@ -528,8 +526,7 @@ pub mod helpers {
         }
 
         Err(EmbeddingLlmError::configuration(format!(
-            "Cannot resolve model path: {}. Expected existing file or HuggingFace format 'repo/model.gguf'", 
-            model_path
+            "Cannot resolve model path: {model_path}. Expected existing file or HuggingFace format 'repo/model.gguf'"
         )))
     }
 
@@ -586,7 +583,7 @@ mod tests {
         if let Some(last_slash_pos) = model_path.rfind('/') {
             let repo = &model_path[..last_slash_pos];
             let filename = &model_path[last_slash_pos + 1..];
-            
+
             assert_eq!(filename, "phi-4-Q4_0.gguf");
             assert_eq!(repo, "microsoft/phi-4-gguf");
         } else {
@@ -611,7 +608,7 @@ mod tests {
     #[test]
     fn test_system_memory_detection() {
         let memory_gb = get_system_memory_gb();
-        println!("Detected system memory: {:?} GB", memory_gb);
+        println!("Detected system memory: {memory_gb:?} GB");
         // System should have at least 1GB of memory
         assert!(memory_gb.is_none() || memory_gb.unwrap() >= 1);
     }
