@@ -83,7 +83,7 @@ impl PluginRunner for LlamaCppPlugin {
     }
     fn load(&mut self, settings: Vec<u8>) -> Result<()> {
         let settings = LlamaRunnerSettings::decode(&mut Cursor::new(settings))
-            .map_err(|e| anyhow!("decode error: {}", e))?;
+            .map_err(|e| anyhow!("decode error: {e}"))?;
         tracing::debug!("LLMRunner load: {settings:?}",);
         self.load_model(settings.into())?;
         Ok(())
@@ -96,7 +96,7 @@ impl PluginRunner for LlamaCppPlugin {
         let res = || -> Result<Vec<u8>> {
             if let Some(llama_model) = self.llama_model.as_mut() {
                 let args = LlamaArg::decode(&mut Cursor::new(arg))
-                    .map_err(|e| anyhow!("decode error: {}", e))?;
+                    .map_err(|e| anyhow!("decode error: {e}"))?;
                 tracing::debug!("LLMRunner run: {args:?}",);
                 let text = llama_model
                     .run(args.clone().into())
@@ -218,7 +218,7 @@ Good luck in the competition and in advancing AI research!
             .0
             .expect("failed to run plugin");
         let res = LlamaArg::decode(&mut Cursor::new(res.clone()))
-            .map_err(|e| anyhow!("decode error: {}", e))
+            .map_err(|e| anyhow!("decode error: {e}"))
             .unwrap();
         println!("response: {:?}", res.prompt);
         assert!(res.prompt.len() > 10 && res.prompt.len() < 4096);

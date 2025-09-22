@@ -143,7 +143,7 @@ fn main() -> Result<()> {
                 let r = OllamaArgs::decode(v.as_slice());
                 match r {
                     Ok(r) => {
-                        stdout.write_all(format!("{:#?}", r).as_bytes()).unwrap();
+                        stdout.write_all(format!("{r:#?}").as_bytes()).unwrap();
                         stdout.flush().unwrap();
                         history = r.histories;
                     }
