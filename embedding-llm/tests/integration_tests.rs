@@ -1,6 +1,8 @@
 use embedding_llm::{
     embedding::LlamaCppEmbedder,
-    protobuf::embedding_llm::{DType, EmbeddingLlmRunnerSettings, HierarchicalChunkingConfig, ModelType},
+    protobuf::embedding_llm::{
+        DType, EmbeddingLlmRunnerSettings, HierarchicalChunkingConfig, ModelType,
+    },
 };
 
 /// 実際のGGUFモデルを使用した統合テスト
@@ -215,9 +217,7 @@ async fn run_embedding_test_with_config(
                 );
             }
             Err(e) => {
-                panic!(
-                    "✗ Failed to generate embedding for '{description}': {e}"
-                );
+                panic!("✗ Failed to generate embedding for '{description}': {e}");
             }
         }
     }
@@ -285,9 +285,7 @@ async fn run_embedding_test_with_config(
             .map(|(a, b)| a * b)
             .sum::<f32>();
 
-        println!(
-            "   - Cosine similarity between identical texts: {cosine_sim:.6}"
-        );
+        println!("   - Cosine similarity between identical texts: {cosine_sim:.6}");
         assert!(
             cosine_sim > 0.99,
             "Inconsistent embeddings for identical text"
@@ -314,9 +312,9 @@ fn get_test_model_configs() -> Vec<(&'static str, EmbeddingLlmRunnerSettings)> {
                 max_seq_length: 256, // 短くして高速化
                 model_type: ModelType::Gguf as i32,
                 model_files: vec!["Qwen3-Embedding-4B-Q4_K_M.gguf".to_string()],
-                tokenizer_model_id: None,    // GGUF内蔵tokenizerでシンプル化
-                hierarchical_chunking_config: None, // hierarchical chunkingなしで高速化
-                max_batch_size: Some(8),     // バッチ処理テスト用
+                tokenizer_model_id: None, // GGUF内蔵tokenizerでシンプル化
+                chunking_config: None,    // hierarchical chunkingなしで高速化
+                max_batch_size: Some(8),  // バッチ処理テスト用
             },
         ),
         // 2. Qwen3-Embedding（最新embedding専用モデル、GGUF内蔵tokenizer）
@@ -330,7 +328,7 @@ fn get_test_model_configs() -> Vec<(&'static str, EmbeddingLlmRunnerSettings)> {
                 model_type: ModelType::Gguf as i32,
                 model_files: vec!["Qwen3-Embedding-4B-Q4_K_M.gguf".to_string()],
                 tokenizer_model_id: None, // GGUF内蔵tokenizerを使用
-                hierarchical_chunking_config: Some(HierarchicalChunkingConfig {
+                chunking_config: Some(HierarchicalChunkingConfig {
                     max_chunk_tokens: 512,
                     min_chunk_tokens: 128,
                     enable_paragraph_merging: true,
@@ -352,8 +350,8 @@ fn get_test_model_configs() -> Vec<(&'static str, EmbeddingLlmRunnerSettings)> {
                 model_type: ModelType::Gguf as i32,
                 model_files: vec!["Qwen3-Embedding-4B-Q4_K_M.gguf".to_string()],
                 tokenizer_model_id: Some("Qwen/Qwen3-Embedding-4B".to_string()), // 元のembeddingモデルのtokenizer
-                hierarchical_chunking_config: None, // hierarchical chunking無効テスト
-                max_batch_size: Some(2),     // GPU用小さめバッチサイズ
+                chunking_config: None,   // hierarchical chunking無効テスト
+                max_batch_size: Some(2), // GPU用小さめバッチサイズ
             },
         ),
     ]
@@ -376,7 +374,7 @@ async fn integration_test_qwen3_embedding_quick() {
         model_type: ModelType::Gguf as i32,
         model_files: vec!["Qwen3-Embedding-4B-Q4_K_M.gguf".to_string()],
         tokenizer_model_id: None, // GGUF内蔵tokenizerのテスト
-        hierarchical_chunking_config: None,
+        chunking_config: None,
         max_batch_size: Some(4), // クイックテスト用バッチサイズ
     };
 
@@ -403,7 +401,7 @@ async fn integration_test_qwen3_embedding_gguf_tokenizer() {
         model_type: ModelType::Gguf as i32,
         model_files: vec!["Qwen3-Embedding-4B-Q4_K_M.gguf".to_string()],
         tokenizer_model_id: Some("Qwen/Qwen3-Embedding-4B".to_string()), // GGUF内蔵tokenizerをテスト
-        hierarchical_chunking_config: Some(HierarchicalChunkingConfig {
+        chunking_config: Some(HierarchicalChunkingConfig {
             max_chunk_tokens: 512,
             min_chunk_tokens: 64,
             enable_paragraph_merging: true,
@@ -440,7 +438,7 @@ async fn integration_test_error_handling() {
         model_type: ModelType::Gguf as i32,
         model_files: vec!["nonexistent.gguf".to_string()],
         tokenizer_model_id: None,
-        hierarchical_chunking_config: None,
+        chunking_config: None,
         max_batch_size: Some(4),
     };
 
@@ -458,7 +456,7 @@ async fn integration_test_error_handling() {
         model_type: ModelType::Gguf as i32,
         model_files: vec!["test.gguf".to_string()],
         tokenizer_model_id: Some("nonexistent/tokenizer".to_string()),
-        hierarchical_chunking_config: None,
+        chunking_config: None,
         max_batch_size: Some(4),
     };
 
@@ -515,9 +513,9 @@ async fn test_hierarchical_chunking_and_batch_consistency() {
         model_files: vec!["Qwen3-Embedding-4B-Q4_K_M.gguf".to_string()],
         tokenizer_model_id: None,
         dtype: Some(DType::F32 as i32),
-        hierarchical_chunking_config: Some(HierarchicalChunkingConfig {
-            max_chunk_tokens: 20,  // 分割を発生させやすい小さな値
-            min_chunk_tokens: 1,   // 小さなチャンクも保持
+        chunking_config: Some(HierarchicalChunkingConfig {
+            max_chunk_tokens: 20, // 分割を発生させやすい小さな値
+            min_chunk_tokens: 1,  // 小さなチャンクも保持
             enable_paragraph_merging: true,
             enable_sentence_splitting: true,
             enable_forced_splitting: true,
@@ -529,17 +527,23 @@ async fn test_hierarchical_chunking_and_batch_consistency() {
     let embedder = match LlamaCppEmbedder::new_from_settings(&base_settings) {
         Ok(e) => e,
         Err(e) => {
-            println!(
-                "⚠ Skipping hierarchical chunking test due to model loading failure: {e}"
-            );
+            println!("⚠ Skipping hierarchical chunking test due to model loading failure: {e}");
             return;
         }
     };
 
     // 各テストケースを処理
     for test_case in &test_cases {
-        println!("\n--- Testing {}: {} ---", test_case.name, test_case.description);
-        let display_text = test_case.text.chars().take(60).collect::<String>().replace('\n', "\\n");
+        println!(
+            "\n--- Testing {}: {} ---",
+            test_case.name, test_case.description
+        );
+        let display_text = test_case
+            .text
+            .chars()
+            .take(60)
+            .collect::<String>()
+            .replace('\n', "\\n");
         println!("Text: {}", display_text);
 
         // 1. バッチ処理でembedding生成（分割結果も取得）
@@ -564,31 +568,45 @@ async fn test_hierarchical_chunking_and_batch_consistency() {
 
         // 期待されるチャンク数の近似的な検証（厳密ではない、トークナイザーに依存）
         let chunk_count_reasonable = batch_results.len() >= (test_case.expected_chunk_count / 2)
-                                   && batch_results.len() <= (test_case.expected_chunk_count * 2);
+            && batch_results.len() <= (test_case.expected_chunk_count * 2);
         if !chunk_count_reasonable {
             println!(
                 "   ⚠ Warning: Expected ~{} chunks, got {} chunks for '{}'",
-                test_case.expected_chunk_count, batch_results.len(), test_case.name
+                test_case.expected_chunk_count,
+                batch_results.len(),
+                test_case.name
             );
         }
 
         // 各チャンクがトークン制限を守っているかを検証
         for (i, result) in batch_results.iter().enumerate() {
             let chunk_text = &test_case.text[result.char_start_pos..result.char_end_pos];
-            println!("     Chunk {}: pos={}-{}, text=\"{}\"",
-                     i, result.char_start_pos, result.char_end_pos,
-                     chunk_text.chars().take(30).collect::<String>().replace('\n', "\\n"));
+            println!(
+                "     Chunk {}: pos={}-{}, text=\"{}\"",
+                i,
+                result.char_start_pos,
+                result.char_end_pos,
+                chunk_text
+                    .chars()
+                    .take(30)
+                    .collect::<String>()
+                    .replace('\n', "\\n")
+            );
 
             // 文字位置が有効範囲内であることを確認
             assert!(
                 result.char_start_pos <= result.char_end_pos,
                 "Chunk {}: Invalid char positions {} > {}",
-                i, result.char_start_pos, result.char_end_pos
+                i,
+                result.char_start_pos,
+                result.char_end_pos
             );
             assert!(
                 result.char_end_pos <= test_case.text.len(),
                 "Chunk {}: End position {} exceeds text length {}",
-                i, result.char_end_pos, test_case.text.len()
+                i,
+                result.char_end_pos,
+                test_case.text.len()
             );
         }
 
@@ -601,7 +619,12 @@ async fn test_hierarchical_chunking_and_batch_consistency() {
                 false, // 正規化なし
                 None,  // mergeなし
             )
-            .unwrap_or_else(|_| panic!("Individual embedding generation failed for {}", test_case.name));
+            .unwrap_or_else(|_| {
+                panic!(
+                    "Individual embedding generation failed for {}",
+                    test_case.name
+                )
+            });
 
         // 3. バッチ vs 個別の一致性検証
         println!("3. Comparing batch vs individual results...");
@@ -609,30 +632,40 @@ async fn test_hierarchical_chunking_and_batch_consistency() {
             batch_results.len(),
             individual_results.len(),
             "Test case '{}': Batch ({}) and individual ({}) chunk counts should match",
-            test_case.name, batch_results.len(), individual_results.len()
+            test_case.name,
+            batch_results.len(),
+            individual_results.len()
         );
 
-        for (i, (batch_result, individual_result)) in batch_results.iter()
+        for (i, (batch_result, individual_result)) in batch_results
+            .iter()
             .zip(individual_results.iter())
             .enumerate()
         {
             // 位置情報の一致を確認
             assert_eq!(
                 batch_result.char_start_pos, individual_result.char_start_pos,
-                "Test case '{}', chunk {}: Start positions differ", test_case.name, i
+                "Test case '{}', chunk {}: Start positions differ",
+                test_case.name, i
             );
             assert_eq!(
                 batch_result.char_end_pos, individual_result.char_end_pos,
-                "Test case '{}', chunk {}: End positions differ", test_case.name, i
+                "Test case '{}', chunk {}: End positions differ",
+                test_case.name, i
             );
 
             // embedding値の一致を確認
             assert_eq!(
-                batch_result.values.len(), individual_result.values.len(),
-                "Test case '{}', chunk {}: Embedding dimensions differ", test_case.name, i
+                batch_result.values.len(),
+                individual_result.values.len(),
+                "Test case '{}', chunk {}: Embedding dimensions differ",
+                test_case.name,
+                i
             );
 
-            let max_diff = batch_result.values.iter()
+            let max_diff = batch_result
+                .values
+                .iter()
                 .zip(individual_result.values.iter())
                 .map(|(a, b)| (a - b).abs())
                 .fold(0.0f32, f32::max);
@@ -640,7 +673,9 @@ async fn test_hierarchical_chunking_and_batch_consistency() {
             assert!(
                 max_diff < 1e-5,
                 "Test case '{}', chunk {}: Embeddings differ beyond tolerance. Max diff: {:.2e}",
-                test_case.name, i, max_diff
+                test_case.name,
+                i,
+                max_diff
             );
         }
 

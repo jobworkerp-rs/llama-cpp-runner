@@ -6,9 +6,7 @@
 use crate::chunking_adapter::EmbeddingHierarchicalChunker;
 use crate::error::{EmbeddingLlmError, Result};
 use crate::tokenization::TokenizationProcessor;
-use command_utils::text::chunking::{
-    EmbeddingMerger, HierarchicalChunkingConfig, MergeStrategy,
-};
+use command_utils::text::chunking::{EmbeddingMerger, HierarchicalChunkingConfig, MergeStrategy};
 use std::sync::Arc;
 use tracing::{debug, info};
 
@@ -194,8 +192,8 @@ mod tests {
             vec![7.0, 8.0, 9.0],
         ];
 
-        let result = TextProcessor::merge_embeddings_static(&embeddings, MergeStrategy::Average)
-            .unwrap();
+        let result =
+            TextProcessor::merge_embeddings_static(&embeddings, MergeStrategy::Average).unwrap();
 
         assert_eq!(result.len(), 3);
         assert!((result[0] - 4.0).abs() < 1e-6);

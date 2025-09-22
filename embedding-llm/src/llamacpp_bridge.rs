@@ -7,9 +7,7 @@ use llama_cpp_2::{
     model::{params::LlamaModelParams, AddBos, LlamaModel},
     token::LlamaToken,
 };
-use llama_cpp_sys_2::{
-    LLAMA_FLASH_ATTN_TYPE_AUTO, LLAMA_FLASH_ATTN_TYPE_DISABLED,
-};
+use llama_cpp_sys_2::{LLAMA_FLASH_ATTN_TYPE_AUTO, LLAMA_FLASH_ATTN_TYPE_DISABLED};
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use tracing::{debug, info};
@@ -112,10 +110,8 @@ impl LlamaCppModel {
         };
 
         info!("Loading model from: {}", resolved_path.display());
-        let model =
-            LlamaModel::load_from_file(&backend, &resolved_path, &model_params).map_err(|e| {
-                EmbeddingLlmError::model_loading(format!("Failed to load model: {e}"))
-            })?;
+        let model = LlamaModel::load_from_file(&backend, &resolved_path, &model_params)
+            .map_err(|e| EmbeddingLlmError::model_loading(format!("Failed to load model: {e}")))?;
 
         // コンテキストパラメータの設定（パフォーマンス最適化）
         let ctx_size = NonZeroU32::new(max_seq_length as u32).ok_or_else(|| {

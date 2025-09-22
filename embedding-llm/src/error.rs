@@ -71,7 +71,7 @@ impl EmbeddingLlmError {
     }
 
     pub fn text_processing<S: Into<String>>(msg: S) -> Self {
-        Self::SlidingWindow(msg.into())  // Reuse SlidingWindow variant for text processing
+        Self::SlidingWindow(msg.into()) // Reuse SlidingWindow variant for text processing
     }
 
     pub fn configuration<S: Into<String>>(msg: S) -> Self {

@@ -198,11 +198,8 @@ impl OllamaPlugin {
     pub fn request_chat_with_history(&mut self, args: OllamaArgs) -> Result<OllamaArgs> {
         if let Some(ollama) = self.ollama.as_mut() {
             let options = Self::create_options(&args);
-            let mut histories: Vec<chat::ChatMessage> = args
-                .histories
-                .iter()
-                .map(Self::to_ollama_chat)
-                .collect();
+            let mut histories: Vec<chat::ChatMessage> =
+                args.histories.iter().map(Self::to_ollama_chat).collect();
             if !histories
                 .first()
                 .is_some_and(|m| m.role == chat::MessageRole::System)
@@ -307,11 +304,8 @@ impl OllamaPlugin {
         if let Some(ollama) = self.ollama.as_mut() {
             let options = Self::create_options(&args);
             // history to messages (refreshed)
-            let mut messages: Vec<chat::ChatMessage> = args
-                .histories
-                .iter()
-                .map(Self::to_ollama_chat)
-                .collect();
+            let mut messages: Vec<chat::ChatMessage> =
+                args.histories.iter().map(Self::to_ollama_chat).collect();
             if messages
                 .first()
                 .is_some_and(|m| m.role == chat::MessageRole::System)

@@ -64,9 +64,7 @@ impl TokenizationProcessor {
 
         // Tokenizerファイルから初期化
         let tokenizer = tokenizers::Tokenizer::from_file(tokenizer_file).map_err(|e| {
-            EmbeddingLlmError::tokenizers(format!(
-                "Failed to load tokenizer from {model_id}: {e}"
-            ))
+            EmbeddingLlmError::tokenizers(format!("Failed to load tokenizer from {model_id}: {e}"))
         })?;
 
         // 特殊トークンIDの取得
@@ -142,27 +140,28 @@ impl TokenizationProcessor {
             };
 
             // 長さ制限の適用
-            let (final_tokens, final_mask, final_char_positions, truncated) = if token_ids.len() > self.max_seq_length {
-                warn!(
-                    "Token sequence truncated from {} to {}",
-                    token_ids.len(),
-                    self.max_seq_length
-                );
-                (
-                    token_ids[..self.max_seq_length].to_vec(),
-                    attention_mask[..self.max_seq_length].to_vec(),
-                    char_positions.map(|positions| {
-                        if positions.len() >= self.max_seq_length {
-                            positions[..self.max_seq_length].to_vec()
-                        } else {
-                            positions
-                        }
-                    }),
-                    true,
-                )
-            } else {
-                (token_ids, attention_mask, char_positions, false)
-            };
+            let (final_tokens, final_mask, final_char_positions, truncated) =
+                if token_ids.len() > self.max_seq_length {
+                    warn!(
+                        "Token sequence truncated from {} to {}",
+                        token_ids.len(),
+                        self.max_seq_length
+                    );
+                    (
+                        token_ids[..self.max_seq_length].to_vec(),
+                        attention_mask[..self.max_seq_length].to_vec(),
+                        char_positions.map(|positions| {
+                            if positions.len() >= self.max_seq_length {
+                                positions[..self.max_seq_length].to_vec()
+                            } else {
+                                positions
+                            }
+                        }),
+                        true,
+                    )
+                } else {
+                    (token_ids, attention_mask, char_positions, false)
+                };
 
             debug!(
                 "Tokenized to {} tokens using HuggingFace tokenizer",

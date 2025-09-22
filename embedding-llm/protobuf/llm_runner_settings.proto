@@ -39,7 +39,7 @@ message EmbeddingLlmRunnerSettings {
   optional string tokenizer_model_id = 7;
   
   // Optional: hierarchical chunking configuration
-  optional HierarchicalChunkingConfig hierarchical_chunking_config = 8;
+  optional HierarchicalChunkingConfig chunking_config = 8;
   
   // Maximum batch size for batch processing (default: adaptive based on memory)
   // Used for hierarchical chunking batch processing optimization

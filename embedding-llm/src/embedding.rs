@@ -152,32 +152,29 @@ impl LlamaCppEmbedder {
         );
 
         // Text Processorの初期化
-        let text_chunking_config =
-            if let Some(config) = settings.hierarchical_chunking_config.as_ref() {
-                // HierarchicalChunkingConfigが指定されている場合
-                let hierarchical_config = HierarchicalChunkingConfig {
-                    max_chunk_tokens: config.max_chunk_tokens as usize,
-                    min_chunk_tokens: config.min_chunk_tokens as usize,
-                    enable_paragraph_merging: config.enable_paragraph_merging,
-                    enable_sentence_splitting: config.enable_sentence_splitting,
-                    enable_forced_splitting: config.enable_forced_splitting,
-                    preserve_paragraph_boundaries: config.preserve_paragraph_boundaries,
-                    max_char_length_fallback: Some(config.max_chunk_tokens as usize * 4), // Default heuristic
-                };
-
-                TextChunkingConfig {
-                    max_seq_length: settings.max_seq_length as usize,
-                    hierarchical_config,
-                }
-            } else {
-                // 設定が未指定の場合は、max_seq_lengthベースのデフォルト設定を使用
-                TextChunkingConfig::for_embedding(settings.max_seq_length as usize)
+        let text_chunking_config = if let Some(config) = settings.chunking_config.as_ref() {
+            // HierarchicalChunkingConfigが指定されている場合
+            let hierarchical_config = HierarchicalChunkingConfig {
+                max_chunk_tokens: config.max_chunk_tokens as usize,
+                min_chunk_tokens: config.min_chunk_tokens as usize,
+                enable_paragraph_merging: config.enable_paragraph_merging,
+                enable_sentence_splitting: config.enable_sentence_splitting,
+                enable_forced_splitting: config.enable_forced_splitting,
+                preserve_paragraph_boundaries: config.preserve_paragraph_boundaries,
+                max_char_length_fallback: Some(config.max_chunk_tokens as usize * 4), // Default heuristic
             };
 
-        let text_processor = TextProcessor::new(
-            tokenization_processor.clone(),
-            text_chunking_config,
-        );
+            TextChunkingConfig {
+                max_seq_length: settings.max_seq_length as usize,
+                hierarchical_config,
+            }
+        } else {
+            // 設定が未指定の場合は、max_seq_lengthベースのデフォルト設定を使用
+            TextChunkingConfig::for_embedding(settings.max_seq_length as usize)
+        };
+
+        let text_processor =
+            TextProcessor::new(tokenization_processor.clone(), text_chunking_config);
 
         Ok(Self {
             model: model_arc,
@@ -204,9 +201,7 @@ impl LlamaCppEmbedder {
         let windows = self
             .text_processor
             .process_text_for_embedding(text, instruction)
-            .map_err(|e| {
-                EmbeddingLlmError::tokenization(format!("Text processing failed: {e}"))
-            })?;
+            .map_err(|e| EmbeddingLlmError::tokenization(format!("Text processing failed: {e}")))?;
 
         info!(
             "Processing {} windows for embedding generation",
@@ -223,7 +218,9 @@ impl LlamaCppEmbedder {
         // まずすべてのウィンドウテキストをトークン化
         let mut tokenized_windows = Vec::new();
         for window in &windows {
-            let tokenized = self.tokenization_processor.tokenize_with_instruction(&window.text, None)?;
+            let tokenized = self
+                .tokenization_processor
+                .tokenize_with_instruction(&window.text, None)?;
             tokenized_windows.push(tokenized.token_ids);
         }
 

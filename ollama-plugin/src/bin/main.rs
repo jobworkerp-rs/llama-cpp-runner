@@ -20,8 +20,10 @@ async fn main() -> Result<()> {
     //     println!("Usage: {} <directory_path> [separator]", args[0]);
     //     std::process::exit(1);
     // }
-    let args = ["summary".to_string(),
-        "/Users/sutr/mnt/Documents/obsidian/日記/2024/11/".to_string()];
+    let args = [
+        "summary".to_string(),
+        "/Users/sutr/mnt/Documents/obsidian/日記/2024/11/".to_string(),
+    ];
 
     let directory = &args[1];
     let separator = args.get(2).map(|s| s.as_str()).unwrap_or("\n---\n");

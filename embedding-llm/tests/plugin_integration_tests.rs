@@ -1,6 +1,7 @@
 use embedding_llm::{
     protobuf::embedding_llm::{
-        DType, EmbeddingArgs, EmbeddingLlmResult, EmbeddingLlmRunnerSettings, HierarchicalChunkingConfig, ModelType,
+        DType, EmbeddingArgs, EmbeddingLlmResult, EmbeddingLlmRunnerSettings,
+        HierarchicalChunkingConfig, ModelType,
     },
     EmbeddingLlmRunnerPlugin,
 };
@@ -38,9 +39,9 @@ async fn test_plugin_full_lifecycle_with_embedding_generation() {
         model_files: vec!["Qwen3-Embedding-4B-Q4_K_M.gguf".to_string()],
         tokenizer_model_id: Some("Qwen/Qwen3-Embedding-4B".to_string()),
         dtype: Some(DType::Bf16 as i32),
-        hierarchical_chunking_config: Some(HierarchicalChunkingConfig {
-            max_chunk_tokens: 64,  // Small chunks to force hierarchical chunking
-            min_chunk_tokens: 8,   // Very small minimum size
+        chunking_config: Some(HierarchicalChunkingConfig {
+            max_chunk_tokens: 64, // Small chunks to force hierarchical chunking
+            min_chunk_tokens: 0,  // no minimum size
             enable_paragraph_merging: true,
             enable_sentence_splitting: true,
             enable_forced_splitting: true,
@@ -182,7 +183,9 @@ async fn test_plugin_full_lifecycle_with_embedding_generation() {
                         i,
                         embedding.begin_position,
                         embedding.end_position,
-                        embedding.end_position.saturating_sub(embedding.begin_position)
+                        embedding
+                            .end_position
+                            .saturating_sub(embedding.begin_position)
                     );
 
                     // First embedding should start at position 0
@@ -344,7 +347,7 @@ async fn test_plugin_error_handling() {
         model_files: vec!["test.gguf".to_string()],
         tokenizer_model_id: None,
         dtype: Some(DType::F32 as i32),
-        hierarchical_chunking_config: None,
+        chunking_config: None,
         max_batch_size: Some(4),
     };
 
@@ -367,7 +370,7 @@ async fn test_plugin_error_handling() {
         model_files: vec![], // Empty model files
         tokenizer_model_id: None,
         dtype: Some(DType::F32 as i32),
-        hierarchical_chunking_config: None,
+        chunking_config: None,
         max_batch_size: Some(4),
     };
 

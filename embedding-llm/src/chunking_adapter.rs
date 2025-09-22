@@ -43,14 +43,21 @@ impl TokenProvider for TokenizationAdapter {
         Ok(text.len().div_ceil(4))
     }
 
-    fn get_token_spans(&self, text: &str) -> std::result::Result<Option<Vec<(usize, usize)>>, Self::Error> {
+    fn get_token_spans(
+        &self,
+        text: &str,
+    ) -> std::result::Result<Option<Vec<(usize, usize)>>, Self::Error> {
         let tokenized = self
             .tokenization_processor
             .tokenize_with_instruction(text, None)?;
         Ok(tokenized.char_positions)
     }
 
-    fn token_to_char(&self, text: &str, token_pos: usize) -> std::result::Result<Option<usize>, Self::Error> {
+    fn token_to_char(
+        &self,
+        text: &str,
+        token_pos: usize,
+    ) -> std::result::Result<Option<usize>, Self::Error> {
         let tokenized = self
             .tokenization_processor
             .tokenize_with_instruction(text, None)?;
@@ -62,7 +69,11 @@ impl TokenProvider for TokenizationAdapter {
         }
     }
 
-    fn char_to_token(&self, text: &str, char_pos: usize) -> std::result::Result<Option<usize>, Self::Error> {
+    fn char_to_token(
+        &self,
+        text: &str,
+        char_pos: usize,
+    ) -> std::result::Result<Option<usize>, Self::Error> {
         let tokenized = self
             .tokenization_processor
             .tokenize_with_instruction(text, None)?;
@@ -99,9 +110,7 @@ impl EmbeddingHierarchicalChunker {
         let adapter = TokenizationAdapter::new(tokenization_processor.clone());
 
         let chunker = HierarchicalChunker::new(config, adapter, None).map_err(|e| {
-            EmbeddingLlmError::sliding_window(format!(
-                "Failed to create hierarchical chunker: {e}"
-            ))
+            EmbeddingLlmError::sliding_window(format!("Failed to create hierarchical chunker: {e}"))
         })?;
 
         Ok(Self {
@@ -118,9 +127,7 @@ impl EmbeddingHierarchicalChunker {
         let adapter = TokenizationAdapter::new(tokenization_processor.clone());
 
         let chunker = HierarchicalChunker::new(config, adapter, None).map_err(|e| {
-            EmbeddingLlmError::sliding_window(format!(
-                "Failed to create hierarchical chunker: {e}"
-            ))
+            EmbeddingLlmError::sliding_window(format!("Failed to create hierarchical chunker: {e}"))
         })?;
 
         Ok(Self {

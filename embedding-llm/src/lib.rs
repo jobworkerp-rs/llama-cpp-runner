@@ -127,7 +127,9 @@ impl PluginRunner for EmbeddingLlmRunnerPlugin {
                             .chars()
                             .skip(embedding_with_pos.char_start_pos)
                             .take(
-                                embedding_with_pos.char_end_pos.saturating_sub(embedding_with_pos.char_start_pos),
+                                embedding_with_pos
+                                    .char_end_pos
+                                    .saturating_sub(embedding_with_pos.char_start_pos),
                             )
                             .collect::<String>();
 
