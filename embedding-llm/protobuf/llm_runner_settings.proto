@@ -2,16 +2,6 @@ syntax = "proto3";
 
 package embedding_llm;
 
-enum ModelType {
-  GGUF = 0;         // llama.cppメイン対応（デフォルト）
-}
-
-enum DType {
-  F32 = 0;  // 32-bit float (default for CPU)
-  F16 = 1;  // 16-bit float (default for GPU)
-  BF16 = 2; // 16-bit brain float (may have issues with CUDA)
-}
-
 message EmbeddingLlmRunnerSettings {
   // HuggingFace model ID or local model path
   string model_id = 1;
@@ -44,6 +34,16 @@ message EmbeddingLlmRunnerSettings {
   // Maximum batch size for batch processing (default: adaptive based on memory)
   // Used for hierarchical chunking batch processing optimization
   optional uint32 max_batch_size = 9;
+}
+
+enum ModelType {
+  GGUF = 0;         // llama.cppメイン対応（デフォルト）
+}
+
+enum DType {
+  F32 = 0;  // 32-bit float (default for CPU)
+  F16 = 1;  // 16-bit float (default for GPU)
+  BF16 = 2; // 16-bit brain float (may have issues with CUDA)
 }
 
 message HierarchicalChunkingConfig {

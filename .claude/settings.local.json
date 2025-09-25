@@ -9,7 +9,8 @@
       "Bash(cargo test:*)",
       "Bash(cargo clippy:*)",
       "Bash(RUST_LOG=debug cargo test -p embedding-llm test_plugin_full_lifecycle_with_embedding_generation --release -- --test-threads=1 --nocapture)",
-      "Bash(RUST_LOG=debug cargo test -p embedding-llm test_plugin_full_lifecycle_with_embedding_generation -- --test-threads=1 --nocapture)"
+      "Bash(RUST_LOG=debug cargo test -p embedding-llm test_plugin_full_lifecycle_with_embedding_generation -- --test-threads=1 --nocapture)",
+      "Bash(cargo clean:*)"
     ],
     "deny": [],
     "ask": []
