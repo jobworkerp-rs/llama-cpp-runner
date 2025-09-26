@@ -23,7 +23,7 @@ jobs:
     outputs:
       release-tag: ${{ steps.tag.outputs.tag }}
     container:
-      image: gitea.sutr.app/servers/rust-gpu-build:20250701
+      image: gitea.sutr.app/servers/rust-gpu-build:20250926
       options: --gpus all
       env:
         CARGO_HOME: /usr/local/cargo

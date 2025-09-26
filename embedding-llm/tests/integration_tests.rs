@@ -20,7 +20,7 @@ use embedding_llm::{
 async fn integration_test_real_embedding() {
     // ログ初期化
     let _ = tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::INFO)
+        .with_max_level(tracing::Level::DEBUG)
         .with_test_writer()
         .try_init();
 
@@ -107,6 +107,18 @@ async fn run_embedding_test_with_config(
             None,
             "Very long text (sliding window test)",
         ),
+        (
+            "Special characters !@#$%^&*()_+-=[]{}|;':\",.<>/?`~",
+            None,
+            "Text with special characters",
+        ),
+        (
+            "プライベートワーク\n- 点数:  / 10\n- コメント:\n\t- 良かった点:\n\t- 改善したい点:\n(あれば)\n- 大
+切にしたいと感じたこととなぜそれが自分にとって大切か",
+            Some("Embed this mixed content:"),
+            "Diary template",
+        ),
+
     ];
 
     println!("\n4. Running embedding generation tests...");
@@ -300,6 +312,98 @@ async fn run_embedding_test_with_config(
 
 /// テスト用モデル設定を取得
 /// 複数の設定でrobustnessを検証
+#[tokio::test]
+async fn test_diary_template_chunking_no_empty_tokens() {
+    // Initialize logging for debugging
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .with_test_writer()
+        .try_init();
+
+    // This is the problematic text from integration test that causes "n_tokens == 0" error
+    let problematic_text = "プライベートワーク\n- 点数:  / 10\n- コメント:\n\t- 良かった点:\n\t- 改善したい点:\n(あれば)\n- 大切にしたいと感じたこととなぜそれが自分にとって大切か";
+    let instruction = Some("Embed this mixed content:");
+
+    println!("Testing problematic text: {:?}", problematic_text);
+    println!("Text length: {} chars", problematic_text.len());
+    println!("Instruction: {:?}", instruction);
+
+    // Use the HF tokenizer configuration to ensure we have a real tokenizer
+    let settings = get_test_model_configs()
+        .into_iter()
+        .find(|(name, _)| name.contains("HF-Tokenizer"))
+        .map(|(_, settings)| settings)
+        .expect("HF Tokenizer config should be available");
+
+    println!("Using model: {}", settings.model_id);
+    println!("Using tokenizer: {:?}", settings.tokenizer_model_id);
+
+    // Create the text processor directly to test chunking
+    use embedding_llm::tokenization::TokenizationProcessor;
+    use embedding_llm::chunking_adapter::EmbeddingHierarchicalChunker;
+    use command_utils::text::chunking::HierarchicalChunkingConfig;
+    use std::sync::Arc;
+
+    let tokenization_processor = Arc::new(
+        if let Some(tokenizer_id) = &settings.tokenizer_model_id {
+            TokenizationProcessor::new_from_model_id(tokenizer_id, 128)
+                .expect("Should be able to create tokenization processor")
+        } else {
+            panic!("No tokenizer specified in test settings")
+        }
+    );
+
+    // Create chunker and test the problematic text
+    let config = HierarchicalChunkingConfig::for_embedding(128);
+    let mut chunker = EmbeddingHierarchicalChunker::with_config(tokenization_processor, config)
+        .expect("Should be able to create chunker");
+
+    println!("\nTesting chunking with instruction...");
+    let full_text_with_instruction = if let Some(inst) = instruction {
+        format!("{}\n{}", inst, problematic_text)
+    } else {
+        problematic_text.to_string()
+    };
+
+    println!("Full text to chunk: {:?}", full_text_with_instruction);
+    println!("Full text length: {} chars", full_text_with_instruction.len());
+
+    // Perform the chunking that should generate the problematic empty token_ids
+    let chunks_result = chunker.chunk_for_embedding(&full_text_with_instruction);
+
+    match chunks_result {
+        Ok(chunks) => {
+            println!("✓ Chunking succeeded, got {} chunks", chunks.len());
+
+            // Check each chunk for empty token_ids - this is where the problem should be visible
+            for (i, chunk) in chunks.iter().enumerate() {
+                println!("Chunk {}: content_len={}, token_count={}",
+                        i, chunk.content.len(), chunk.token_ids.len());
+                println!("  Content: {:?}", chunk.content);
+                println!("  Token IDs: {:?}", chunk.token_ids);
+
+                // This assertion should fail if empty token_ids are generated
+                assert!(
+                    !chunk.token_ids.is_empty(),
+                    "Chunk {} has empty token_ids! Content: {:?}",
+                    i, chunk.content
+                );
+
+                assert!(
+                    !chunk.content.is_empty(),
+                    "Chunk {} has empty content! This should not happen",
+                    i
+                );
+            }
+
+            println!("✓ All {} chunks have non-empty token_ids", chunks.len());
+        }
+        Err(e) => {
+            panic!("✗ Chunking failed: {}", e);
+        }
+    }
+}
+
 fn get_test_model_configs() -> Vec<(&'static str, EmbeddingLlmRunnerSettings)> {
     vec![
         // 1. Qwen3-Embeddingのみ（動作確認済み）
@@ -330,7 +434,7 @@ fn get_test_model_configs() -> Vec<(&'static str, EmbeddingLlmRunnerSettings)> {
                 tokenizer_model_id: None, // GGUF内蔵tokenizerを使用
                 chunking_config: Some(HierarchicalChunkingConfig {
                     max_chunk_tokens: 512,
-                    min_chunk_tokens: 128,
+                    min_chunk_tokens: 1,
                     enable_paragraph_merging: true,
                     enable_sentence_splitting: true,
                     enable_forced_splitting: true,
@@ -402,7 +506,7 @@ async fn integration_test_qwen3_embedding_gguf_tokenizer() {
         tokenizer_model_id: Some("Qwen/Qwen3-Embedding-4B".to_string()), // GGUF内蔵tokenizerをテスト
         chunking_config: Some(HierarchicalChunkingConfig {
             max_chunk_tokens: 512,
-            min_chunk_tokens: 64,
+            min_chunk_tokens: 1,
             enable_paragraph_merging: true,
             enable_sentence_splitting: true,
             enable_forced_splitting: true,
@@ -577,7 +681,11 @@ async fn test_hierarchical_chunking_and_batch_consistency() {
 
         // 各チャンクがトークン制限を守っているかを検証
         for (i, result) in batch_results.iter().enumerate() {
-            let chunk_text = &test_case.text[result.char_start_pos..result.char_end_pos];
+            let chunk_text: String = test_case.text
+                .chars()
+                .skip(result.char_start_pos)
+                .take(result.char_end_pos - result.char_start_pos)
+                .collect();
             println!(
                 "     Chunk {}: pos={}-{}, text=\"{}\"",
                 i,
@@ -599,11 +707,11 @@ async fn test_hierarchical_chunking_and_batch_consistency() {
                 result.char_end_pos
             );
             assert!(
-                result.char_end_pos <= test_case.text.len(),
-                "Chunk {}: End position {} exceeds text length {}",
+                result.char_end_pos <= test_case.text.chars().count(),
+                "Chunk {}: End position {} exceeds text character count {}",
                 i,
                 result.char_end_pos,
-                test_case.text.len()
+                test_case.text.chars().count()
             );
         }
 

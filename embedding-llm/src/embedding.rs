@@ -213,36 +213,42 @@ impl LlamaCppEmbedder {
         }
 
         // バッチ処理でembeddingを効率的に生成
-        // まずすべてのウィンドウテキストをトークン化
-        let mut tokenized_windows = Vec::new();
-        for window in &windows {
-            let tokenized = self
-                .tokenization_processor
-                .tokenize_with_instruction(&window.text, None)?;
-            tokenized_windows.push(tokenized.token_ids);
-        }
-
-        let token_sequences: Vec<&[u32]> = tokenized_windows.iter().map(|w| w.as_slice()).collect();
-
+        // 既存のトークン化済みデータを直接使用
         let mut model = self.model.lock().map_err(|_| {
             EmbeddingLlmError::inference("Failed to acquire model lock".to_string())
         })?;
 
-        let mut all_embeddings = if token_sequences.len() > 1 {
-            debug!(
-                "Using batch processing for {} windows",
-                token_sequences.len()
-            );
+        // TODO: Re-enable batch processing once llama-cpp-rs issue is fixed
+        // Issue: https://github.com/utilityai/llama-cpp-rs/pull/802
+        // Problem: Batch processing fails with "n_tokens == 0" error for multi-line text
+        // Root cause: Batch initialization issue with complex text containing newlines/tabs
+        // Current workaround: Use individual processing for each window
+        /*
+        let mut all_embeddings = if windows.len() > 1 {
+            debug!("Using batch processing for {} windows", windows.len());
+            let token_sequences: Vec<&[u32]> = windows.iter().map(|w| w.token_ids.as_slice()).collect();
+            debug!("tokens: {:?}", token_sequences);
             model.generate_batch_embeddings(&token_sequences)?
-        } else if token_sequences.len() == 1 {
+        } else if windows.len() == 1 {
             debug!("Using single embedding generation for 1 window");
-            let embedding = model.generate_embedding(&tokenized_windows[0])?;
+            let embedding = model.generate_embedding(&windows[0].token_ids)?;
             vec![embedding]
         } else {
             // windows.is_empty()のチェックでカバーされるはずだが、念のため
-            warn!("No tokenized windows available for embedding generation");
+            warn!("No windows available for embedding generation");
             return Ok(vec![]);
         };
+        */
+
+        // Workaround: Process each window individually to avoid batch processing issues
+        let mut all_embeddings = Vec::with_capacity(windows.len());
+        debug!("Processing {} windows individually (batch processing disabled)", windows.len());
+
+        for (i, window) in windows.iter().enumerate() {
+            debug!("Processing window {} with {} tokens", i, window.token_ids.len());
+            let embedding = model.generate_embedding(&window.token_ids)?;
+            all_embeddings.push(embedding);
+        }
 
         // L2正規化（オプション）
         if normalize {

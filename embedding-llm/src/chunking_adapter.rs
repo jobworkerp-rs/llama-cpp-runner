@@ -319,6 +319,9 @@ impl ChunkQualityMetrics {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tokenization::TokenizationProcessor;
+    use command_utils::text::chunking::HierarchicalChunkingConfig;
+    use std::sync::Arc;
 
     #[test]
     fn test_chunk_type_mapping() {
@@ -378,4 +381,5 @@ mod tests {
         assert!(forced_metrics.semantic_coherence < 0.5);
         assert!(forced_metrics.overall_quality() < metrics.overall_quality());
     }
+
 }

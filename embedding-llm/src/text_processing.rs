@@ -88,6 +88,7 @@ impl TextProcessor {
                 TextWindow {
                     text: full_text,
                     original_text: chunk.content,
+                    token_ids: chunk.token_ids,
                     char_start_pos: chunk.char_start,
                     char_end_pos: chunk.char_end,
                     window_index: idx,
@@ -124,6 +125,8 @@ pub struct TextWindow {
     pub text: String,
     /// Original text content without instruction
     pub original_text: String,
+    /// Token IDs for the original text (without instruction)
+    pub token_ids: Vec<u32>,
     /// Character start position in original input text
     pub char_start_pos: usize,
     /// Character end position in original input text
@@ -172,6 +175,7 @@ mod tests {
         let window = TextWindow {
             text: "Instruction\nContent".to_string(),
             original_text: "Content".to_string(),
+            token_ids: vec![1, 2, 3, 4],
             char_start_pos: 10,
             char_end_pos: 17,
             window_index: 0,
@@ -182,6 +186,7 @@ mod tests {
         assert_eq!(window.char_length(), 7);
         assert!(window.is_high_quality());
         assert_eq!(window.chunk_description(), "Complete paragraph");
+        assert_eq!(window.token_ids.len(), 4);
     }
 
     #[test]
