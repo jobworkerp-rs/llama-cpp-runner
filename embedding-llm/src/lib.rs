@@ -18,6 +18,8 @@ use prost::Message;
 use std::collections::HashMap;
 
 use crate::embedding::LlamaCppEmbedder;
+use llama_cpp_2::llama_backend::LlamaBackend;
+use std::sync::{Arc, Mutex};
 
 /// Generated protobuf modules
 pub mod protobuf {
@@ -28,6 +30,7 @@ pub mod protobuf {
 
 /// Main plugin structure for embedding-llm
 pub struct EmbeddingLlmRunnerPlugin {
+    backend: Arc<Mutex<LlamaBackend>>,
     embedder: Option<LlamaCppEmbedder>,
 }
 
@@ -35,7 +38,15 @@ impl EmbeddingLlmRunnerPlugin {
     pub const RUNNER_NAME: &'static str = "EmbeddingLlmRunner";
 
     pub fn new() -> Result<Self> {
-        Ok(Self { embedder: None })
+        tracing::info!("Initializing llama.cpp backend for embedding plugin");
+        let mut backend =
+            LlamaBackend::init().map_err(|e| anyhow!("Failed to init llama.cpp backend: {e}"))?;
+        backend.void_logs(); // Disable llama.cpp logs
+
+        Ok(Self {
+            backend: Arc::new(Mutex::new(backend)),
+            embedder: None,
+        })
     }
 }
 
@@ -70,8 +81,9 @@ impl PluginRunner for EmbeddingLlmRunnerPlugin {
             return Err(anyhow!("GGUF model files must be specified"));
         }
 
-        // llama.cpp embedderの初期化
-        let embedder = LlamaCppEmbedder::new_from_settings(&settings)?;
+        // llama.cpp embedderの初期化（バックエンドを渡す）
+        let embedder =
+            LlamaCppEmbedder::new_from_settings_with_backend(&settings, self.backend.clone())?;
 
         self.embedder = Some(embedder);
 

@@ -34,52 +34,70 @@ pub struct EmbeddingWithPosition {
 }
 
 impl LlamaCppEmbedder {
-    /// 設定からEmbedderを初期化
-    pub fn new_from_settings(settings: &EmbeddingLlmRunnerSettings) -> Result<Self> {
+    /// 設定とバックエンドからEmbedderを初期化（推奨方式）
+    pub fn new_from_settings_with_backend(
+        settings: &EmbeddingLlmRunnerSettings,
+        backend: Arc<Mutex<llama_cpp_2::llama_backend::LlamaBackend>>,
+    ) -> Result<Self> {
         // モデルファイルパスの構築
-        let model_path = if settings.model_files.is_empty() {
-            return Err(EmbeddingLlmError::configuration(
-                "No model files specified for llama.cpp".to_string(),
-            ));
-        } else {
-            // XXX 複数ファイルの場合は最初のファイルを使用（llama.cppは単一ファイル）
-            // (本当は複数ファイルのこともあるがEmbedding用の場合に分割されるほど大きなモデルは無い想定)
-            if settings.model_files.len() > 1 {
-                error!(
-                    "Multiple model files specified, using first file: {}",
-                    settings.model_files[0]
-                );
-            }
-
-            let model_dir = PathBuf::from(&settings.model_id);
-            if model_dir.is_absolute() {
-                // Absolute local file path - use model_files[0] as is
-                PathBuf::from(&settings.model_files[0])
-                    .to_string_lossy()
-                    .to_string()
-            } else {
-                // HuggingFace format: model_id/model_files[0] → "repo/gguf_file.gguf"
-                // This supports llama.cpp's HuggingFace model format requirement
-                // Example: model_id="Qwen/Qwen3-Embedding-4B-GGUF", model_files=["Qwen3-Embedding-4B-Q4_K_M.gguf"]
-                //          Results in: "Qwen/Qwen3-Embedding-4B-GGUF/Qwen3-Embedding-4B-Q4_K_M.gguf"
-                model_dir
-                    .join(&settings.model_files[0])
-                    .to_string_lossy()
-                    .to_string()
-            }
-        };
+        let model_path = Self::build_model_path(settings)?;
 
         info!("Loading llama.cpp model from: {}", model_path);
 
-        // llama.cppモデルの初期化
-        let model = LlamaCppModel::new(
+        // バックエンドを受け取ってモデルを初期化
+        let model = LlamaCppModel::new_with_backend(
             &model_path,
             settings.use_cpu,
             settings.max_seq_length as usize,
             settings.max_batch_size,
-        )
-        .map_err(|e| EmbeddingLlmError::model_loading(format!("Failed to load model: {e}")))?;
+            backend,
+        )?;
 
+        Self::build_embedder_common(settings, model)
+    }
+
+    /// モデルパスの構築（共通処理）
+    fn build_model_path(settings: &EmbeddingLlmRunnerSettings) -> Result<String> {
+        if settings.model_files.is_empty() {
+            return Err(EmbeddingLlmError::configuration(
+                "No model files specified for llama.cpp".to_string(),
+            ));
+        }
+
+        // XXX 複数ファイルの場合は最初のファイルを使用（llama.cppは単一ファイル）
+        // (本当は複数ファイルのこともあるがEmbedding用の場合に分割されるほど大きなモデルは無い想定)
+        if settings.model_files.len() > 1 {
+            error!(
+                "Multiple model files specified, using first file: {}",
+                settings.model_files[0]
+            );
+        }
+
+        let model_dir = PathBuf::from(&settings.model_id);
+        let model_path = if model_dir.is_absolute() {
+            // Absolute local file path - use model_files[0] as is
+            PathBuf::from(&settings.model_files[0])
+                .to_string_lossy()
+                .to_string()
+        } else {
+            // HuggingFace format: model_id/model_files[0] → "repo/gguf_file.gguf"
+            // This supports llama.cpp's HuggingFace model format requirement
+            // Example: model_id="Qwen/Qwen3-Embedding-4B-GGUF", model_files=["Qwen3-Embedding-4B-Q4_K_M.gguf"]
+            //          Results in: "Qwen/Qwen3-Embedding-4B-GGUF/Qwen3-Embedding-4B-Q4_K_M.gguf"
+            model_dir
+                .join(&settings.model_files[0])
+                .to_string_lossy()
+                .to_string()
+        };
+
+        Ok(model_path)
+    }
+
+    /// Embedderの共通構築処理
+    fn build_embedder_common(
+        settings: &EmbeddingLlmRunnerSettings,
+        model: LlamaCppModel,
+    ) -> Result<Self> {
         // dtypeのデフォルト値設定
         let dtype_enum = settings
             .dtype
@@ -104,7 +122,7 @@ impl LlamaCppEmbedder {
         let vocab_size = model.vocabulary_size();
 
         let model_info = ModelInfo {
-            model_path: model_path.clone(),
+            model_path: model.model_path().to_string(),
             embedding_dimension,
             max_context_length,
             vocab_size,
@@ -242,10 +260,17 @@ impl LlamaCppEmbedder {
 
         // Workaround: Process each window individually to avoid batch processing issues
         let mut all_embeddings = Vec::with_capacity(windows.len());
-        debug!("Processing {} windows individually (batch processing disabled)", windows.len());
+        debug!(
+            "Processing {} windows individually (batch processing disabled)",
+            windows.len()
+        );
 
         for (i, window) in windows.iter().enumerate() {
-            debug!("Processing window {} with {} tokens", i, window.token_ids.len());
+            debug!(
+                "Processing window {} with {} tokens",
+                i,
+                window.token_ids.len()
+            );
             let embedding = model.generate_embedding(&window.token_ids)?;
             all_embeddings.push(embedding);
         }
@@ -568,5 +593,44 @@ mod tests {
         let result_single = single_embedding.clone();
         assert_eq!(result_single.len(), 1);
         assert_eq!(result_single[0], vec![1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn test_new_from_settings_with_backend_integration() {
+        use crate::protobuf::embedding_llm::{DType, EmbeddingLlmRunnerSettings, ModelType};
+        use llama_cpp_2::llama_backend::LlamaBackend;
+        use std::sync::{Arc, Mutex};
+
+        // Test the new backend sharing approach
+        let backend_result = LlamaBackend::init();
+        if backend_result.is_err() {
+            println!("Skipping backend integration test - llama.cpp not available");
+            return;
+        }
+
+        let mut backend = backend_result.unwrap();
+        backend.void_logs();
+        let shared_backend = Arc::new(Mutex::new(backend));
+
+        let settings = EmbeddingLlmRunnerSettings {
+            model_id: "test_model".to_string(),
+            use_cpu: true,
+            dtype: Some(DType::F32 as i32),
+            max_seq_length: 128,
+            model_type: ModelType::Gguf as i32,
+            model_files: vec!["nonexistent.gguf".to_string()],
+            tokenizer_model_id: None,
+            chunking_config: None,
+            max_batch_size: Some(4),
+        };
+
+        // Test new constructor with backend (should fail due to nonexistent model file)
+        let result = LlamaCppEmbedder::new_from_settings_with_backend(&settings, shared_backend);
+        assert!(
+            result.is_err(),
+            "Should fail with invalid model file, but backend sharing should work"
+        );
+
+        println!("✓ Backend sharing integration test completed successfully");
     }
 }

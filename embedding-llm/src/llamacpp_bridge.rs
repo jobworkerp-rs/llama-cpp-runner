@@ -10,6 +10,7 @@ use llama_cpp_2::{
 use llama_cpp_sys_2::{LLAMA_FLASH_ATTN_TYPE_AUTO, LLAMA_FLASH_ATTN_TYPE_DISABLED};
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use tracing::{debug, info};
 
 /// システムメモリ容量をGB単位で取得
@@ -72,7 +73,7 @@ fn get_system_memory_gb() -> Option<usize> {
 
 /// llama.cppモデルのラッパー（プロダクション実装）
 pub struct LlamaCppModel {
-    backend: LlamaBackend,
+    backend: Arc<Mutex<LlamaBackend>>,
     model: LlamaModel,
     ctx_params: LlamaContextParams,
     model_path: String,
@@ -84,20 +85,18 @@ pub struct LlamaCppModel {
 }
 
 impl LlamaCppModel {
-    /// GGUFモデルの初期化（プロダクション実装）
-    pub fn new(
+    /// 既存バックエンドを使用したGGUFモデルの初期化（推奨方式）
+    pub fn new_with_backend(
         model_path: &str,
         use_cpu: bool,
         max_seq_length: usize,
         max_batch_size: Option<u32>,
+        backend: Arc<Mutex<LlamaBackend>>,
     ) -> Result<Self> {
         // Model file validation
         self::helpers::validate_model_file(model_path)?;
 
-        info!("Initializing llama.cpp backend");
-        let mut backend = LlamaBackend::init()
-            .map_err(|e| EmbeddingLlmError::llamacpp(format!("Failed to init backend: {e}")))?;
-        backend.void_logs(); // Disable llama.cpp logs
+        info!("Using provided llama.cpp backend");
 
         // Resolve model path (may download from HF if needed)
         let resolved_path = self::helpers::resolve_model_path(model_path)?;
@@ -110,9 +109,34 @@ impl LlamaCppModel {
         };
 
         info!("Loading model from: {}", resolved_path.display());
-        let model = LlamaModel::load_from_file(&backend, &resolved_path, &model_params)
-            .map_err(|e| EmbeddingLlmError::model_loading(format!("Failed to load model: {e}")))?;
+        let model = {
+            let backend_guard = backend.lock().map_err(|_| {
+                EmbeddingLlmError::llamacpp("Failed to acquire backend lock".to_string())
+            })?;
+            LlamaModel::load_from_file(&backend_guard, &resolved_path, &model_params).map_err(
+                |e| EmbeddingLlmError::model_loading(format!("Failed to load model: {e}")),
+            )?
+        };
 
+        Self::build_model_common(
+            model_path,
+            use_cpu,
+            max_seq_length,
+            max_batch_size,
+            backend,
+            model,
+        )
+    }
+
+    /// LlamaCppModelの共通構築処理
+    fn build_model_common(
+        model_path: &str,
+        use_cpu: bool,
+        max_seq_length: usize,
+        max_batch_size: Option<u32>,
+        backend: Arc<Mutex<LlamaBackend>>,
+        model: LlamaModel,
+    ) -> Result<Self> {
         // コンテキストパラメータの設定（パフォーマンス最適化）
         let ctx_size = NonZeroU32::new(max_seq_length as u32).ok_or_else(|| {
             EmbeddingLlmError::configuration("max_seq_length must be > 0".to_string())
@@ -151,7 +175,7 @@ impl LlamaCppModel {
         let vocab_size = model.n_vocab() as usize;
 
         info!("llama.cpp model loaded:");
-        info!("  model_path: {}", resolved_path.display());
+        info!("  model_path: {}", model_path);
         info!("  embedding_dim: {}", n_embd);
         info!("  context_size: {}", max_seq_length);
         info!("  vocab_size: {}", vocab_size);
@@ -199,10 +223,16 @@ impl LlamaCppModel {
         }
 
         // コンテキストを作成
-        let mut ctx = self
-            .model
-            .new_context(&self.backend, self.ctx_params.clone())
-            .map_err(|e| EmbeddingLlmError::llamacpp(format!("Failed to create context: {e}")))?;
+        let mut ctx = {
+            let backend_guard = self.backend.lock().map_err(|_| {
+                EmbeddingLlmError::llamacpp("Failed to acquire backend lock".to_string())
+            })?;
+            self.model
+                .new_context(&backend_guard, self.ctx_params.clone())
+                .map_err(|e| {
+                    EmbeddingLlmError::llamacpp(format!("Failed to create context: {e}"))
+                })?
+        };
 
         // Convert u32 to LlamaToken（公式実装と同じ方式）
         let llama_tokens: Vec<LlamaToken> = token_ids
@@ -328,10 +358,16 @@ impl LlamaCppModel {
         }
 
         // コンテキストを作成
-        let mut ctx = self
-            .model
-            .new_context(&self.backend, self.ctx_params.clone())
-            .map_err(|e| EmbeddingLlmError::llamacpp(format!("Failed to create context: {e}")))?;
+        let mut ctx = {
+            let backend_guard = self.backend.lock().map_err(|_| {
+                EmbeddingLlmError::llamacpp("Failed to acquire backend lock".to_string())
+            })?;
+            self.model
+                .new_context(&backend_guard, self.ctx_params.clone())
+                .map_err(|e| {
+                    EmbeddingLlmError::llamacpp(format!("Failed to create context: {e}"))
+                })?
+        };
 
         // バッチの準備（複数シーケンス対応）
         let n_ctx = self.n_ctx;
@@ -595,13 +631,6 @@ mod tests {
     fn test_estimate_gpu_memory() {
         // This test requires a valid GGUF file to exist
         let result = helpers::estimate_gpu_memory("/nonexistent/path.gguf");
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_model_creation_without_real_model() {
-        // This will fail due to missing model file, which is expected
-        let result = LlamaCppModel::new("/tmp/test.gguf", true, 512, Some(32));
         assert!(result.is_err());
     }
 

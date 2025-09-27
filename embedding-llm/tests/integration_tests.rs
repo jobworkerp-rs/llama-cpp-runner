@@ -50,9 +50,24 @@ async fn run_embedding_test_with_config(
     println!("Use CPU: {}", settings.use_cpu);
     println!("Max seq length: {}", settings.max_seq_length);
 
-    // Embedderの初期化
-    println!("\n1. Loading model...");
-    let embedder = match LlamaCppEmbedder::new_from_settings(settings) {
+    // バックエンドの初期化（プラグインごと方式）
+    println!("\n1. Initializing backend...");
+    let backend_result = llama_cpp_2::llama_backend::LlamaBackend::init();
+    if backend_result.is_err() {
+        println!(
+            "⚠ Failed to initialize backend: {:?}. Skipping test.",
+            backend_result.err()
+        );
+        return Ok(());
+    }
+    let mut backend = backend_result.unwrap();
+    backend.void_logs();
+    let shared_backend = std::sync::Arc::new(std::sync::Mutex::new(backend));
+
+    // Embedderの初期化（新方式）
+    println!("\n2. Loading model with shared backend...");
+    let embedder = match LlamaCppEmbedder::new_from_settings_with_backend(settings, shared_backend)
+    {
         Ok(embedder) => {
             println!("✓ Model loaded successfully");
             embedder
@@ -63,7 +78,7 @@ async fn run_embedding_test_with_config(
     };
 
     // ヘルスチェック
-    println!("\n2. Performing health check...");
+    println!("\n3. Performing health check...");
     if let Err(e) = embedder.health_check() {
         panic!("✗ Health check failed: {e}");
     }
@@ -71,7 +86,7 @@ async fn run_embedding_test_with_config(
 
     // モデル情報の表示
     let model_info = embedder.model_info();
-    println!("\n3. Model Information:");
+    println!("\n4. Model Information:");
     println!("   Path: {}", model_info.model_path);
     println!("   Embedding dimension: {}", model_info.embedding_dimension);
     println!("   Max context length: {}", model_info.max_context_length);
@@ -121,7 +136,7 @@ async fn run_embedding_test_with_config(
 
     ];
 
-    println!("\n4. Running embedding generation tests...");
+    println!("\n5. Running embedding generation tests...");
     for (i, (text, instruction, description)) in test_cases.iter().enumerate() {
         println!("   Test {}: {}", i + 1, description);
 
@@ -339,19 +354,18 @@ async fn test_diary_template_chunking_no_empty_tokens() {
     println!("Using tokenizer: {:?}", settings.tokenizer_model_id);
 
     // Create the text processor directly to test chunking
-    use embedding_llm::tokenization::TokenizationProcessor;
-    use embedding_llm::chunking_adapter::EmbeddingHierarchicalChunker;
     use command_utils::text::chunking::HierarchicalChunkingConfig;
+    use embedding_llm::chunking_adapter::EmbeddingHierarchicalChunker;
+    use embedding_llm::tokenization::TokenizationProcessor;
     use std::sync::Arc;
 
-    let tokenization_processor = Arc::new(
-        if let Some(tokenizer_id) = &settings.tokenizer_model_id {
+    let tokenization_processor =
+        Arc::new(if let Some(tokenizer_id) = &settings.tokenizer_model_id {
             TokenizationProcessor::new_from_model_id(tokenizer_id, 128)
                 .expect("Should be able to create tokenization processor")
         } else {
             panic!("No tokenizer specified in test settings")
-        }
-    );
+        });
 
     // Create chunker and test the problematic text
     let config = HierarchicalChunkingConfig::for_embedding(128);
@@ -366,7 +380,10 @@ async fn test_diary_template_chunking_no_empty_tokens() {
     };
 
     println!("Full text to chunk: {:?}", full_text_with_instruction);
-    println!("Full text length: {} chars", full_text_with_instruction.len());
+    println!(
+        "Full text length: {} chars",
+        full_text_with_instruction.len()
+    );
 
     // Perform the chunking that should generate the problematic empty token_ids
     let chunks_result = chunker.chunk_for_embedding(&full_text_with_instruction);
@@ -377,8 +394,12 @@ async fn test_diary_template_chunking_no_empty_tokens() {
 
             // Check each chunk for empty token_ids - this is where the problem should be visible
             for (i, chunk) in chunks.iter().enumerate() {
-                println!("Chunk {}: content_len={}, token_count={}",
-                        i, chunk.content.len(), chunk.token_ids.len());
+                println!(
+                    "Chunk {}: content_len={}, token_count={}",
+                    i,
+                    chunk.content.len(),
+                    chunk.token_ids.len()
+                );
                 println!("  Content: {:?}", chunk.content);
                 println!("  Token IDs: {:?}", chunk.token_ids);
 
@@ -386,7 +407,8 @@ async fn test_diary_template_chunking_no_empty_tokens() {
                 assert!(
                     !chunk.token_ids.is_empty(),
                     "Chunk {} has empty token_ids! Content: {:?}",
-                    i, chunk.content
+                    i,
+                    chunk.content
                 );
 
                 assert!(
@@ -544,8 +566,19 @@ async fn integration_test_error_handling() {
         max_batch_size: Some(4),
     };
 
+    // バックエンドの初期化
+    let backend_result = llama_cpp_2::llama_backend::LlamaBackend::init();
+    if backend_result.is_err() {
+        println!("⚠ Skipping error handling test - backend initialization failed");
+        return;
+    }
+    let mut backend = backend_result.unwrap();
+    backend.void_logs();
+    let shared_backend = std::sync::Arc::new(std::sync::Mutex::new(backend));
+
     println!("1. Testing invalid model path...");
-    let result = LlamaCppEmbedder::new_from_settings(&invalid_settings);
+    let result =
+        LlamaCppEmbedder::new_from_settings_with_backend(&invalid_settings, shared_backend.clone());
     assert!(result.is_err(), "Should fail with invalid model path");
     println!("   ✓ Correctly handled invalid model path");
 
@@ -563,7 +596,10 @@ async fn integration_test_error_handling() {
     };
 
     println!("2. Testing invalid tokenizer...");
-    let result = LlamaCppEmbedder::new_from_settings(&invalid_tokenizer_settings);
+    let result = LlamaCppEmbedder::new_from_settings_with_backend(
+        &invalid_tokenizer_settings,
+        shared_backend,
+    );
     assert!(result.is_err(), "Should fail with invalid tokenizer");
     println!("   ✓ Correctly handled invalid tokenizer");
 
@@ -625,13 +661,24 @@ async fn test_hierarchical_chunking_and_batch_consistency() {
         max_batch_size: Some(1), // 個別処理用
     };
 
-    let embedder = match LlamaCppEmbedder::new_from_settings(&base_settings) {
-        Ok(e) => e,
-        Err(e) => {
-            println!("⚠ Skipping hierarchical chunking test due to model loading failure: {e}");
-            return;
-        }
-    };
+    // バックエンドの初期化
+    let backend_result = llama_cpp_2::llama_backend::LlamaBackend::init();
+    if backend_result.is_err() {
+        println!("⚠ Skipping hierarchical chunking test - backend initialization failed");
+        return;
+    }
+    let mut backend = backend_result.unwrap();
+    backend.void_logs();
+    let shared_backend = std::sync::Arc::new(std::sync::Mutex::new(backend));
+
+    let embedder =
+        match LlamaCppEmbedder::new_from_settings_with_backend(&base_settings, shared_backend) {
+            Ok(e) => e,
+            Err(e) => {
+                println!("⚠ Skipping hierarchical chunking test due to model loading failure: {e}");
+                return;
+            }
+        };
 
     // 各テストケースを処理
     for test_case in &test_cases {
@@ -662,7 +709,7 @@ async fn test_hierarchical_chunking_and_batch_consistency() {
 
         // 分割内容の検証
         assert!(
-            batch_results.len() > 0,
+            !batch_results.is_empty(),
             "Test case '{}': No chunks generated (expected at least 1)",
             test_case.name
         );
@@ -681,7 +728,8 @@ async fn test_hierarchical_chunking_and_batch_consistency() {
 
         // 各チャンクがトークン制限を守っているかを検証
         for (i, result) in batch_results.iter().enumerate() {
-            let chunk_text: String = test_case.text
+            let chunk_text: String = test_case
+                .text
                 .chars()
                 .skip(result.char_start_pos)
                 .take(result.char_end_pos - result.char_start_pos)
