@@ -19,7 +19,7 @@ use std::collections::HashMap;
 
 use crate::embedding::LlamaCppEmbedder;
 use llama_cpp_2::llama_backend::LlamaBackend;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// Generated protobuf modules
 pub mod protobuf {
@@ -27,6 +27,9 @@ pub mod protobuf {
         include!(concat!(env!("OUT_DIR"), "/embedding_llm.rs"));
     }
 }
+
+/// グローバルバックエンドのシングルトン
+static GLOBAL_BACKEND: OnceLock<Arc<Mutex<LlamaBackend>>> = OnceLock::new();
 
 /// Main plugin structure for embedding-llm
 pub struct EmbeddingLlmRunnerPlugin {
@@ -38,13 +41,19 @@ impl EmbeddingLlmRunnerPlugin {
     pub const RUNNER_NAME: &'static str = "EmbeddingLlmRunner";
 
     pub fn new() -> Result<Self> {
-        tracing::info!("Initializing llama.cpp backend for embedding plugin");
-        let mut backend =
-            LlamaBackend::init().map_err(|e| anyhow!("Failed to init llama.cpp backend: {e}"))?;
-        backend.void_logs(); // Disable llama.cpp logs
+        // グローバルバックエンドを取得または初期化
+        let backend = GLOBAL_BACKEND
+            .get_or_init(|| {
+                tracing::info!("Initializing global llama.cpp backend for embedding plugin");
+                let mut backend = LlamaBackend::init().expect("Failed to init llama.cpp backend");
+                backend.void_logs(); // Disable llama.cpp logs
+                Arc::new(Mutex::new(backend))
+            })
+            .clone();
 
+        tracing::info!("Using shared llama.cpp backend for embedding plugin");
         Ok(Self {
-            backend: Arc::new(Mutex::new(backend)),
+            backend,
             embedder: None,
         })
     }
@@ -254,5 +263,38 @@ mod tests {
         assert!(result_proto.is_some());
         let result_proto = result_proto.unwrap();
         assert!(result_proto.contains("EmbeddingLlmResult"));
+    }
+
+    #[test]
+    fn test_multiple_plugin_creation() {
+        // Test that multiple plugin instances can be created without BackendAlreadyInitialized error
+        let plugin1 = EmbeddingLlmRunnerPlugin::new().unwrap();
+        let plugin2 = EmbeddingLlmRunnerPlugin::new().unwrap();
+        let plugin3 = EmbeddingLlmRunnerPlugin::new().unwrap();
+
+        assert_eq!(plugin1.name(), "EmbeddingLlmRunner");
+        assert_eq!(plugin2.name(), "EmbeddingLlmRunner");
+        assert_eq!(plugin3.name(), "EmbeddingLlmRunner");
+
+        println!("✓ Successfully created multiple plugin instances sharing the same backend");
+    }
+
+    #[test]
+    fn test_load_plugin_multiple_times() {
+        // Test that load_plugin() can be called multiple times without errors
+        let plugin1 = load_plugin();
+        let plugin2 = load_plugin();
+        let plugin3 = load_plugin();
+
+        assert_eq!(plugin1.name(), "EmbeddingLlmRunner");
+        assert_eq!(plugin2.name(), "EmbeddingLlmRunner");
+        assert_eq!(plugin3.name(), "EmbeddingLlmRunner");
+
+        // Clean up
+        free_plugin(plugin1);
+        free_plugin(plugin2);
+        free_plugin(plugin3);
+
+        println!("✓ Successfully loaded and freed multiple plugin instances via C API");
     }
 }
