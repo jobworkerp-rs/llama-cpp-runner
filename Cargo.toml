@@ -2,7 +2,6 @@
 
 members = [
     "modules/jobworkerp-client",
-    "modules/jobworkerp-util",
     "modules/command-utils",
     "llama-protobuf",
     "llama-cpp-plugin",

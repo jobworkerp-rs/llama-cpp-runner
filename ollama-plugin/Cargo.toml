@@ -15,7 +15,6 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 jobworkerp-client = { path = "../modules/jobworkerp-client" }
-jobworkerp-util = { path = "../modules/jobworkerp-util" }
 jobworkerp-llama-protobuf = { path = "../llama-protobuf" }
 
 anyhow = { workspace = true }

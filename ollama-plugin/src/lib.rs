@@ -5,7 +5,6 @@ use jobworkerp_client::{schema_to_json_string, schema_to_json_string_option};
 use jobworkerp_llama_protobuf::protobuf::llama_cpp::{LlamaArg, LlamaRunnerSettings};
 use jobworkerp_llama_protobuf::protobuf::ollama::ollama_args::{self, MessageRole};
 use jobworkerp_llama_protobuf::protobuf::ollama::{OllamaArgs, OllamaRunnerSettings};
-use jobworkerp_util::runner::OLLAMA_PROMPT;
 use ollama_rs::generation::chat;
 use ollama_rs::generation::chat::request::ChatMessageRequest;
 use ollama_rs::{
@@ -20,6 +19,8 @@ use prost::Message;
 use std::collections::HashMap;
 use std::io::Cursor;
 use std::vec;
+
+pub const OLLAMA_PROMPT: &str = "OllamaPromptRunner";
 
 // suppress warn improper_ctypes_definitions
 #[allow(improper_ctypes_definitions)]
