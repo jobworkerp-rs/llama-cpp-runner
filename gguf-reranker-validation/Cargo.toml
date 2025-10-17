@@ -1,0 +1,15 @@
+[package]
+name = "gguf-reranker-validation"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description.workspace = true
+license.workspace = true
+
+[features]
+default = []
+cuda = ["llama-cpp-2/cuda"]
+
+[dependencies]
+anyhow = { workspace = true }
+llama-cpp-2 = { workspace = true }

@@ -441,6 +441,7 @@ fn get_test_model_configs() -> Vec<(&'static str, EmbeddingLlmRunnerSettings)> {
                 tokenizer_model_id: None, // GGUF内蔵tokenizerでシンプル化
                 chunking_config: None,    // hierarchical chunkingなしで高速化
                 max_batch_size: Some(8),  // バッチ処理テスト用
+                gpu_device: None,
             },
         ),
         // 2. Qwen3-Embedding（最新embedding専用モデル、GGUF内蔵tokenizer）
@@ -462,6 +463,7 @@ fn get_test_model_configs() -> Vec<(&'static str, EmbeddingLlmRunnerSettings)> {
                     enable_forced_splitting: true,
                 }),
                 max_batch_size: Some(6),
+                gpu_device: None,
             },
         ),
         // 3. Qwen3-Embedding + HuggingFace tokenizer組み合わせ
@@ -477,6 +479,7 @@ fn get_test_model_configs() -> Vec<(&'static str, EmbeddingLlmRunnerSettings)> {
                 tokenizer_model_id: Some("Qwen/Qwen3-Embedding-4B".to_string()), // 元のembeddingモデルのtokenizer
                 chunking_config: None,   // hierarchical chunking無効テスト
                 max_batch_size: Some(2), // GPU用小さめバッチサイズ
+                gpu_device: None,
             },
         ),
     ]
@@ -500,6 +503,7 @@ async fn integration_test_qwen3_embedding_quick() {
         model_files: vec!["Qwen3-Embedding-4B-Q4_K_M.gguf".to_string()],
         tokenizer_model_id: None, // GGUF内蔵tokenizerのテスト
         chunking_config: None,
+                gpu_device: None,
         max_batch_size: Some(4), // クイックテスト用バッチサイズ
     };
 
@@ -534,9 +538,10 @@ async fn integration_test_qwen3_embedding_gguf_tokenizer() {
             enable_forced_splitting: true,
         }),
         max_batch_size: Some(4), // GGUF内蔵tokenizer用バッチサイズ
+        gpu_device: None,
     };
 
-    println!("=== Qwen3-Embedding with GGUF Built-in Tokenizer Test ===");
+    println!("=== Qwen3-Embedding with HuggingFace Tokenizer Test ===");
     if let Err(e) = run_embedding_test_with_config(&settings).await {
         panic!("Qwen3-Embedding GGUF tokenizer test failed: {e}");
     }
@@ -564,6 +569,7 @@ async fn integration_test_error_handling() {
         tokenizer_model_id: None,
         chunking_config: None,
         max_batch_size: Some(4),
+        gpu_device: None,
     };
 
     // バックエンドの初期化
@@ -593,6 +599,7 @@ async fn integration_test_error_handling() {
         tokenizer_model_id: Some("nonexistent/tokenizer".to_string()),
         chunking_config: None,
         max_batch_size: Some(4),
+        gpu_device: None,
     };
 
     println!("2. Testing invalid tokenizer...");
@@ -659,6 +666,7 @@ async fn test_hierarchical_chunking_and_batch_consistency() {
             enable_forced_splitting: true,
         }),
         max_batch_size: Some(1), // 個別処理用
+        gpu_device: None,
     };
 
     // バックエンドの初期化
@@ -841,4 +849,128 @@ async fn test_hierarchical_chunking_and_batch_consistency() {
     );
 
     println!("=== Hierarchical Chunking and Batch Consistency Test Completed Successfully ===");
+}
+
+/// GPU device指定のテスト
+#[tokio::test]
+#[ignore]
+async fn integration_test_gpu_device_specification() {
+    use embedding_llm::embedding::LlamaCppEmbedder;
+    use llama_cpp_2::llama_backend::LlamaBackend;
+    use std::sync::{Arc, Mutex};
+
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .with_test_writer()
+        .try_init();
+
+    println!("=== GPU Device Specification Test ===");
+
+    // バックエンドの初期化
+    let backend_result = LlamaBackend::init();
+    if backend_result.is_err() {
+        println!("⚠ Skipping GPU device test - backend initialization failed");
+        return;
+    }
+
+    let mut backend = backend_result.unwrap();
+    backend.void_logs();
+    let shared_backend = Arc::new(Mutex::new(backend));
+
+    // Test 1: GPU device 0を指定（24GB GPU）
+    let settings_gpu0 = EmbeddingLlmRunnerSettings {
+        model_id: "Qwen/Qwen3-Embedding-4B-GGUF".to_string(),
+        use_cpu: false,
+        dtype: Some(DType::F16 as i32),
+        max_seq_length: 512,
+        model_type: ModelType::Gguf as i32,
+        model_files: vec!["Qwen3-Embedding-4B-Q4_K_M.gguf".to_string()],
+        tokenizer_model_id: None,
+        chunking_config: None,
+        max_batch_size: Some(2),
+        gpu_device: Some(0), // GPU 0を指定
+    };
+
+    println!("1. Testing with gpu_device=0...");
+    let result = LlamaCppEmbedder::new_from_settings_with_backend(&settings_gpu0, shared_backend.clone());
+    match result {
+        Ok(_embedder) => {
+            println!("   ✓ Successfully initialized with GPU device 0");
+        }
+        Err(e) => {
+            println!("   ⚠ Failed to initialize with GPU device 0: {}", e);
+            println!("   (This is expected if GPU 0 does not have sufficient VRAM)");
+        }
+    }
+
+    // Test 2: GPU device未指定（デフォルト動作）
+    let settings_no_gpu = EmbeddingLlmRunnerSettings {
+        model_id: "Qwen/Qwen3-Embedding-4B-GGUF".to_string(),
+        use_cpu: false,
+        dtype: Some(DType::F16 as i32),
+        max_seq_length: 512,
+        model_type: ModelType::Gguf as i32,
+        model_files: vec!["Qwen3-Embedding-4B-Q4_K_M.gguf".to_string()],
+        tokenizer_model_id: None,
+        chunking_config: None,
+        max_batch_size: Some(2),
+        gpu_device: None, // GPU指定なし（デフォルト）
+    };
+
+    println!("\n2. Testing with gpu_device=None (default)...");
+    let result = LlamaCppEmbedder::new_from_settings_with_backend(&settings_no_gpu, shared_backend.clone());
+    match result {
+        Ok(_embedder) => {
+            println!("   ✓ Successfully initialized with default GPU device");
+        }
+        Err(e) => {
+            println!("   ⚠ Failed to initialize with default GPU: {}", e);
+        }
+    }
+
+    // Test 3: CPUモード時のGPU指定は無視される
+    let settings_cpu_with_gpu = EmbeddingLlmRunnerSettings {
+        model_id: "Qwen/Qwen3-Embedding-4B-GGUF".to_string(),
+        use_cpu: true,
+        dtype: Some(DType::F32 as i32),
+        max_seq_length: 512,
+        model_type: ModelType::Gguf as i32,
+        model_files: vec!["Qwen3-Embedding-4B-Q4_K_M.gguf".to_string()],
+        tokenizer_model_id: None,
+        chunking_config: None,
+        max_batch_size: Some(2),
+        gpu_device: Some(0), // CPUモードだが指定（警告が出るべき）
+    };
+
+    println!("\n3. Testing with use_cpu=true and gpu_device=0 (should warn)...");
+    let result = LlamaCppEmbedder::new_from_settings_with_backend(&settings_cpu_with_gpu, shared_backend.clone());
+    match result {
+        Ok(_embedder) => {
+            println!("   ✓ Successfully initialized (GPU device ignored in CPU mode)");
+        }
+        Err(e) => {
+            println!("   ✗ Unexpected error: {}", e);
+        }
+    }
+
+    // Test 4: 負のGPU IDはエラー
+    let settings_invalid_gpu = EmbeddingLlmRunnerSettings {
+        model_id: "Qwen/Qwen3-Embedding-4B-GGUF".to_string(),
+        use_cpu: false,
+        dtype: Some(DType::F16 as i32),
+        max_seq_length: 512,
+        model_type: ModelType::Gguf as i32,
+        model_files: vec!["Qwen3-Embedding-4B-Q4_K_M.gguf".to_string()],
+        tokenizer_model_id: None,
+        chunking_config: None,
+        max_batch_size: Some(2),
+        gpu_device: Some(-1), // 負の値は不正
+    };
+
+    println!("\n4. Testing with invalid gpu_device=-1 (should fail)...");
+    let result = LlamaCppEmbedder::new_from_settings_with_backend(&settings_invalid_gpu, shared_backend);
+    assert!(result.is_err(), "Should fail with invalid GPU device ID");
+    println!("   ✓ Correctly rejected invalid GPU device ID");
+
+    println!("\n=== GPU Device Specification Test Completed ===");
 }

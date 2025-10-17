@@ -47,6 +47,7 @@ async fn test_plugin_full_lifecycle_with_embedding_generation() {
             enable_forced_splitting: true,
         }),
         max_batch_size: Some(1), // Sequential processing to avoid batch space issues
+        gpu_device: None,
     };
 
     let mut settings_buf = Vec::new();
@@ -348,6 +349,7 @@ async fn test_plugin_error_handling() {
         dtype: Some(DType::F32 as i32),
         chunking_config: None,
         max_batch_size: Some(4),
+        gpu_device: None,
     };
 
     let mut settings_buf = Vec::new();
@@ -371,6 +373,7 @@ async fn test_plugin_error_handling() {
         dtype: Some(DType::F32 as i32),
         chunking_config: None,
         max_batch_size: Some(4),
+        gpu_device: None,
     };
 
     let mut settings_buf = Vec::new();

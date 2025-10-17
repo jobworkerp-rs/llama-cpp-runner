@@ -1,0 +1,52 @@
+[package]
+name = "llama-cpp-reranker-runner"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "Reranker plugin runner using llama.cpp"
+license.workspace = true
+
+[lib]
+name = "message_vectordb_reranker_runner"
+crate-type = ["cdylib", "lib"]            # Plugin dynamic library
+
+[features]
+default = ["c-api"]
+c-api = []
+
+# Hardware acceleration (llama.cpp features)
+cuda = ["llama-cpp-2/cuda"]
+metal = ["llama-cpp-2/metal"]
+openmp = ["llama-cpp-2/openmp"]
+
+[dependencies]
+# === Local Dependencies ===
+command-utils = { workspace = true }
+
+# === JobworkerP Plugin Framework ===
+jobworkerp-client = { path = "../modules/jobworkerp-client" }
+
+# === llama.cpp ===
+llama-cpp-2 = { workspace = true }
+hf-hub = { workspace = true }
+
+# === Workspace Dependencies ===
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+prost = { workspace = true }
+tonic = { workspace = true }
+dotenvy = { workspace = true }
+schemars = { workspace = true }
+thiserror = { workspace = true }
+lru = { version = "0.16" }         # For cache.rs
+
+[build-dependencies]
+prost-build = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3.23"
+tokio-test = "0.4"

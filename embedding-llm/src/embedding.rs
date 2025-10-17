@@ -44,6 +44,16 @@ impl LlamaCppEmbedder {
 
         info!("Loading llama.cpp model from: {}", model_path);
 
+        // GPU device設定の検証とログ出力
+        let gpu_device = settings.gpu_device;
+        if let Some(device_id) = gpu_device {
+            if settings.use_cpu {
+                warn!("gpu_device={} is specified but use_cpu=true, GPU device setting will be ignored", device_id);
+            } else {
+                info!("Using GPU device: {}", device_id);
+            }
+        }
+
         // バックエンドを受け取ってモデルを初期化
         let model = LlamaCppModel::new_with_backend(
             &model_path,
@@ -51,6 +61,7 @@ impl LlamaCppEmbedder {
             settings.max_seq_length as usize,
             settings.max_batch_size,
             backend,
+            gpu_device,
         )?;
 
         Self::build_embedder_common(settings, model)
@@ -622,6 +633,7 @@ mod tests {
             tokenizer_model_id: None,
             chunking_config: None,
             max_batch_size: Some(4),
+            gpu_device: None,
         };
 
         // Test new constructor with backend (should fail due to nonexistent model file)

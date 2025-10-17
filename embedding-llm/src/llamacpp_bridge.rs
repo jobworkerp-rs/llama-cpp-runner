@@ -92,6 +92,7 @@ impl LlamaCppModel {
         max_seq_length: usize,
         max_batch_size: Option<u32>,
         backend: Arc<Mutex<LlamaBackend>>,
+        gpu_device: Option<i32>,
     ) -> Result<Self> {
         // Model file validation
         self::helpers::validate_model_file(model_path)?;
@@ -105,7 +106,20 @@ impl LlamaCppModel {
         let model_params = if use_cpu {
             LlamaModelParams::default()
         } else {
-            LlamaModelParams::default().with_n_gpu_layers(1000) // Offload all layers to GPU
+            let mut params = LlamaModelParams::default().with_n_gpu_layers(1000); // Offload all layers to GPU
+            
+            // GPU device specification (if provided)
+            if let Some(device_id) = gpu_device {
+                if device_id < 0 {
+                    return Err(EmbeddingLlmError::configuration(format!(
+                        "Invalid gpu_device: {}. Must be >= 0",
+                        device_id
+                    )));
+                }
+                info!("Setting main GPU device to: {}", device_id);
+                params = params.with_main_gpu(device_id);
+            }
+            params
         };
 
         info!("Loading model from: {}", resolved_path.display());
@@ -163,6 +177,8 @@ impl LlamaCppModel {
 
         let ctx_params = LlamaContextParams::default()
             .with_n_ctx(Some(ctx_size))
+            .with_n_batch(ctx_size.into()) // Set batch size to match context size for embedding processing
+            .with_n_ubatch(ctx_size.into()) // Set physical batch size to match for single-pass embedding
             .with_embeddings(true) // Enable embedding mode
             .with_flash_attention_policy(if use_cpu {
                 LLAMA_FLASH_ATTN_TYPE_DISABLED

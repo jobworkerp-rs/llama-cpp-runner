@@ -34,6 +34,11 @@ message EmbeddingLlmRunnerSettings {
   // Maximum batch size for batch processing (default: adaptive based on memory)
   // Used for hierarchical chunking batch processing optimization
   optional uint32 max_batch_size = 9;
+  
+  // GPU device index to use for inference (default: 0)
+  // Only effective when use_cpu = false
+  // Ignored when use_cpu = true
+  optional int32 gpu_device = 10;
 }
 
 enum ModelType {

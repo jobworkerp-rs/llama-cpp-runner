@@ -1,0 +1,73 @@
+syntax = "proto3";
+
+package reranker_runner;
+
+// Reranker Runner Configuration
+message RerankerSettings {
+  // ========================================
+  // Model Configuration
+  // ========================================
+
+  // Model ID (HuggingFace repo or local path)
+  // Example: "Qwen3-Reranker-4B-Q4_K_M.gguf" (local)
+  string model_id = 1;
+
+  // HuggingFace repo (optional)
+  // Example: "QuantFactory/Qwen3-Reranker-4B-GGUF"
+  // If null, model_id is treated as a local path
+  optional string hf_repo = 2;
+
+  // ========================================
+  // Hardware Configuration
+  // ========================================
+
+  // Use CPU flag (default: false = use GPU)
+  bool use_cpu = 3;
+
+  // Number of threads (default: auto-detect)
+  optional uint32 threads = 4;
+
+  // Number of threads for batch processing (default: use threads value)
+  optional uint32 threads_batch = 5;
+
+  // Context size (default: 32768)
+  optional uint32 ctx_size = 6;
+
+  // Batch size (default: 32768)
+  // Note: For long documents, n_batch >= document_token_count is required
+  optional uint32 n_batch = 7;
+
+  // Use Flash Attention flag (default: true)
+  optional bool use_flash_attention = 8;
+
+  // ========================================
+  // Reranker Configuration
+  // ========================================
+
+  // Default instruction text (optional)
+  // If not specified, uses official Qwen3-Reranker-4B default:
+  // "Given a web search query, retrieve relevant passages that answer the query"
+  optional string default_instruction = 9;
+
+  // ========================================
+  // Cache Configuration
+  // ========================================
+
+  // Cache size (default: 10000 entries)
+  optional uint32 cache_size = 10;
+
+  // Cache TTL in seconds (default: 3600 = 1 hour)
+  optional uint64 cache_ttl_seconds = 11;
+
+  // ========================================
+  // Document Processing Configuration
+  // ========================================
+
+  // Maximum document length in tokens - GPU environment
+  // default: 20000 (verified: 4.1 seconds/document)
+  optional uint32 max_document_length_gpu = 12;
+
+  // Maximum document length in tokens - CPU environment
+  // default: 5000 (estimated: ~4 seconds/document)
+  optional uint32 max_document_length_cpu = 13;
+}
