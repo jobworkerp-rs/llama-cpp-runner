@@ -33,7 +33,7 @@ static GLOBAL_BACKEND: OnceLock<Arc<Mutex<LlamaBackend>>> = OnceLock::new();
 
 /// Main plugin structure for embedding-llm
 pub struct EmbeddingLlmRunnerPlugin {
-    backend: Arc<Mutex<LlamaBackend>>,
+    backend: Option<Arc<Mutex<LlamaBackend>>>,
     embedder: Option<LlamaCppEmbedder>,
 }
 
@@ -41,7 +41,20 @@ impl EmbeddingLlmRunnerPlugin {
     pub const RUNNER_NAME: &'static str = "EmbeddingLlmRunner";
 
     pub fn new() -> Result<Self> {
-        // グローバルバックエンドを取得または初期化
+        tracing::info!("Creating EmbeddingLlmRunner plugin (backend will be initialized on load)");
+        Ok(Self {
+            backend: None,
+            embedder: None,
+        })
+    }
+
+    /// Ensure backend is initialized (lazy initialization)
+    fn ensure_backend(&mut self) -> Result<Arc<Mutex<LlamaBackend>>> {
+        if let Some(backend) = &self.backend {
+            return Ok(backend.clone());
+        }
+
+        // Initialize global backend on first use (in load() method)
         let backend = GLOBAL_BACKEND
             .get_or_init(|| {
                 tracing::info!("Initializing global llama.cpp backend for embedding plugin");
@@ -52,10 +65,8 @@ impl EmbeddingLlmRunnerPlugin {
             .clone();
 
         tracing::info!("Using shared llama.cpp backend for embedding plugin");
-        Ok(Self {
-            backend,
-            embedder: None,
-        })
+        self.backend = Some(backend.clone());
+        Ok(backend)
     }
 }
 
@@ -90,9 +101,12 @@ impl PluginRunner for EmbeddingLlmRunnerPlugin {
             return Err(anyhow!("GGUF model files must be specified"));
         }
 
+        // Initialize backend here (lazy initialization - only when actually loading model)
+        let backend = self.ensure_backend()?;
+
         // llama.cpp embedderの初期化（バックエンドを渡す）
         let embedder =
-            LlamaCppEmbedder::new_from_settings_with_backend(&settings, self.backend.clone())?;
+            LlamaCppEmbedder::new_from_settings_with_backend(&settings, backend)?;
 
         self.embedder = Some(embedder);
 
