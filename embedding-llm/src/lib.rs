@@ -237,9 +237,25 @@ impl PluginRunner for EmbeddingLlmRunnerPlugin {
 // Plugin entry points
 #[no_mangle]
 pub extern "C" fn load_plugin() -> Box<dyn PluginRunner + Send + Sync> {
-    dotenvy::dotenv().ok();
-    let plugin = EmbeddingLlmRunnerPlugin::new().expect("Failed to load plugin");
-    Box::new(plugin)
+    std::panic::catch_unwind(|| {
+        dotenvy::dotenv().ok();
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(async move {
+                command_utils::util::tracing::tracing_init_from_env()
+                    .await
+                    .unwrap_or_default();
+            });
+        let plugin = EmbeddingLlmRunnerPlugin::new().expect("Failed to load plugin");
+        Box::new(plugin)
+    })
+    .unwrap_or_else(|e| {
+        eprintln!("load_plugin panic: {:?}", e);
+        Box::new(EmbeddingLlmRunnerPlugin {
+            backend: None,
+            embedder: None,
+        })
+    })
 }
 
 #[no_mangle]
