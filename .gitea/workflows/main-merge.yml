@@ -77,12 +77,30 @@ jobs:
     - name: Clean previous builds
       run: cargo clean
 
-    - name: Build release without CUDA (test)
-      run: cargo build --release
-      continue-on-error: true
-      
-    - name: Build release with CUDA
-      run: cargo build --release --features cuda
+    - name: Build CPU version
+      run: |
+        cargo build --release
+        mkdir -p artifacts/runner
+        cp target/release/lib*.so artifacts/runner/
+        echo "CPU version built and saved to artifacts/runner/"
+        ls -lh artifacts/runner/
+
+    - name: Clean for CUDA build
+      run: cargo clean
+
+    - name: Build CUDA version
+      run: |
+        cargo build --release --features cuda
+        mkdir -p artifacts/cuda_runner
+        # Rename CUDA version with _cuda suffix
+        for f in target/release/lib*.so; do
+          if [ -f "$f" ]; then
+            base=$(basename "$f" .so)
+            cp "$f" "artifacts/cuda_runner/${base}_cuda.so"
+            echo "Copied $f to artifacts/cuda_runner/${base}_cuda.so"
+          fi
+        done
+        ls -lh artifacts/cuda_runner/
 
     - name: Generate release tag
       id: tag
@@ -115,8 +133,19 @@ jobs:
         git lfs pull
         git checkout origin/main -- ./VERSION
         git reset --soft origin/main
+
+        # Copy CPU version to runner/ directory
+        mkdir -p runner
+        cp ../artifacts/runner/*.so runner/
+        echo "CPU plugins copied to runner/:"
+        ls -lh runner/*.so
+
+        # Copy CUDA version to cuda_runner/ directory
         mkdir -p cuda_runner
-        cp ../target/release/lib*.so cuda_runner/
+        cp ../artifacts/cuda_runner/*.so cuda_runner/
+        echo "CUDA plugins copied to cuda_runner/:"
+        ls -lh cuda_runner/*.so
+
         git add .
         if [ $(git diff --staged | wc -l) -eq 0 ]; then
           echo "No changes to publish"
@@ -124,7 +153,7 @@ jobs:
         fi
         echo ${{ steps.tag.outputs.tag }} > VERSION
         git add ./VERSION
-        git commit -m "Publish plugin ${{ steps.tag.outputs.tag }}"
+        git commit -m "Publish plugin ${{ steps.tag.outputs.tag }} (CPU: runner/, CUDA: cuda_runner/)"
         git push origin main
         git tag ${{ steps.tag.outputs.tag }}
         git push origin --tags
