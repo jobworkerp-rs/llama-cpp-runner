@@ -114,7 +114,9 @@ impl LlamaRerankerModel {
             return Err(RerankerError::config_error("HF repo not specified"));
         }
 
-        let api = hf_hub::api::sync::Api::new()
+        let api = hf_hub::api::sync::ApiBuilder::from_env()
+            .with_progress(false)
+            .build()
             .map_err(|e| RerankerError::HfHubError(format!("API init failed: {:?}", e)))?;
 
         let repo_api = api.model(config.hf_repo.clone());
