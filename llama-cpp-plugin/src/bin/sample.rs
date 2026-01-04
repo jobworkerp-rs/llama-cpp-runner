@@ -106,7 +106,7 @@ impl Model {
     fn get_or_load(self) -> Result<PathBuf> {
         match self {
             Model::Local { path } => Ok(path),
-            Model::HuggingFace { model, repo } => ApiBuilder::new()
+            Model::HuggingFace { model, repo } => ApiBuilder::from_env()
                 .with_progress(true)
                 .build()
                 .with_context(|| "unable to create huggingface api")?

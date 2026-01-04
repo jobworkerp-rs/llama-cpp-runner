@@ -560,8 +560,8 @@ pub mod helpers {
 
                 info!("Downloading model from HuggingFace: {}/{}", repo, filename);
 
-                let api = ApiBuilder::new()
-                    .with_progress(true)
+                let api = ApiBuilder::from_env()
+                    .with_progress(false)
                     .build()
                     .map_err(|e| {
                         EmbeddingLlmError::hf_hub(format!("Failed to create HF API: {e}"))

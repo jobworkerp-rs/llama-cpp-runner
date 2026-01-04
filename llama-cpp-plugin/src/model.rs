@@ -122,8 +122,8 @@ impl LlamaModelConfig {
         match self.hf_repo.clone() {
             None => Ok(modelfiles),
             Some(repo) => {
-                let api = ApiBuilder::new()
-                    .with_progress(true)
+                let api = ApiBuilder::from_env()
+                    .with_progress(false)
                     .build()
                     .with_context(|| "unable to create huggingface api")?
                     .model(repo);
