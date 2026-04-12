@@ -51,17 +51,17 @@ impl From<ParamOverrideValueWrapper> for ParamOverrideValue {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct Model {
-    /// Use an already downloaded model
-    /// The path to the model. e.g. `/home/marcus/.cache/huggingface/hub/models--TheBloke--Llama-2-7B-Chat-GGUF/blobs/08a5566d61d7cb6b420c3e4387a39e0078e1f2fe5f055f3a03887385304d4bfa`
-    local_path: Option<PathBuf>,
-    /// Download a model from huggingface (or use a cached version)
-    /// the repo containing the model. e.g. `TheBloke/Llama-2-7B-Chat-GGUF`
-    hf_repo: Option<String>,
-    /// the model name. e.g. `llama-2-7b-chat.Q4_K_M.gguf`
-    hf_model: Option<String>,
-}
+// #[derive(Debug, Clone, Serialize, Deserialize)]
+// struct Model {
+//     /// Use an already downloaded model
+//     /// The path to the model. e.g. `/home/marcus/.cache/huggingface/hub/models--TheBloke--Llama-2-7B-Chat-GGUF/blobs/08a5566d61d7cb6b420c3e4387a39e0078e1f2fe5f055f3a03887385304d4bfa`
+//     local_path: Option<PathBuf>,
+//     /// Download a model from huggingface (or use a cached version)
+//     /// the repo containing the model. e.g. `TheBloke/Llama-2-7B-Chat-GGUF`
+//     hf_repo: Option<String>,
+//     /// the model name. e.g. `llama-2-7b-chat.Q4_K_M.gguf`
+//     hf_model: Option<String>,
+// }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct LlamaModelConfig {
@@ -267,7 +267,7 @@ impl LlamaModelWrapper {
         self.decode(args)
     }
 
-    fn create_batch(&self, prompt: &str, ctx: &LlamaContext, n_len: i32) -> Result<LlamaBatch> {
+    fn create_batch(&self, prompt: &str, ctx: &LlamaContext, n_len: i32) -> Result<LlamaBatch<'_>> {
         let tokens_list = self
             .model
             .str_to_token(prompt, AddBos::Always)
