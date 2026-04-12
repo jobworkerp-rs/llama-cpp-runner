@@ -102,6 +102,23 @@ jobs:
         done
         ls -lh artifacts/cuda_runner/
 
+    # Run multimodal smoke tests against real HF models. These are marked
+    # #[ignore] so they also run in PR CI (see pull-request.yml); here on
+    # main we re-run them as the last safety net before publishing. A
+    # failure must block the release — do not re-introduce
+    # continue-on-error without explicit justification.
+    - name: Run multimodal smoke tests (ignored)
+      run: |
+        cargo test -p jobworkerp-llama-cpp-plugin \
+          test_multimodal_generation_with_real_model \
+          --release -- --ignored --test-threads=1 --nocapture
+        cargo test -p jobworkerp-llama-cpp-plugin \
+          test_multimodal_audio_generation \
+          --release -- --ignored --test-threads=1 --nocapture
+        cargo test -p embedding-llm \
+          integration_test_multimodal_embedding \
+          --release -- --ignored --test-threads=1 --nocapture
+
     - name: Generate release tag
       id: tag
       run: |

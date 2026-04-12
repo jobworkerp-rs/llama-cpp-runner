@@ -8,6 +8,7 @@ fn main() {
         )
         .compile_protos(
             &[
+                "llama_cpp/media_input.proto",
                 "llama_cpp/llama_cpp_runner.proto",
                 "llama_cpp/llama_cpp_arg.proto",
             ],

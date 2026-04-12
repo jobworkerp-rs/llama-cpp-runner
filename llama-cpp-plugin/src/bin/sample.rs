@@ -15,8 +15,8 @@ use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::params::kv_overrides::ParamOverrideValue;
 use llama_cpp_2::model::params::LlamaModelParams;
+use llama_cpp_2::model::AddBos;
 use llama_cpp_2::model::LlamaModel;
-use llama_cpp_2::model::{AddBos, Special};
 use llama_cpp_2::token::data_array::LlamaTokenDataArray;
 use std::ffi::CString;
 use std::io::Write;
@@ -214,8 +214,12 @@ either reduce n_len or increase n_ctx"
     // print the prompt token-by-token
     eprintln!();
 
+    let mut prompt_decoder = encoding_rs::UTF_8.new_decoder();
     for token in &tokens_list {
-        eprint!("{}", model.token_to_str(*token, Special::Tokenize)?);
+        eprint!(
+            "{}",
+            model.token_to_piece(*token, &mut prompt_decoder, /* special= */ true, None)?
+        );
     }
 
     std::io::stderr().flush()?;
@@ -263,7 +267,17 @@ either reduce n_len or increase n_ctx"
                 break;
             }
 
-            let output_bytes = model.token_to_bytes(new_token_id, Special::Tokenize)?;
+            let output_bytes =
+                match model.token_to_piece_bytes(new_token_id, 8, /* special= */ true, None) {
+                    Err(llama_cpp_2::TokenToStringError::InsufficientBufferSpace(i)) => model
+                        .token_to_piece_bytes(
+                            new_token_id,
+                            (-i).try_into().expect("Error buffer size is positive"),
+                            true,
+                            None,
+                        )?,
+                    other => other?,
+                };
             // use `Decoder.decode_to_string()` to avoid the intermediate buffer
             let mut output_string = String::with_capacity(32);
             let _decode_result = decoder.decode_to_string(&output_bytes, &mut output_string, false);

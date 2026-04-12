@@ -104,6 +104,9 @@ impl PluginRunner for LlamaCppPlugin {
                 tracing::debug!("END OF LLMRunner: {text:?}",);
                 let buf = LlamaArg {
                     prompt: text,
+                    // Drop media inputs from the response so chained runners
+                    // don't re-feed them on the next turn.
+                    medias: vec![],
                     ..args
                 };
                 // serialize and return
@@ -210,6 +213,7 @@ Good luck in the competition and in advancing AI research!
             repeat_last_n: Some(8),
             seed: Some(30),
             need_print: true,
+            medias: vec![],
         };
         let mut buf = Vec::with_capacity(request.encoded_len());
         request.encode(&mut buf).unwrap();

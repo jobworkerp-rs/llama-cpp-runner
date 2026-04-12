@@ -27,6 +27,7 @@ command-utils = { workspace = true }
 jobworkerp-client = { path = "../modules/jobworkerp-client" }
 
 # === llama.cpp ===
+encoding_rs = { workspace = true }
 llama-cpp-2 = { workspace = true }
 hf-hub = { workspace = true }
 

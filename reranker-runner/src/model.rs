@@ -314,15 +314,14 @@ impl LlamaRerankerModel {
     /// # Errors
     /// - Detokenization failed
     pub fn detokenize(&self, tokens: &[LlamaToken]) -> Result<String, RerankerError> {
-        use llama_cpp_2::model::Special;
-
+        let mut decoder = encoding_rs::UTF_8.new_decoder();
         let mut result = String::new();
         for token in tokens {
-            let token_str = self
+            let piece = self
                 .model
-                .token_to_str(*token, Special::Tokenize)
+                .token_to_piece(*token, &mut decoder, /* special= */ true, None)
                 .map_err(|e| RerankerError::tokenization_failed(format!("{:?}", e)))?;
-            result.push_str(&token_str);
+            result.push_str(&piece);
         }
         Ok(result)
     }

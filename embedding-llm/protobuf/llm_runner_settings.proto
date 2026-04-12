@@ -2,6 +2,8 @@ syntax = "proto3";
 
 package embedding_llm;
 
+import "llama_cpp/media_input.proto";
+
 message EmbeddingLlmRunnerSettings {
   // HuggingFace model ID or local model path
   string model_id = 1;
@@ -39,6 +41,11 @@ message EmbeddingLlmRunnerSettings {
   // Only effective when use_cpu = false
   // Ignored when use_cpu = true
   optional int32 gpu_device = 10;
+
+  // Multimodal projector settings. Same semantics as
+  // LlamaRunnerSettings.mtmd — defined in llama_cpp/media_input.proto and
+  // shared between both runners.
+  optional llama_cpp.MtmdSettings mtmd = 11;
 }
 
 enum ModelType {
