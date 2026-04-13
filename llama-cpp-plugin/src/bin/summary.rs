@@ -47,6 +47,7 @@ fn main() -> Result<()> {
         repeat_last_n: Some(8),
         seed: Some(32),
         need_print: true,
+        medias: vec![],
     };
     let mut buf = Vec::with_capacity(request.encoded_len());
     request.encode(&mut buf).unwrap();

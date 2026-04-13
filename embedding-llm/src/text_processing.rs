@@ -74,7 +74,15 @@ impl TextProcessor {
 
         info!("Created {} paragraph-aware windows", chunks.len());
 
-        // Convert to TextWindow format
+        // Convert to TextWindow format.
+        //
+        // `full_text` is informational only (stored in TextWindow.text for
+        // logging/debug). The tokens actually fed to the embedding model come
+        // from `chunk.token_ids`, which were produced upstream by
+        // EmbeddingHierarchicalChunker without any instruction prefix. This
+        // matches the EmbeddingArgs.instruction proto contract: instruction is
+        // metadata and does NOT influence the embedding vector today. Kept as
+        // scaffolding for future instruction-aware models (E5/BGE/GTE).
         let windows: Vec<TextWindow> = chunks
             .into_iter()
             .enumerate()

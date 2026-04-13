@@ -7,7 +7,7 @@ edition = "2021"
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 schemars = { workspace = true }
-serde = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
 prost = { workspace = true }
 
 [build-dependencies]

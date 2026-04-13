@@ -14,6 +14,16 @@ pub struct LlamaCppEmbedder {
     tokenization_processor: Arc<TokenizationProcessor>,
     text_processor: TextProcessor,
     model_info: ModelInfo,
+    media_limits: Option<mtmd_support::MediaLimits>,
+    /// Multimodal runtime — shared via `Arc` so that `prepare_bitmaps` and
+    /// `inject_markers` (both `&MtmdRuntime`, upstream-documented as
+    /// thread-safe) can run concurrently across blocking-thread invocations
+    /// of `run()`. The only operation that needs mutual exclusion on the
+    /// shared `MtmdContext` is `eval_chunks` inside
+    /// `generate_multimodal_embedding`; that call is serialized by the
+    /// existing `model` Mutex, so no separate mtmd-level lock is required.
+    /// See `mtmd-support/src/runtime.rs` for the underlying contract.
+    mtmd_runtime: Option<Arc<mtmd_support::MtmdRuntime>>,
 }
 
 #[derive(Debug, Clone)]
@@ -23,6 +33,9 @@ pub struct ModelInfo {
     pub max_context_length: usize,
     pub vocab_size: usize,
     pub dtype: String,
+    pub supports_vision: bool,
+    pub supports_audio: bool,
+    pub audio_sample_rate: Option<u32>,
 }
 
 /// Embedding result with character position information
@@ -55,7 +68,7 @@ impl LlamaCppEmbedder {
         }
 
         // バックエンドを受け取ってモデルを初期化
-        let model = LlamaCppModel::new_with_backend(
+        let mut model = LlamaCppModel::new_with_backend(
             &model_path,
             settings.use_cpu,
             settings.max_seq_length as usize,
@@ -63,6 +76,16 @@ impl LlamaCppEmbedder {
             backend,
             gpu_device,
         )?;
+
+        // Initialize multimodal projector when settings are provided.
+        if let Some(mtmd_settings) = &settings.mtmd {
+            model.init_mtmd(
+                &mtmd_settings.mmproj,
+                mtmd_settings.mmproj_hf_repo.as_deref(),
+                mtmd_settings.mmproj_use_gpu.unwrap_or(!settings.use_cpu),
+                mtmd_settings.media_marker.as_deref(),
+            )?;
+        }
 
         Self::build_embedder_common(settings, model)
     }
@@ -132,12 +155,20 @@ impl LlamaCppEmbedder {
         let max_context_length = model.max_context_length();
         let vocab_size = model.vocabulary_size();
 
+        let (supports_vision, supports_audio, audio_sample_rate) = model
+            .mtmd_ref()
+            .map(|m| (m.support_vision(), m.support_audio(), m.audio_sample_rate()))
+            .unwrap_or((false, false, None));
+
         let model_info = ModelInfo {
             model_path: model.model_path().to_string(),
             embedding_dimension,
             max_context_length,
             vocab_size,
             dtype: dtype.to_string(),
+            supports_vision,
+            supports_audio,
+            audio_sample_rate,
         };
 
         info!("Model loaded successfully: {:?}", model_info);
@@ -203,11 +234,33 @@ impl LlamaCppEmbedder {
         let text_processor =
             TextProcessor::new(tokenization_processor.clone(), text_chunking_config);
 
+        let media_limits = settings
+            .mtmd
+            .as_ref()
+            .map(mtmd_support::MediaLimits::from_settings);
+
+        // Move the mtmd runtime out of the model so it can be accessed
+        // without holding the model lock. `prepare_bitmaps` /
+        // `inject_markers` take `&MtmdRuntime` and are safe to call
+        // concurrently (see field doc), so `Arc` — not `Mutex` — is
+        // sufficient. `eval_chunks` is serialized via the model lock held
+        // by `generate_multimodal_embedding`.
+        let mtmd_runtime = {
+            let mut model_guard = model_arc.lock().map_err(|_| {
+                crate::error::EmbeddingLlmError::llamacpp(
+                    "Failed to acquire model lock to extract mtmd runtime".to_string(),
+                )
+            })?;
+            model_guard.take_mtmd().map(Arc::new)
+        };
+
         Ok(Self {
             model: model_arc,
             tokenization_processor,
             text_processor,
             model_info,
+            media_limits,
+            mtmd_runtime,
         })
     }
 
@@ -492,6 +545,26 @@ impl LlamaCppEmbedder {
         Ok(())
     }
 
+    /// Access the underlying llama.cpp model (for multimodal path).
+    pub fn model(&self) -> &Arc<Mutex<LlamaCppModel>> {
+        &self.model
+    }
+
+    /// Media limits derived from MtmdSettings (None when text-only).
+    pub fn media_limits(&self) -> &Option<mtmd_support::MediaLimits> {
+        &self.media_limits
+    }
+
+    /// Access to the multimodal runtime (if initialized).
+    ///
+    /// Returned as `&Arc<...>` so callers can clone cheaply and use
+    /// `prepare_bitmaps` / `inject_markers` without holding any mtmd-level
+    /// lock. `eval_chunks` (inside `generate_multimodal_embedding`) is
+    /// serialized by the `model` Mutex instead.
+    pub fn mtmd_runtime(&self) -> Option<&Arc<mtmd_support::MtmdRuntime>> {
+        self.mtmd_runtime.as_ref()
+    }
+
     /// リソース使用量の推定（デバッグ用）
     pub fn estimate_memory_usage(&self) -> usize {
         // 簡易的な推定
@@ -515,6 +588,9 @@ mod tests {
             max_context_length: 512,
             vocab_size: 32000,
             dtype: "f32".to_string(),
+            supports_vision: false,
+            supports_audio: false,
+            audio_sample_rate: None,
         };
 
         assert_eq!(model_info.embedding_dimension, 1024);
@@ -558,6 +634,9 @@ mod tests {
             max_context_length: 512,
             vocab_size: 32000,
             dtype: "f32".to_string(),
+            supports_vision: false,
+            supports_audio: false,
+            audio_sample_rate: None,
         };
 
         // Test the calculation logic
@@ -634,6 +713,7 @@ mod tests {
             chunking_config: None,
             max_batch_size: Some(4),
             gpu_device: None,
+            mtmd: None,
         };
 
         // Test new constructor with backend (should fail due to nonexistent model file)

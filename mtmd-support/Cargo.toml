@@ -1,0 +1,14 @@
+[package]
+name = "mtmd-support"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "Shared multimodal projector runtime for llama.cpp-based plugins"
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+llama-cpp-2 = { workspace = true, features = ["mtmd"] }
+jobworkerp-llama-protobuf = { path = "../llama-protobuf" }

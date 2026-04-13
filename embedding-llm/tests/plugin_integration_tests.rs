@@ -48,6 +48,7 @@ async fn test_plugin_full_lifecycle_with_embedding_generation() {
         }),
         max_batch_size: Some(1), // Sequential processing to avoid batch space issues
         gpu_device: None,
+        mtmd: None,
     };
 
     let mut settings_buf = Vec::new();
@@ -79,6 +80,8 @@ async fn test_plugin_full_lifecycle_with_embedding_generation() {
                 text: "The quick brown fox jumps over the lazy dog.".to_string(),
                 instruction: Some("Generate embedding for this text".to_string()),
                 normalize_embeddings: false,
+                medias: vec![],
+            pooling_type: 0,
             }
         ),
         (
@@ -87,6 +90,8 @@ async fn test_plugin_full_lifecycle_with_embedding_generation() {
                 text: "Machine learning and artificial intelligence are transforming technology.".to_string(),
                 instruction: Some("Create semantic embedding".to_string()),
                 normalize_embeddings: true,
+                medias: vec![],
+            pooling_type: 0,
             }
         ),
         (
@@ -95,6 +100,8 @@ async fn test_plugin_full_lifecycle_with_embedding_generation() {
                 text: "Natural language processing is a subfield of linguistics, computer science, and artificial intelligence concerned with the interactions between computers and human language, in particular how to program computers to process and analyze large amounts of natural language data. The goal is a computer capable of understanding the contents of documents, including the contextual nuances of the language within them. The technology can then accurately extract information and insights contained in the documents as well as categorize and organize the documents themselves. This is a very long text that should exceed the token limits and create multiple sliding windows for comprehensive testing of position calculation across different windows and segments.".to_string(),
                 instruction: Some("Generate comprehensive embedding".to_string()),
                 normalize_embeddings: false,
+                medias: vec![],
+            pooling_type: 0,
             }
         ),
         (
@@ -103,6 +110,8 @@ async fn test_plugin_full_lifecycle_with_embedding_generation() {
                 text: "Lorem ipsum dolor sit amet, consectetur adipiscing elit. Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum. Sed ut perspiciatis unde omnis iste natus error sit voluptatem accusantium doloremque laudantium, totam rem aperiam, eaque ipsa quae ab illo inventore veritatis et quasi architecto beatae vitae dicta sunt explicabo. Nemo enim ipsam voluptatem quia voluptas sit aspernatur aut odit aut fugit, sed quia consequuntur magni dolores eos qui ratione voluptatem sequi nesciunt. Neque porro quisquam est, qui dolorem ipsum quia dolor sit amet, consectetur, adipisci velit, sed quia non numquam eius modi tempora incidunt ut labore et dolore magnam aliquam quaerat voluptatem.".to_string(),
                 instruction: None,
                 normalize_embeddings: false,
+                medias: vec![],
+            pooling_type: 0,
             }
         ),
         (
@@ -111,6 +120,8 @@ async fn test_plugin_full_lifecycle_with_embedding_generation() {
                 text: "Hello world".to_string(),
                 instruction: None, // No instruction test
                 normalize_embeddings: true,
+                medias: vec![],
+            pooling_type: 0,
             }
         ),
         (
@@ -119,6 +130,8 @@ async fn test_plugin_full_lifecycle_with_embedding_generation() {
                 text: "This is an extremely long text designed to exceed token limits and create multiple sliding windows. The purpose of this test is to validate that the character position calculation works correctly when text is split into multiple segments. Natural language processing involves many complex tasks including tokenization, semantic analysis, syntactic parsing, named entity recognition, sentiment analysis, machine translation, question answering, text summarization, and many other applications. Machine learning models have revolutionized how we approach these problems by learning patterns from large datasets rather than relying solely on hand-crafted rules. Deep learning architectures such as transformers have been particularly successful in capturing long-range dependencies in sequential data. The attention mechanism allows models to focus on relevant parts of the input sequence when making predictions. This has led to significant improvements in tasks like machine translation where the model needs to align words and phrases between source and target languages. Pre-trained language models like BERT, GPT, and T5 have further advanced the field by providing strong baselines that can be fine-tuned for specific tasks. These models are trained on massive amounts of text data and learn rich representations of language that capture both syntactic and semantic information. The emergence of large language models has opened up new possibilities for few-shot and zero-shot learning where models can perform tasks with minimal or no task-specific training data.".to_string(),
                 instruction: Some("Generate comprehensive embeddings for this extensive text".to_string()),
                 normalize_embeddings: false,
+                medias: vec![],
+            pooling_type: 0,
             }
         ),
     ];
@@ -350,6 +363,7 @@ async fn test_plugin_error_handling() {
         chunking_config: None,
         max_batch_size: Some(4),
         gpu_device: None,
+        mtmd: None,
     };
 
     let mut settings_buf = Vec::new();
@@ -374,6 +388,7 @@ async fn test_plugin_error_handling() {
         chunking_config: None,
         max_batch_size: Some(4),
         gpu_device: None,
+        mtmd: None,
     };
 
     let mut settings_buf = Vec::new();
@@ -391,6 +406,8 @@ async fn test_plugin_error_handling() {
         text: "Test text".to_string(),
         instruction: None,
         normalize_embeddings: false,
+        medias: vec![],
+        pooling_type: 0,
     };
 
     let mut args_buf = Vec::new();
@@ -455,6 +472,154 @@ async fn test_plugin_protobuf_schemas() {
 
     println!("✓ Protobuf schemas are correctly accessible");
     println!("=== Protobuf Schema Test Completed ===");
+}
+
+#[tokio::test]
+async fn test_plugin_multimodal_error_paths() {
+    use jobworkerp_llama_protobuf::protobuf::llama_cpp::{
+        media_input::Source, MediaInput, MediaKind,
+    };
+
+    println!("=== Plugin Multimodal Error Path Tests ===");
+
+    let mut plugin = EmbeddingLlmRunnerPlugin::new().expect("Failed to create plugin");
+
+    // Test 1: Empty text AND empty medias → InvalidArgument
+    println!("1. Testing empty text + empty medias rejection...");
+    {
+        let args = EmbeddingArgs {
+            text: String::new(),
+            instruction: None,
+            normalize_embeddings: false,
+            medias: vec![],
+            pooling_type: 0,
+        };
+        let mut buf = Vec::new();
+        args.encode(&mut buf).expect("encode");
+        let (result, _) = plugin.run(buf, HashMap::new());
+        assert!(result.is_err(), "Should reject empty text + empty medias");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("both text and medias are empty"),
+            "Expected InvalidArgument message, got: {err_msg}"
+        );
+        println!("  ✓ Correctly rejected empty text + empty medias");
+    }
+
+    // Test 2: Media-only input (empty text + medias) on uninitialized plugin
+    println!("2. Testing media-only input on uninitialized plugin...");
+    {
+        let args = EmbeddingArgs {
+            text: String::new(),
+            instruction: None,
+            normalize_embeddings: false,
+            medias: vec![MediaInput {
+                kind: MediaKind::Image as i32,
+                source: Some(Source::Encoded(vec![0xFF, 0xD8, 0xFF])),
+                id: None,
+            }],
+            pooling_type: 0,
+        };
+        let mut buf = Vec::new();
+        args.encode(&mut buf).expect("encode");
+        let (result, _) = plugin.run(buf, HashMap::new());
+        assert!(
+            result.is_err(),
+            "Should fail on uninitialized plugin, not on empty text"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        // Should fail because embedder is not initialized, NOT because text is empty
+        assert!(
+            err_msg.contains("not initialized"),
+            "Expected 'not initialized' error, got: {err_msg}"
+        );
+        println!(
+            "  ✓ Media-only input accepted but fails on uninitialized embedder (not empty text)"
+        );
+    }
+
+    // Test 3: Text+media input on uninitialized plugin
+    println!("3. Testing text+media input on uninitialized plugin...");
+    {
+        let args = EmbeddingArgs {
+            text: "Describe this image".to_string(),
+            instruction: None,
+            normalize_embeddings: false,
+            medias: vec![MediaInput {
+                kind: MediaKind::Image as i32,
+                source: Some(Source::Encoded(vec![0xFF, 0xD8, 0xFF])),
+                id: None,
+            }],
+            pooling_type: 0,
+        };
+        let mut buf = Vec::new();
+        args.encode(&mut buf).expect("encode");
+        let (result, _) = plugin.run(buf, HashMap::new());
+        assert!(result.is_err(), "Should fail on uninitialized plugin");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("not initialized"),
+            "Expected 'not initialized' error, got: {err_msg}"
+        );
+        println!("  ✓ Text+media input accepted but fails on uninitialized embedder");
+    }
+
+    // Test 4: Load text-only model and try multimodal input → mmproj not configured
+    println!("4. Testing multimodal input on text-only model...");
+    {
+        let settings = EmbeddingLlmRunnerSettings {
+            model_id: "Qwen/Qwen3-Embedding-0.6B-GGUF".to_string(),
+            use_cpu: true,
+            dtype: Some(DType::F32 as i32),
+            max_seq_length: 128,
+            model_type: ModelType::Gguf as i32,
+            model_files: vec!["Qwen3-Embedding-0.6B-Q4_K_M.gguf".to_string()],
+            tokenizer_model_id: None,
+            chunking_config: Some(HierarchicalChunkingConfig {
+                max_chunk_tokens: 64,
+                min_chunk_tokens: 8,
+                enable_paragraph_merging: true,
+                enable_sentence_splitting: true,
+                enable_forced_splitting: true,
+            }),
+            max_batch_size: Some(4),
+            gpu_device: None,
+            mtmd: None, // No mmproj configured
+        };
+
+        let mut settings_buf = Vec::new();
+        settings.encode(&mut settings_buf).expect("encode");
+
+        // Try to load - may fail if model not available
+        let load_result = plugin.load(settings_buf);
+        if load_result.is_err() {
+            println!("  ⚠ Skipping: model not available");
+        } else {
+            let args = EmbeddingArgs {
+                text: "Describe this".to_string(),
+                instruction: None,
+                normalize_embeddings: false,
+                medias: vec![MediaInput {
+                    kind: MediaKind::Image as i32,
+                    source: Some(Source::Encoded(vec![0xFF, 0xD8, 0xFF])),
+                    id: None,
+                }],
+                pooling_type: 0,
+            };
+            let mut buf = Vec::new();
+            args.encode(&mut buf).expect("encode");
+            let (result, _) = plugin.run(buf, HashMap::new());
+            assert!(result.is_err(), "Should fail with mmproj not configured");
+            let err_msg = result.unwrap_err().to_string();
+            assert!(
+                err_msg.contains("mmproj") || err_msg.contains("multimodal"),
+                "Expected mmproj/multimodal error, got: {err_msg}"
+            );
+            println!("  ✓ Correctly rejected multimodal input on text-only model");
+        }
+    }
+
+    println!("=== Multimodal Error Path Tests Completed ===");
 }
 
 #[tokio::test]

@@ -2,6 +2,8 @@ syntax = "proto3";
 
 package llama_cpp;
 
+import "llama_cpp/media_input.proto";
+
 message LlamaRunnerSettings {
     // The path or name to the model
     // if hf_repo is Some, the model is filename on huggingface
@@ -25,6 +27,10 @@ message LlamaRunnerSettings {
     optional bool use_flash_attention = 8;
     // system prompt before the user prompt
     optional string system_prompt = 9;
+
+    // Multimodal projector settings. When omitted, the runner operates in
+    // text-only mode (default; no behavior change from prior releases).
+    optional MtmdSettings mtmd = 10;
 
     // TODO
     // override some parameters of the model

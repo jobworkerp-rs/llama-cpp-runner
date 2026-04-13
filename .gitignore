@@ -24,3 +24,8 @@ logs/
 temp/
 tmp/
 .cargo/
+
+# Local development tool settings (Claude Code, etc.)
+.claude/
+AGENTS.md
+CLAUDE.md

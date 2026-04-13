@@ -133,7 +133,6 @@ async fn run_embedding_test_with_config(
             Some("Embed this mixed content:"),
             "Diary template",
         ),
-
     ];
 
     println!("\n5. Running embedding generation tests...");
@@ -320,6 +319,101 @@ async fn run_embedding_test_with_config(
         println!("   ✓ Consistency test passed");
     }
 
+    // 8. Detokenize round-trip test for the built-in llama.cpp tokenizer path.
+    // Regression guard for a bug where LlamaCppModel::detokenize only returned
+    // the first token and panicked on empty slices.
+    println!("\n8. Testing detokenize round-trip (built-in tokenizer)...");
+    {
+        let model_arc = embedder.model();
+        let model_guard = model_arc
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Failed to lock model for detokenize test"))?;
+
+        // Empty input must not panic and must return an empty string.
+        let empty = model_guard.detokenize(&[])?;
+        assert_eq!(empty, "", "detokenize of empty input must be empty string");
+        println!("   ✓ Empty input returns empty string");
+
+        // Multi-token round-trip: tokenize a phrase, detokenize it back, and
+        // confirm that more than just the first token's piece survives.
+        let source = "The quick brown fox jumps over the lazy dog";
+        let tokens = model_guard.tokenize(source, /* add_bos= */ false)?;
+        assert!(
+            tokens.len() >= 3,
+            "Expected the phrase to tokenize into >= 3 tokens, got {}",
+            tokens.len()
+        );
+        let decoded_all = model_guard.detokenize(&tokens)?;
+        let decoded_first_only = model_guard.detokenize(&tokens[..1])?;
+        assert!(
+            decoded_all.len() > decoded_first_only.len(),
+            "detokenize of full token list ({:?}) must be longer than first-token-only ({:?})",
+            decoded_all,
+            decoded_first_only
+        );
+        // Round-trip fidelity is tokenizer-dependent (leading spaces, special
+        // tokens, normalization), so we assert containment of a distinctive
+        // sub-phrase that cannot be produced by a single token of GGUF BPE.
+        let non_trivial_substrings = ["quick", "brown", "lazy"];
+        let matched = non_trivial_substrings
+            .iter()
+            .filter(|s| decoded_all.contains(**s))
+            .count();
+        assert!(
+            matched >= 1,
+            "Expected detokenized output to contain at least one of {:?}, got: {:?}",
+            non_trivial_substrings,
+            decoded_all
+        );
+        println!(
+            "   ✓ Round-trip decoded {} tokens -> {:?}",
+            tokens.len(),
+            decoded_all
+        );
+    }
+
+    // 9. Instruction no-op guarantee (EmbeddingArgs.instruction proto contract).
+    // Same text with/without instruction must produce the same embedding, since
+    // instruction is metadata and is not tokenized into the embedding input.
+    println!("\n9. Testing instruction no-op invariant...");
+    {
+        let text = "Hello world";
+        let without_inst = embedder
+            .generate_embeddings_with_positions(text, None, true, None)
+            .map_err(|e| anyhow::anyhow!("instruction no-op (without) failed: {e}"))?;
+        let with_inst = embedder
+            .generate_embeddings_with_positions(
+                text,
+                Some("Instruct: Given a web search query, retrieve relevant documents."),
+                true,
+                None,
+            )
+            .map_err(|e| anyhow::anyhow!("instruction no-op (with) failed: {e}"))?;
+        assert_eq!(
+            without_inst.len(),
+            with_inst.len(),
+            "instruction should not change the number of windows"
+        );
+        for (i, (a, b)) in without_inst.iter().zip(with_inst.iter()).enumerate() {
+            assert_eq!(
+                a.values.len(),
+                b.values.len(),
+                "embedding dim mismatch at window {i}"
+            );
+            let dot: f32 = a
+                .values
+                .iter()
+                .zip(b.values.iter())
+                .map(|(x, y)| x * y)
+                .sum();
+            assert!(
+                dot > 0.999,
+                "instruction must not change embedding (window {i}, cosine={dot:.6})"
+            );
+        }
+        println!("   ✓ instruction has no effect on embedding values");
+    }
+
     println!("   ✓ All tests passed for this configuration!");
 
     Ok(()) // Resultの返却を追加
@@ -442,6 +536,7 @@ fn get_test_model_configs() -> Vec<(&'static str, EmbeddingLlmRunnerSettings)> {
                 chunking_config: None,    // hierarchical chunkingなしで高速化
                 max_batch_size: Some(8),  // バッチ処理テスト用
                 gpu_device: None,
+                mtmd: None,
             },
         ),
         // 2. Qwen3-Embedding（最新embedding専用モデル、GGUF内蔵tokenizer）
@@ -464,6 +559,7 @@ fn get_test_model_configs() -> Vec<(&'static str, EmbeddingLlmRunnerSettings)> {
                 }),
                 max_batch_size: Some(6),
                 gpu_device: None,
+                mtmd: None,
             },
         ),
         // 3. Qwen3-Embedding + HuggingFace tokenizer組み合わせ
@@ -480,6 +576,7 @@ fn get_test_model_configs() -> Vec<(&'static str, EmbeddingLlmRunnerSettings)> {
                 chunking_config: None,   // hierarchical chunking無効テスト
                 max_batch_size: Some(2), // GPU用小さめバッチサイズ
                 gpu_device: None,
+                mtmd: None,
             },
         ),
     ]
@@ -503,8 +600,9 @@ async fn integration_test_qwen3_embedding_quick() {
         model_files: vec!["Qwen3-Embedding-4B-Q4_K_M.gguf".to_string()],
         tokenizer_model_id: None, // GGUF内蔵tokenizerのテスト
         chunking_config: None,
-                gpu_device: None,
+        gpu_device: None,
         max_batch_size: Some(4), // クイックテスト用バッチサイズ
+        mtmd: None,
     };
 
     println!("=== Qwen3-Embedding Quick Test ===");
@@ -539,6 +637,7 @@ async fn integration_test_qwen3_embedding_gguf_tokenizer() {
         }),
         max_batch_size: Some(4), // GGUF内蔵tokenizer用バッチサイズ
         gpu_device: None,
+        mtmd: None,
     };
 
     println!("=== Qwen3-Embedding with HuggingFace Tokenizer Test ===");
@@ -570,6 +669,7 @@ async fn integration_test_error_handling() {
         chunking_config: None,
         max_batch_size: Some(4),
         gpu_device: None,
+        mtmd: None,
     };
 
     // バックエンドの初期化
@@ -600,6 +700,7 @@ async fn integration_test_error_handling() {
         chunking_config: None,
         max_batch_size: Some(4),
         gpu_device: None,
+        mtmd: None,
     };
 
     println!("2. Testing invalid tokenizer...");
@@ -667,6 +768,7 @@ async fn test_hierarchical_chunking_and_batch_consistency() {
         }),
         max_batch_size: Some(1), // 個別処理用
         gpu_device: None,
+        mtmd: None,
     };
 
     // バックエンドの初期化
@@ -889,10 +991,12 @@ async fn integration_test_gpu_device_specification() {
         chunking_config: None,
         max_batch_size: Some(2),
         gpu_device: Some(0), // GPU 0を指定
+        mtmd: None,
     };
 
     println!("1. Testing with gpu_device=0...");
-    let result = LlamaCppEmbedder::new_from_settings_with_backend(&settings_gpu0, shared_backend.clone());
+    let result =
+        LlamaCppEmbedder::new_from_settings_with_backend(&settings_gpu0, shared_backend.clone());
     match result {
         Ok(_embedder) => {
             println!("   ✓ Successfully initialized with GPU device 0");
@@ -915,10 +1019,12 @@ async fn integration_test_gpu_device_specification() {
         chunking_config: None,
         max_batch_size: Some(2),
         gpu_device: None, // GPU指定なし（デフォルト）
+        mtmd: None,
     };
 
     println!("\n2. Testing with gpu_device=None (default)...");
-    let result = LlamaCppEmbedder::new_from_settings_with_backend(&settings_no_gpu, shared_backend.clone());
+    let result =
+        LlamaCppEmbedder::new_from_settings_with_backend(&settings_no_gpu, shared_backend.clone());
     match result {
         Ok(_embedder) => {
             println!("   ✓ Successfully initialized with default GPU device");
@@ -940,10 +1046,14 @@ async fn integration_test_gpu_device_specification() {
         chunking_config: None,
         max_batch_size: Some(2),
         gpu_device: Some(0), // CPUモードだが指定（警告が出るべき）
+        mtmd: None,
     };
 
     println!("\n3. Testing with use_cpu=true and gpu_device=0 (should warn)...");
-    let result = LlamaCppEmbedder::new_from_settings_with_backend(&settings_cpu_with_gpu, shared_backend.clone());
+    let result = LlamaCppEmbedder::new_from_settings_with_backend(
+        &settings_cpu_with_gpu,
+        shared_backend.clone(),
+    );
     match result {
         Ok(_embedder) => {
             println!("   ✓ Successfully initialized (GPU device ignored in CPU mode)");
@@ -965,12 +1075,161 @@ async fn integration_test_gpu_device_specification() {
         chunking_config: None,
         max_batch_size: Some(2),
         gpu_device: Some(-1), // 負の値は不正
+        mtmd: None,
     };
 
     println!("\n4. Testing with invalid gpu_device=-1 (should fail)...");
-    let result = LlamaCppEmbedder::new_from_settings_with_backend(&settings_invalid_gpu, shared_backend);
+    let result =
+        LlamaCppEmbedder::new_from_settings_with_backend(&settings_invalid_gpu, shared_backend);
     assert!(result.is_err(), "Should fail with invalid GPU device ID");
     println!("   ✓ Correctly rejected invalid GPU device ID");
 
     println!("\n=== GPU Device Specification Test Completed ===");
+}
+
+/// Multimodal embedding happy-path with a real model.
+///
+/// Requires gemma-4-E4B-it (downloaded from HuggingFace on first run).
+/// ```bash
+/// cargo test -p embedding-llm integration_test_multimodal_embedding \
+///     --release -- --ignored --test-threads=1 --nocapture
+/// ```
+#[tokio::test]
+#[ignore]
+async fn integration_test_multimodal_embedding() {
+    use embedding_llm::protobuf::embedding_llm::{EmbeddingLlmResult, PoolingType};
+    use jobworkerp_client::plugins::PluginRunner;
+    use jobworkerp_llama_protobuf::protobuf::llama_cpp::{
+        media_input::Source, MediaInput, MediaKind,
+    };
+    use prost::Message;
+    use std::collections::HashMap;
+
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .with_test_writer()
+        .try_init();
+
+    println!("=== Multimodal Embedding Integration Test ===");
+
+    // Use the test image shipped in the repo root.
+    let image_bytes =
+        std::fs::read(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../output.png"))
+            .expect("output.png should exist in repo root");
+
+    let settings = EmbeddingLlmRunnerSettings {
+        model_id: "unsloth/gemma-4-E4B-it-GGUF".to_string(),
+        use_cpu: false,
+        dtype: None,
+        max_seq_length: 2048,
+        model_type: ModelType::Gguf as i32,
+        model_files: vec!["gemma-4-E4B-it-Q4_K_M.gguf".to_string()],
+        tokenizer_model_id: None,
+        chunking_config: None,
+        max_batch_size: None,
+        gpu_device: None,
+        mtmd: Some(jobworkerp_llama_protobuf::MtmdSettings {
+            mmproj: "mmproj-F16.gguf".to_string(),
+            mmproj_hf_repo: Some("unsloth/gemma-4-E4B-it-GGUF".to_string()),
+            mmproj_use_gpu: None,
+            media_marker: None,
+            allow_url_fetch: false,
+            max_media_bytes: 10_000_000,
+            max_decoded_media_bytes: 100_000_000,
+            allowed_media_dirs: vec![],
+        }),
+    };
+
+    println!("1. Loading model with mmproj...");
+    let mut plugin =
+        embedding_llm::EmbeddingLlmRunnerPlugin::new().expect("Failed to create plugin");
+    let settings_bytes = prost::Message::encode_to_vec(&settings);
+    plugin
+        .load(settings_bytes)
+        .expect("Failed to load multimodal model");
+    println!("   ✓ Model loaded");
+
+    println!("2. Running text+image embedding...");
+    let args = embedding_llm::protobuf::embedding_llm::EmbeddingArgs {
+        text: "Describe this image".to_string(),
+        instruction: None,
+        normalize_embeddings: true,
+        medias: vec![MediaInput {
+            kind: MediaKind::Image as i32,
+            source: Some(Source::Encoded(image_bytes)),
+            id: None,
+        }],
+        pooling_type: PoolingType::Last as i32,
+    };
+    let args_bytes = prost::Message::encode_to_vec(&args);
+    let (result, _metadata) = plugin.run(args_bytes, HashMap::new());
+    let result_bytes = result.expect("Multimodal embedding should succeed");
+
+    let parsed = EmbeddingLlmResult::decode(result_bytes.as_slice()).expect("Should decode result");
+    assert_eq!(
+        parsed.embeddings.len(),
+        1,
+        "Should return 1 pooled embedding"
+    );
+
+    let embedding = &parsed.embeddings[0];
+    assert!(
+        !embedding.values.is_empty(),
+        "Embedding should not be empty"
+    );
+    assert!(
+        !embedding
+            .values
+            .iter()
+            .any(|v| v.is_nan() || v.is_infinite()),
+        "Embedding should not contain NaN or Inf"
+    );
+
+    let norm: f32 = embedding.values.iter().map(|x| x * x).sum::<f32>().sqrt();
+    assert!(
+        (norm - 1.0).abs() < 0.01,
+        "Normalized embedding should have unit norm, got {norm}"
+    );
+
+    println!(
+        "   ✓ Got embedding with {} dimensions, norm={:.4}",
+        embedding.values.len(),
+        norm
+    );
+
+    // Invalid pooling_type must be rejected explicitly instead of silently
+    // falling back to the model default. proto3 open-enum still lets unknown
+    // i32 values cross the wire, so the runner is expected to reject them
+    // via `PoolingType::try_from` at the run() entry point.
+    println!("3. Rejecting invalid pooling_type...");
+    for bad in [-1_i32, 5, 99] {
+        let bad_args = embedding_llm::protobuf::embedding_llm::EmbeddingArgs {
+            text: "Describe this image".to_string(),
+            instruction: None,
+            normalize_embeddings: true,
+            medias: vec![MediaInput {
+                kind: MediaKind::Image as i32,
+                // Re-use a tiny placeholder: the request must fail before
+                // decoding, so any small payload is fine. Use the same
+                // bytes we already have to avoid an extra fixture.
+                source: Some(Source::Encoded(vec![])),
+                id: None,
+            }],
+            pooling_type: bad,
+        };
+        let bad_bytes = prost::Message::encode_to_vec(&bad_args);
+        let (bad_result, _) = plugin.run(bad_bytes, HashMap::new());
+        assert!(
+            bad_result.is_err(),
+            "pooling_type={bad} must be rejected, got Ok"
+        );
+        let err_msg = format!("{:?}", bad_result.unwrap_err());
+        assert!(
+            err_msg.contains("pooling_type"),
+            "error must mention pooling_type, got: {err_msg}"
+        );
+        println!("   ✓ pooling_type={bad} rejected");
+    }
+
+    println!("=== Multimodal Embedding Integration Test Passed ===");
 }

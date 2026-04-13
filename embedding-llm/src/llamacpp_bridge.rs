@@ -5,9 +5,11 @@ use llama_cpp_2::{
     llama_backend::LlamaBackend,
     llama_batch::LlamaBatch,
     model::{params::LlamaModelParams, AddBos, LlamaModel},
+    mtmd::MtmdBitmap,
     token::LlamaToken,
 };
 use llama_cpp_sys_2::{LLAMA_FLASH_ATTN_TYPE_AUTO, LLAMA_FLASH_ATTN_TYPE_DISABLED};
+use mtmd_support::MtmdRuntime;
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -82,6 +84,7 @@ pub struct LlamaCppModel {
     vocab_size: usize,   // vocabulary size
     max_batch_size: u32, // maximum batch size for batch processing
     _use_cpu: bool,      // Store for potential future use
+    mtmd: Option<MtmdRuntime>,
 }
 
 impl LlamaCppModel {
@@ -107,7 +110,7 @@ impl LlamaCppModel {
             LlamaModelParams::default()
         } else {
             let mut params = LlamaModelParams::default().with_n_gpu_layers(1000); // Offload all layers to GPU
-            
+
             // GPU device specification (if provided)
             if let Some(device_id) = gpu_device {
                 if device_id < 0 {
@@ -216,6 +219,7 @@ impl LlamaCppModel {
             vocab_size,
             max_batch_size: optimal_batch_size,
             _use_cpu: use_cpu,
+            mtmd: None,
         })
     }
 
@@ -480,11 +484,28 @@ impl LlamaCppModel {
 
     /// トークンから文字列に変換
     pub fn detokenize(&self, tokens: &[u32]) -> Result<String> {
-        let llama_tokens: Vec<LlamaToken> =
-            tokens.iter().map(|&t| LlamaToken::new(t as i32)).collect();
-        self.model
-            .token_to_str(llama_tokens[0], llama_cpp_2::model::Special::Tokenize)
-            .map_err(|e| EmbeddingLlmError::tokenization(format!("Failed to detokenize: {e}")))
+        // Empty input is a valid no-op; previous implementation indexed
+        // llama_tokens[0] unconditionally and panicked on empty slices.
+        if tokens.is_empty() {
+            return Ok(String::new());
+        }
+        // One shared UTF-8 decoder across all tokens so continuation bytes
+        // split across consecutive pieces are reassembled correctly. The
+        // previous implementation only decoded llama_tokens[0] and discarded
+        // the rest, mirroring the bug fixed in reranker-runner.
+        let mut decoder = encoding_rs::UTF_8.new_decoder();
+        let mut result = String::new();
+        for &t in tokens {
+            let token = LlamaToken::new(t as i32);
+            let piece = self
+                .model
+                .token_to_piece(token, &mut decoder, /* special= */ true, None)
+                .map_err(|e| {
+                    EmbeddingLlmError::tokenization(format!("Failed to detokenize: {e}"))
+                })?;
+            result.push_str(&piece);
+        }
+        Ok(result)
     }
 
     /// embedding次元数を取得
@@ -512,9 +533,169 @@ impl LlamaCppModel {
         self.model.token_eos().0 as u32
     }
 
-    /// BOS token ID を取得  
+    /// BOS token ID を取得
     pub fn bos_token_id(&self) -> u32 {
         self.model.token_bos().0 as u32
+    }
+
+    // -- Multimodal support --------------------------------------------------
+
+    /// Initialize the multimodal projector. Call after model is loaded.
+    pub fn init_mtmd(
+        &mut self,
+        mmproj_path: &str,
+        mmproj_hf_repo: Option<&str>,
+        use_gpu: bool,
+        media_marker: Option<&str>,
+    ) -> Result<()> {
+        let resolved = match mmproj_hf_repo {
+            Some(repo) => {
+                let api = ApiBuilder::from_env()
+                    .with_progress(false)
+                    .build()
+                    .map_err(|e| EmbeddingLlmError::hf_hub(format!("HF API for mmproj: {e}")))?
+                    .model(repo.to_string());
+                api.get(mmproj_path)
+                    .map_err(|e| EmbeddingLlmError::hf_hub(format!("download mmproj: {e}")))?
+            }
+            None => PathBuf::from(mmproj_path),
+        };
+
+        let runtime = MtmdRuntime::from_settings(
+            resolved.to_string_lossy().as_ref(),
+            &self.model,
+            use_gpu,
+            media_marker,
+        )
+        .map_err(|e| EmbeddingLlmError::llamacpp(format!("mtmd init: {e}")))?;
+
+        self.mtmd = Some(runtime);
+        Ok(())
+    }
+
+    /// Access to the multimodal runtime (if initialized).
+    pub fn mtmd_ref(&self) -> Option<&MtmdRuntime> {
+        self.mtmd.as_ref()
+    }
+
+    /// Take ownership of the multimodal runtime out of the model.
+    /// Used during embedder construction to move the runtime to a place
+    /// where it can be accessed without holding the model lock.
+    pub fn take_mtmd(&mut self) -> Option<MtmdRuntime> {
+        self.mtmd.take()
+    }
+
+    /// Generate a pooled embedding via multimodal prefill.
+    ///
+    /// Creates a fresh context, runs `tokenize_and_prefill` to process the
+    /// combined text+media prompt, then extracts the pooled embedding from
+    /// sequence 0.
+    /// Generate a pooled embedding via multimodal prefill.
+    ///
+    /// The `MtmdRuntime` is passed in from the caller (held by
+    /// `LlamaCppEmbedder`) rather than read from `self.mtmd`, because
+    /// `take_mtmd()` moves the runtime out of the model during embedder
+    /// construction to reduce lock contention.
+    /// `pooling_type` maps to `EmbeddingArgs.pooling_type`:
+    ///   Unspecified -> model default (fallback to Last if None)
+    ///   None -> per-token: use embeddings_ith for last token
+    ///   Mean / Cls / Last -> pooled: use embeddings_seq_ith
+    ///
+    /// Out-of-range enum values are filtered at the `run()` entry point via
+    /// `PoolingType::try_from`, so this function trusts its input and the
+    /// match below is exhaustive without a defensive wildcard arm.
+    pub fn generate_multimodal_embedding(
+        &self,
+        mtmd: &MtmdRuntime,
+        prompt: &str,
+        bitmaps: &[MtmdBitmap],
+        normalize: bool,
+        pooling_type: crate::protobuf::embedding_llm::PoolingType,
+    ) -> Result<Vec<f32>> {
+        use crate::protobuf::embedding_llm::PoolingType;
+        use llama_cpp_2::context::params::LlamaPoolingType;
+
+        // Resolve effective pooling type from request + model default.
+        let effective_pooling = match pooling_type {
+            PoolingType::Unspecified => {
+                // Use model default, fallback to Last if None.
+                let model_default = self.ctx_params.pooling_type();
+                if matches!(model_default, LlamaPoolingType::None) {
+                    LlamaPoolingType::Last
+                } else {
+                    model_default
+                }
+            }
+            PoolingType::None => LlamaPoolingType::None,
+            PoolingType::Mean => LlamaPoolingType::Mean,
+            PoolingType::Cls => LlamaPoolingType::Cls,
+            PoolingType::Last => LlamaPoolingType::Last,
+        };
+
+        let mtmd_ctx_params = self.ctx_params.clone().with_pooling_type(effective_pooling);
+
+        let mut ctx = {
+            let backend_guard = self.backend.lock().map_err(|_| {
+                EmbeddingLlmError::llamacpp("Failed to acquire backend lock".to_string())
+            })?;
+            self.model
+                .new_context(&backend_guard, mtmd_ctx_params)
+                .map_err(|e| {
+                    EmbeddingLlmError::llamacpp(format!("Failed to create context: {e}"))
+                })?
+        };
+
+        let n_past = mtmd
+            .tokenize_and_prefill(&mut ctx, prompt, bitmaps, /* n_batch= */ 512)
+            .map_err(|e| EmbeddingLlmError::inference(format!("mtmd tokenize_and_prefill: {e}")))?;
+
+        let n_ctx = ctx.n_ctx() as i32;
+        if n_past > n_ctx {
+            return Err(EmbeddingLlmError::inference(format!(
+                "multimodal input exceeds context length: \
+                 prefill used {n_past} positions but context size is {n_ctx}. \
+                 Reduce input size or increase ctx_size."
+            )));
+        }
+
+        // Extract embedding according to the resolved pooling type.
+        let embeddings = if matches!(effective_pooling, LlamaPoolingType::None) {
+            // Per-token mode: get the last token's embedding.
+            ctx.embeddings_ith(n_past - 1).map_err(|e| {
+                EmbeddingLlmError::inference(format!(
+                    "embeddings_ith({}) after mtmd: {e:?}",
+                    n_past - 1
+                ))
+            })?
+        } else {
+            ctx.embeddings_seq_ith(0).map_err(|e| {
+                EmbeddingLlmError::inference(format!("embeddings_seq_ith(0) after mtmd: {e:?}"))
+            })?
+        };
+
+        let mut vec = embeddings.to_vec();
+
+        // Zero-vector guard (same check as text-only paths)
+        let norm_squared: f32 = vec.iter().map(|x| x * x).sum();
+        if norm_squared == 0.0 {
+            return Err(EmbeddingLlmError::inference(format!(
+                "Generated zero embedding vector from multimodal input! All {} values are zero.",
+                vec.len()
+            )));
+        }
+
+        if normalize {
+            let norm = norm_squared.sqrt();
+            vec.iter_mut().for_each(|x| *x /= norm);
+        }
+
+        debug!(
+            "multimodal embedding: dim={}, norm={}",
+            vec.len(),
+            norm_squared.sqrt()
+        );
+
+        Ok(vec)
     }
 }
 

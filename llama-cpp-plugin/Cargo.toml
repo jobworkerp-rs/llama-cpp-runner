@@ -3,8 +3,8 @@ name = "jobworkerp-llama-cpp-plugin"
 version = "0.1.0"
 edition = "2021"
 
-#[[bin]]
-#name = "sample"
+[[bin]]
+name = "sample"
 
 [lib]
 crate-type = ["dylib", "rlib"]
@@ -14,6 +14,7 @@ crate-type = ["dylib", "rlib"]
 [dependencies]
 jobworkerp-client = { path = "../modules/jobworkerp-client" }
 jobworkerp-llama-protobuf = { path = "../llama-protobuf" }
+mtmd-support = { path = "../mtmd-support" }
 
 anyhow = { workspace = true }
 async-trait = { workspace = true }
@@ -41,6 +42,8 @@ url = { workspace = true }
 default = []
 metal = ["llama-cpp-2/metal"]
 cuda = ["llama-cpp-2/cuda"]
-native = ["llama-cpp-2/native"]
+# `native` optimizations are now enabled by default in llama-cpp-2 >= 0.1.143.
+# This feature is kept as a no-op for backward compatibility.
+native = []
 dynamic-link = ["llama-cpp-2/dynamic-link"]
 openmp = ["llama-cpp-2/openmp"]

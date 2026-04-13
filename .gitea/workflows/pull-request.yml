@@ -21,7 +21,7 @@ jobs:
   test:
     runs-on: ubuntu-latest
     container:
-      image: gitea.sutr.app/servers/rust-gpu-build:20250926
+      image: gitea.sutr.app/servers/rust-gpu-build:main
       options: --gpus all
       env:
         NVIDIA_VISIBLE_DEVICES: all
@@ -55,7 +55,7 @@ jobs:
         head -1 ~/.ssh/id_ed25519
         tail -1 ~/.ssh/id_ed25519
       env:
-        SSH_KEY: ${{ secrets.SSH_PRIVATE_KEY }} 
+        SSH_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
     - name: Checkout code
       uses: actions/checkout@v4
       with:
@@ -85,3 +85,19 @@ jobs:
 
     - name: Run tests
       run: cargo test --release -- --test-threads=1
+
+    # Multimodal happy-path tests are marked #[ignore] because they pull
+    # real HF models. We still gate them on PR CI so breakage in the
+    # image/audio path cannot land on main unnoticed. Keep this aligned
+    # with the smoke step in main-merge.yml.
+    - name: Run multimodal smoke tests (ignored)
+      run: |
+        cargo test -p jobworkerp-llama-cpp-plugin \
+          test_multimodal_generation_with_real_model \
+          --release -- --ignored --test-threads=1 --nocapture
+        cargo test -p jobworkerp-llama-cpp-plugin \
+          test_multimodal_audio_generation \
+          --release -- --ignored --test-threads=1 --nocapture
+        cargo test -p embedding-llm \
+          integration_test_multimodal_embedding \
+          --release -- --ignored --test-threads=1 --nocapture

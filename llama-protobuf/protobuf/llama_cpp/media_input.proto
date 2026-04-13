@@ -1,0 +1,121 @@
+syntax = "proto3";
+
+package llama_cpp;
+
+// Media input shared by LlamaArg and EmbeddingArgs.
+// One MediaInput represents one media item that will be matched 1:1 with a
+// media marker ("<__media__>" by default) inside the prompt/text.
+//
+// The order of MediaInput items in the containing message MUST match the
+// appearance order of the markers in the text; mismatched counts will return
+// an error (mapped from MtmdTokenizeError::BitmapCountMismatch).
+message MediaInput {
+  // REQUIRED: media kind. This is a CONTRACT, not a hint.
+  // - The runner uses `kind` to perform capability checks against the loaded
+  //   mmproj (support_vision / support_audio) BEFORE decoding bytes.
+  // - If `kind` and the actual encoded bytes disagree (e.g. kind=IMAGE but
+  //   the bytes decode as audio), the runner returns InvalidArgument. It
+  //   never silently falls back to the detected type.
+  // - For `raw_image` / `raw_audio` sources, `kind` MUST match the oneof
+  //   arm; mismatch is InvalidArgument.
+  MediaKind kind = 1;
+
+  // Exactly one of the following fields must be set.
+  oneof source {
+    // Encoded file bytes (jpg/png/bmp/gif/... for image, wav/mp3/flac for
+    // audio). Format is auto-detected by llama.cpp (stb_image / miniaudio).
+    bytes encoded = 2;
+
+    // Local filesystem path readable by the plugin process.
+    // Useful when media is large and already on a shared volume.
+    string file_path = 3;
+
+    // URL to download from. Plugin fetches once and caches in-memory.
+    // SUPPORTED SCHEMES: http, https. Disabled by default — enable via
+    // MtmdSettings.allow_url_fetch. Phase 1 always rejects with
+    // UrlFetchDisabled regardless of allow_url_fetch.
+    string url = 4;
+
+    // Raw decoded data (advanced use: bypasses decoder).
+    // For image: RawImage { nx, ny, rgb bytes (len == nx*ny*3) }
+    // For audio: RawAudio { pcm_f32 (mono), sample_rate_hz }
+    RawImage raw_image = 5;
+    RawAudio raw_audio = 6;
+  }
+
+  // Optional stable identifier for KV-cache reuse across turns.
+  // When set, passed through to MtmdBitmap::set_id().
+  optional string id = 7;
+}
+
+enum MediaKind {
+  MEDIA_KIND_UNSPECIFIED = 0;
+  MEDIA_KIND_IMAGE = 1;
+  MEDIA_KIND_AUDIO = 2;
+}
+
+message RawImage {
+  uint32 nx = 1;              // width in pixels
+  uint32 ny = 2;              // height in pixels
+  bytes rgb = 3;              // packed RGB, length MUST equal nx*ny*3
+}
+
+message RawAudio {
+  // Mono PCM samples as IEEE-754 f32 (little-endian on the wire).
+  //
+  // sample_rate_hz MUST equal the rate expected by the loaded mmproj
+  // (queried at runtime via MtmdContext::get_audio_sample_rate(); Whisper-
+  // based encoders expect 16000). Mismatch is rejected with
+  // InvalidArgument — the runner does NOT resample. Callers are expected
+  // to resample upstream.
+  repeated float samples = 1;
+  uint32 sample_rate_hz = 2;
+  uint32 channels = 3;        // MUST be 1 (mono); anything else is rejected
+}
+
+// Multimodal projector settings shared by LlamaRunnerSettings and
+// EmbeddingLlmRunnerSettings. Defined here (not inside llama_cpp_runner.proto
+// or llm_runner_settings.proto) so that both runners import the SAME type
+// from llama-protobuf.
+message MtmdSettings {
+  // Local path or HF-repo filename for the mmproj.gguf file.
+  // Resolution rules mirror `LlamaRunnerSettings.model` / `hf_repo`.
+  string mmproj = 1;
+  optional string mmproj_hf_repo = 2;
+
+  // Whether to offload mmproj compute to GPU. Default true when GPU is
+  // available (mirrors `!disable_gpu`); set explicitly to override.
+  optional bool mmproj_use_gpu = 3;
+
+  // Override for the media marker token in prompts (default "<__media__>").
+  optional string media_marker = 4;
+
+  // Allow http/https fetch for MediaInput.url. Phase 1 ignores this flag
+  // and always returns UrlFetchDisabled (HTTP client intentionally not
+  // linked). Phase 2 will honor this flag.
+  bool allow_url_fetch = 5;
+
+  // Max media bytes accepted per MediaInput (0 = unlimited). DoS guard.
+  // For encoded/url/file_path paths this checks the compressed/on-disk
+  // size. Raw paths count the decoded buffer size.
+  // Recommended: set a non-zero value when allowing file_path sources,
+  // as local files can be arbitrarily large.
+  uint32 max_media_bytes = 6;
+
+  // Max decoded media bytes per MediaInput (0 = unlimited). Post-decode
+  // size check: rejects results where a small compressed file expanded
+  // into a large decoded buffer. Note that decoding itself may temporarily
+  // allocate memory up to the decoded size before this check runs;
+  // use max_media_bytes to limit compressed input size as a first line
+  // of defense. Checked after decode for encoded/file_path paths using
+  // the actual bitmap data length (nx*ny*3 for images, n_samples*4 for
+  // audio). Raw paths are unaffected (already checked by max_media_bytes).
+  uint64 max_decoded_media_bytes = 7;
+
+  // Allowed base directories for MediaInput.file_path. When non-empty,
+  // file_path sources are only accepted if their canonical path starts
+  // with one of these directories. When empty (default), file_path
+  // sources are rejected entirely for safety.
+  // Set to ["/"] to allow any path (not recommended in production).
+  repeated string allowed_media_dirs = 8;
+}

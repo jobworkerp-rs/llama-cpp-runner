@@ -4,6 +4,7 @@ members = [
     "modules/jobworkerp-client",
     "modules/command-utils",
     "llama-protobuf",
+    "mtmd-support",              # Shared multimodal projector runtime
     "llama-cpp-plugin",
     "embedding-llm",
     "reranker-runner",           # New: llama.cpp-based reranker
@@ -34,8 +35,9 @@ hf-hub = { version = "0.5" }
 itertools = { version = "0.14" }
 # llama-cpp-2 = { git = "https://github.com/utilityai/llama-cpp-rs", rev = "2822e3ae86a66b571cc6de371feefb938f4f1da7" }
 #llama-cpp-2 = { git = "https://github.com/utilityai/llama-cpp-rs", rev = "4d1df04fb28b247494849d018d55a7fcf42c0ee1" }
-llama-cpp-2 = { version = "0.1" }
-llama-cpp-sys-2 = { version = "0.1" }
+# `mtmd` feature enables the multimodal projector module used by image/audio inputs.
+llama-cpp-2 = { version = "0.1.143", features = ["mtmd"] }
+llama-cpp-sys-2 = { version = "0.1.143" }
 once_cell = { version = "1" }
 opentelemetry = "0.31"
 prost = { version = "0.14" }
