@@ -127,15 +127,41 @@ impl PluginRunner for LlamaCppPlugin {
         false
     }
     fn runner_settings_proto(&self) -> String {
-        include_str!("../../llama-protobuf/protobuf/llama_cpp/llama_cpp_runner.proto").to_string()
+        static RESOLVED: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        RESOLVED
+            .get_or_init(|| {
+                jobworkerp_llama_protobuf::proto_resolve::resolve_proto_imports(
+                    include_str!("../../llama-protobuf/protobuf/llama_cpp/llama_cpp_runner.proto"),
+                    &[jobworkerp_llama_protobuf::proto_resolve::MEDIA_INPUT_IMPORT],
+                )
+                .expect("LlamaCppPlugin: runner_settings_proto resolution failed")
+            })
+            .clone()
     }
     fn job_args_proto(&self) -> String {
-        include_str!("../../llama-protobuf/protobuf/llama_cpp/llama_cpp_arg.proto").to_string()
+        static RESOLVED: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        RESOLVED
+            .get_or_init(|| {
+                jobworkerp_llama_protobuf::proto_resolve::resolve_proto_imports(
+                    include_str!("../../llama-protobuf/protobuf/llama_cpp/llama_cpp_arg.proto"),
+                    &[jobworkerp_llama_protobuf::proto_resolve::MEDIA_INPUT_IMPORT],
+                )
+                .expect("LlamaCppPlugin: job_args_proto resolution failed")
+            })
+            .clone()
     }
     fn result_output_proto(&self) -> Option<String> {
-        // for prompt chain
+        static RESOLVED: std::sync::OnceLock<String> = std::sync::OnceLock::new();
         Some(
-            include_str!("../../llama-protobuf/protobuf/llama_cpp/llama_cpp_arg.proto").to_string(),
+            RESOLVED
+                .get_or_init(|| {
+                    jobworkerp_llama_protobuf::proto_resolve::resolve_proto_imports(
+                        include_str!("../../llama-protobuf/protobuf/llama_cpp/llama_cpp_arg.proto"),
+                        &[jobworkerp_llama_protobuf::proto_resolve::MEDIA_INPUT_IMPORT],
+                    )
+                    .expect("LlamaCppPlugin: result_output_proto resolution failed")
+                })
+                .clone(),
         )
     }
     fn settings_schema(&self) -> String {
@@ -226,5 +252,33 @@ Good luck in the competition and in advancing AI research!
             .unwrap();
         println!("response: {:?}", res.prompt);
         assert!(res.prompt.len() > 10 && res.prompt.len() < 4096);
+    }
+
+    #[test]
+    fn test_protobuf_schema_resolution() {
+        let plugin = LlamaCppPlugin::new();
+
+        let settings = plugin.runner_settings_proto();
+        assert!(
+            !settings.lines().any(|l| l.trim().starts_with("import ")),
+            "runner_settings_proto must not contain import statements"
+        );
+        assert!(settings.contains("message LlamaRunnerSettings"));
+        assert!(settings.contains("message MtmdSettings"));
+
+        let args = plugin.job_args_proto();
+        assert!(
+            !args.lines().any(|l| l.trim().starts_with("import ")),
+            "job_args_proto must not contain import statements"
+        );
+        assert!(args.contains("message LlamaArg"));
+        assert!(args.contains("message MediaInput"));
+
+        let result = plugin.result_output_proto().expect("result_output_proto");
+        assert!(
+            !result.lines().any(|l| l.trim().starts_with("import ")),
+            "result_output_proto must not contain import statements"
+        );
+        assert!(result.contains("message LlamaArg"));
     }
 }

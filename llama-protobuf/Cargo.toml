@@ -9,6 +9,11 @@ async-trait = { workspace = true }
 schemars = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 prost = { workspace = true }
+regex = { workspace = true }
+
+[dev-dependencies]
+command-utils = { path = "../modules/command-utils" }
+serde_json = { workspace = true }
 
 [build-dependencies]
 prost-build = { workspace = true }

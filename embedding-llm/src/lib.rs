@@ -323,11 +323,29 @@ impl PluginRunner for EmbeddingLlmRunnerPlugin {
     }
 
     fn runner_settings_proto(&self) -> String {
-        include_str!("../protobuf/llm_runner_settings.proto").to_string()
+        static RESOLVED: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        RESOLVED
+            .get_or_init(|| {
+                jobworkerp_llama_protobuf::proto_resolve::resolve_proto_imports(
+                    include_str!("../protobuf/llm_runner_settings.proto"),
+                    &[jobworkerp_llama_protobuf::proto_resolve::MEDIA_INPUT_IMPORT],
+                )
+                .expect("EmbeddingLlmRunner: runner_settings_proto resolution failed")
+            })
+            .clone()
     }
 
     fn job_args_proto(&self) -> String {
-        include_str!("../protobuf/embedding_args.proto").to_string()
+        static RESOLVED: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        RESOLVED
+            .get_or_init(|| {
+                jobworkerp_llama_protobuf::proto_resolve::resolve_proto_imports(
+                    include_str!("../protobuf/embedding_args.proto"),
+                    &[jobworkerp_llama_protobuf::proto_resolve::MEDIA_INPUT_IMPORT],
+                )
+                .expect("EmbeddingLlmRunner: job_args_proto resolution failed")
+            })
+            .clone()
     }
 
     fn result_output_proto(&self) -> Option<String> {
@@ -397,10 +415,20 @@ mod tests {
         let settings_proto = plugin.runner_settings_proto();
         assert!(!settings_proto.is_empty());
         assert!(settings_proto.contains("EmbeddingLlmRunnerSettings"));
+        assert!(
+            !settings_proto
+                .lines()
+                .any(|l| l.trim().starts_with("import ")),
+            "runner_settings_proto must not contain import statements"
+        );
 
         let args_proto = plugin.job_args_proto();
         assert!(!args_proto.is_empty());
         assert!(args_proto.contains("EmbeddingArgs"));
+        assert!(
+            !args_proto.lines().any(|l| l.trim().starts_with("import ")),
+            "job_args_proto must not contain import statements"
+        );
 
         let result_proto = plugin.result_output_proto();
         assert!(result_proto.is_some());
