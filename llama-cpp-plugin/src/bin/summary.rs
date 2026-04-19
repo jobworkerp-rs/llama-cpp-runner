@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use jobworkerp_client::plugins::PluginRunner;
 use jobworkerp_llama_cpp_plugin::LlamaCppPlugin;
 use jobworkerp_llama_protobuf::protobuf::llama_cpp::LlamaArg;

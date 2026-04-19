@@ -8,7 +8,7 @@ pub mod text_processing;
 pub mod token_position;
 pub mod tokenization;
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use command_utils::trace::Tracing;
 use jobworkerp_client::{
@@ -85,7 +85,9 @@ impl PluginRunner for EmbeddingLlmRunnerPlugin {
     }
 
     fn description(&self) -> String {
-        String::from("Generate text embeddings with positional information and optional instruction prefixes")
+        String::from(
+            "Generate text embeddings with positional information and optional instruction prefixes",
+        )
     }
 
     fn load(&mut self, settings: Vec<u8>) -> Result<()> {
@@ -366,7 +368,7 @@ impl PluginRunner for EmbeddingLlmRunnerPlugin {
 }
 
 // Plugin entry points
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn load_plugin() -> Box<dyn PluginRunner + Send + Sync> {
     std::panic::catch_unwind(|| {
         dotenvy::dotenv().ok();
@@ -389,7 +391,7 @@ pub extern "C" fn load_plugin() -> Box<dyn PluginRunner + Send + Sync> {
     })
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn free_plugin(ptr: Box<dyn PluginRunner + Send + Sync>) {
     drop(ptr);
 }

@@ -1,9 +1,9 @@
 use embedding_llm::{
+    EmbeddingLlmRunnerPlugin,
     protobuf::embedding_llm::{
         DType, EmbeddingArgs, EmbeddingLlmResult, EmbeddingLlmRunnerSettings,
         HierarchicalChunkingConfig, ModelType,
     },
-    EmbeddingLlmRunnerPlugin,
 };
 use jobworkerp_client::plugins::PluginRunner;
 use prost::Message;
@@ -240,9 +240,13 @@ async fn test_plugin_full_lifecycle_with_embedding_generation() {
                         let prev_embedding = &embedding_result.embeddings[i - 1];
                         // Current embedding should not start before previous one ends
                         // (allowing for overlap in sliding window)
-                        assert!(embedding.begin_position >= prev_embedding.begin_position,
-                               "Embedding {} begin position {} should not be before previous embedding's begin position {}",
-                               i, embedding.begin_position, prev_embedding.begin_position);
+                        assert!(
+                            embedding.begin_position >= prev_embedding.begin_position,
+                            "Embedding {} begin position {} should not be before previous embedding's begin position {}",
+                            i,
+                            embedding.begin_position,
+                            prev_embedding.begin_position
+                        );
                     }
                 }
 
@@ -477,7 +481,7 @@ async fn test_plugin_protobuf_schemas() {
 #[tokio::test]
 async fn test_plugin_multimodal_error_paths() {
     use jobworkerp_llama_protobuf::protobuf::llama_cpp::{
-        media_input::Source, MediaInput, MediaKind,
+        MediaInput, MediaKind, media_input::Source,
     };
 
     println!("=== Plugin Multimodal Error Path Tests ===");

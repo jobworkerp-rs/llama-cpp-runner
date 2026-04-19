@@ -77,7 +77,6 @@ pub enum FilePathDenied {
     IoError { path: String, reason: String },
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

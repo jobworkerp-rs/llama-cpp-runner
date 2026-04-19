@@ -4,8 +4,8 @@ use llama_cpp_2::{
     context::params::LlamaContextParams,
     llama_backend::LlamaBackend,
     llama_batch::LlamaBatch,
-    model::{params::LlamaModelParams, AddBos, LlamaModel},
-    token::{data::LlamaTokenData, LlamaToken},
+    model::{AddBos, LlamaModel, params::LlamaModelParams},
+    token::{LlamaToken, data::LlamaTokenData},
 };
 use std::num::NonZeroU32;
 use std::path::Path;

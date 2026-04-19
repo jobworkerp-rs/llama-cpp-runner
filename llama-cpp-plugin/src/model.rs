@@ -1,14 +1,14 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use hf_hub::api::sync::ApiBuilder;
 use jobworkerp_llama_protobuf::protobuf::llama_cpp::{LlamaArg, LlamaRunnerSettings, MediaInput};
 use llama_cpp_2::{
-    context::{params::LlamaContextParams, LlamaContext},
+    context::{LlamaContext, params::LlamaContextParams},
     ggml_time_us,
     llama_backend::LlamaBackend,
     llama_batch::LlamaBatch,
     model::{
-        params::{kv_overrides::ParamOverrideValue, LlamaModelParams},
         AddBos, LlamaChatMessage, LlamaModel,
+        params::{LlamaModelParams, kv_overrides::ParamOverrideValue},
     },
     sampling::LlamaSampler,
     token::LlamaToken,
@@ -759,8 +759,8 @@ mod tests {
     }
 
     fn dummy_media() -> MediaInput {
-        use jobworkerp_llama_protobuf::protobuf::llama_cpp::media_input::Source;
         use jobworkerp_llama_protobuf::protobuf::llama_cpp::MediaKind;
+        use jobworkerp_llama_protobuf::protobuf::llama_cpp::media_input::Source;
         MediaInput {
             kind: MediaKind::Image as i32,
             source: Some(Source::Encoded(vec![0xFF, 0xD8, 0xFF])),
@@ -830,8 +830,8 @@ mod tests {
     #[test]
     #[ignore]
     fn test_multimodal_generation_with_real_model() {
-        use jobworkerp_llama_protobuf::protobuf::llama_cpp::media_input::Source;
         use jobworkerp_llama_protobuf::protobuf::llama_cpp::MediaKind;
+        use jobworkerp_llama_protobuf::protobuf::llama_cpp::media_input::Source;
 
         // Use the test image shipped in the repo root.
         let image_bytes =
@@ -893,8 +893,8 @@ mod tests {
     #[test]
     #[ignore]
     fn test_multimodal_audio_generation() {
-        use jobworkerp_llama_protobuf::protobuf::llama_cpp::media_input::Source;
         use jobworkerp_llama_protobuf::protobuf::llama_cpp::MediaKind;
+        use jobworkerp_llama_protobuf::protobuf::llama_cpp::media_input::Source;
 
         let audio_bytes = std::fs::read(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../hello_test.wav"),

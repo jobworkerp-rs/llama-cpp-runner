@@ -1,6 +1,6 @@
 pub mod model;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use jobworkerp_client::{
     plugins::PluginRunner, schema_to_json_string, schema_to_json_string_option,
 };
@@ -11,7 +11,7 @@ use std::{collections::HashMap, io::Cursor};
 
 // suppress warn improper_ctypes_definitions
 #[allow(improper_ctypes_definitions)]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn load_plugin() -> Box<dyn PluginRunner + Send + Sync> {
     std::panic::catch_unwind(|| {
         dotenvy::dotenv().ok();
@@ -31,7 +31,7 @@ pub extern "C" fn load_plugin() -> Box<dyn PluginRunner + Send + Sync> {
     })
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[allow(improper_ctypes_definitions)]
 pub extern "C" fn free_plugin(ptr: Box<dyn PluginRunner + Send + Sync>) {
     drop(ptr);
@@ -79,7 +79,8 @@ impl PluginRunner for LlamaCppPlugin {
     }
     fn description(&self) -> String {
         String::from(
-            "LLMPromptRunner is a plugin that lets you run LLM models with your own prompts and custom settings",        )
+            "LLMPromptRunner is a plugin that lets you run LLM models with your own prompts and custom settings",
+        )
     }
     fn load(&mut self, settings: Vec<u8>) -> Result<()> {
         let settings = LlamaRunnerSettings::decode(&mut Cursor::new(settings))

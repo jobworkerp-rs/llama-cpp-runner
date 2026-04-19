@@ -4,7 +4,7 @@ use llama_cpp_2::{
     context::params::LlamaContextParams,
     llama_backend::LlamaBackend,
     llama_batch::LlamaBatch,
-    model::{params::LlamaModelParams, AddBos, LlamaModel},
+    model::{AddBos, LlamaModel, params::LlamaModelParams},
     mtmd::MtmdBitmap,
     token::LlamaToken,
 };
@@ -284,7 +284,7 @@ impl LlamaCppModel {
             Err(e) => {
                 return Err(EmbeddingLlmError::inference(format!(
                     "Failed to get sequence embeddings: {e:?}"
-                )))
+                )));
             }
         };
 
@@ -308,9 +308,10 @@ impl LlamaCppModel {
         debug!("  - L2 norm: {}", norm_squared.sqrt());
 
         if norm_squared == 0.0 {
-            return Err(EmbeddingLlmError::inference(
-                format!("Generated zero embedding vector! All {} values are zero. This indicates an issue with llama.cpp embedding computation.", embeddings.len())
-            ));
+            return Err(EmbeddingLlmError::inference(format!(
+                "Generated zero embedding vector! All {} values are zero. This indicates an issue with llama.cpp embedding computation.",
+                embeddings.len()
+            )));
         }
 
         Ok(embeddings.to_vec())
@@ -435,7 +436,7 @@ impl LlamaCppModel {
                 Err(e) => {
                     return Err(EmbeddingLlmError::inference(format!(
                         "Failed to get embeddings for sequence {seq_id}: {e:?}"
-                    )))
+                    )));
                 }
             };
 

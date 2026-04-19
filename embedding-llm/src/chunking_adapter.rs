@@ -3,7 +3,7 @@
 use crate::error::{EmbeddingLlmError, Result};
 use crate::tokenization::TokenizationProcessor;
 use command_utils::text::chunking::{
-    config::TokenProvider, HierarchicalChunk, HierarchicalChunker, HierarchicalChunkingConfig,
+    HierarchicalChunk, HierarchicalChunker, HierarchicalChunkingConfig, config::TokenProvider,
 };
 use std::sync::Arc;
 use tracing::{debug, info};

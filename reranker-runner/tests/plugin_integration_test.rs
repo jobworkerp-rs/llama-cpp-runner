@@ -4,10 +4,10 @@
 // without requiring actual GGUF model files.
 
 use jobworkerp_client::plugins::PluginRunner;
+use message_vectordb_reranker_runner::RerankerRunnerPlugin;
 use message_vectordb_reranker_runner::proto::{
     Candidate, RerankerArgs, RerankerOptions, RerankerResult, RerankerSettings,
 };
-use message_vectordb_reranker_runner::RerankerRunnerPlugin;
 use prost::Message;
 use std::collections::HashMap;
 

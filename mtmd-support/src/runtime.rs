@@ -6,7 +6,7 @@ use llama_cpp_2::{
     mtmd::{MtmdBitmap, MtmdContext, MtmdContextParams, MtmdInputChunks, MtmdInputText},
 };
 
-use jobworkerp_llama_protobuf::protobuf::llama_cpp::{media_input, MediaInput, MediaKind};
+use jobworkerp_llama_protobuf::protobuf::llama_cpp::{MediaInput, MediaKind, media_input};
 
 use crate::{error::MtmdError, limits::MediaLimits, marker::inject_markers};
 
