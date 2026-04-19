@@ -6,9 +6,13 @@ edition = "2021"
 [dependencies]
 anyhow = { workspace = true }
 async-trait = { workspace = true }
+command-utils = { path = "../modules/command-utils" }
 schemars = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 prost = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
 
 [build-dependencies]
 prost-build = { workspace = true }
