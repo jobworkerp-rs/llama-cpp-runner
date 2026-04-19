@@ -313,8 +313,8 @@ async fn test_reranker_with_cache() {
 
 #[tokio::test]
 #[ignore] // Requires model file
-          // NOTE: This test is disabled because llama.cpp backend can only be initialized once per process.
-          // Run CPU and GPU tests separately to compare performance.
+// NOTE: This test is disabled because llama.cpp backend can only be initialized once per process.
+// Run CPU and GPU tests separately to compare performance.
 async fn test_cpu_vs_gpu_performance() {
     eprintln!(
         "⚠️  This test is disabled: llama.cpp backend can only be initialized once per process."

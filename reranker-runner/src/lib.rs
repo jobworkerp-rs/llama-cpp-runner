@@ -4,7 +4,7 @@
 // and Qwen3-Reranker-4B-GGUF model, achieving 100-250x speedup over
 // the existing Candle-based implementation.
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use jobworkerp_client::{
     plugins::PluginRunner, schema_to_json_string, schema_to_json_string_option,
 };
@@ -417,7 +417,7 @@ mod plugin_exports {
     use super::*;
 
     #[allow(improper_ctypes_definitions)]
-    #[no_mangle]
+    #[unsafe(no_mangle)]
     pub extern "C" fn load_plugin() -> Box<dyn PluginRunner + Send + Sync> {
         std::panic::catch_unwind(|| {
             // Load environment variables
@@ -440,7 +440,7 @@ mod plugin_exports {
         })
     }
 
-    #[no_mangle]
+    #[unsafe(no_mangle)]
     #[allow(improper_ctypes_definitions)]
     pub extern "C" fn free_plugin(ptr: Box<dyn PluginRunner + Send + Sync>) {
         drop(ptr);

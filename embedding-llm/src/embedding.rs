@@ -61,7 +61,10 @@ impl LlamaCppEmbedder {
         let gpu_device = settings.gpu_device;
         if let Some(device_id) = gpu_device {
             if settings.use_cpu {
-                warn!("gpu_device={} is specified but use_cpu=true, GPU device setting will be ignored", device_id);
+                warn!(
+                    "gpu_device={} is specified but use_cpu=true, GPU device setting will be ignored",
+                    device_id
+                );
             } else {
                 info!("Using GPU device: {}", device_id);
             }
@@ -201,9 +204,9 @@ impl LlamaCppEmbedder {
                     Err(e) => {
                         // 3. GGUF内蔵tokenizerが失敗した場合はエラー
                         let err_msg = format!(
-                        "GGUF built-in tokenizer failed and no tokenizer_model_id specified. \
+                            "GGUF built-in tokenizer failed and no tokenizer_model_id specified. \
                          Either use a GGUF with built-in tokenizer or specify tokenizer_model_id. Error: {e}"
-                    );
+                        );
                         error!("{}", err_msg);
                         return Err(EmbeddingLlmError::configuration(err_msg));
                     }

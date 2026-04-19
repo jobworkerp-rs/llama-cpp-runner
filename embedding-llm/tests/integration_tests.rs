@@ -73,7 +73,10 @@ async fn run_embedding_test_with_config(
             embedder
         }
         Err(e) => {
-            panic!("✗ Failed to load model '{}': {}\n\nTroubleshooting:\n- Ensure network connectivity for HF models\n- Verify GGUF file format\n- Check available memory\n- Try CPU-only mode", settings.model_id, e);
+            panic!(
+                "✗ Failed to load model '{}': {}\n\nTroubleshooting:\n- Ensure network connectivity for HF models\n- Verify GGUF file format\n- Check available memory\n- Try CPU-only mode",
+                settings.model_id, e
+            );
         }
     };
 
@@ -128,8 +131,8 @@ async fn run_embedding_test_with_config(
             "Text with special characters",
         ),
         (
-            "プライベートワーク\n- 点数:  / 10\n- コメント:\n\t- 良かった点:\n\t- 改善したい点:\n(あれば)\n- 大
-切にしたいと感じたこととなぜそれが自分にとって大切か",
+            "あいうえお\n- 点数:  / 10\n- コメント:\n\t- 良かった点:\n\t- 続けたい点:\n(注)\n- 大
+切にしたいこと",
             Some("Embed this mixed content:"),
             "Diary template",
         ),
@@ -1100,7 +1103,7 @@ async fn integration_test_multimodal_embedding() {
     use embedding_llm::protobuf::embedding_llm::{EmbeddingLlmResult, PoolingType};
     use jobworkerp_client::plugins::PluginRunner;
     use jobworkerp_llama_protobuf::protobuf::llama_cpp::{
-        media_input::Source, MediaInput, MediaKind,
+        MediaInput, MediaKind, media_input::Source,
     };
     use prost::Message;
     use std::collections::HashMap;

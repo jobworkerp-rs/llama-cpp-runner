@@ -1,12 +1,12 @@
 // GGUF Qwen3-Reranker-4B validation test
 // Tests compatibility with llama-cpp-2 for reranking use case
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use llama_cpp_2::{
     context::params::LlamaContextParams,
     llama_backend::LlamaBackend,
     llama_batch::LlamaBatch,
-    model::{params::LlamaModelParams, AddBos, LlamaModel},
+    model::{AddBos, LlamaModel, params::LlamaModelParams},
     token::data::LlamaTokenData,
 };
 use std::path::Path;

@@ -15,7 +15,7 @@ resolver = "2"
 
 [workspace.package]
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 authors = ["sutr"]
 description = "Job-Worker plugin using llama"
 repository = "https://github.com/jobworkerp-rs/llama-plugins"
