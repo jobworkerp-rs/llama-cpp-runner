@@ -23,7 +23,7 @@ jobs:
         if: vars.BUILD_CONTAINER != ''
         run: |
           apt-get update
-          apt-get install -y curl git-lfs
+          apt-get install -y curl git-lfs jq
           curl -fsSL https://deb.nodesource.com/setup_lts.x | bash -
           apt-get install -y nodejs
 
@@ -122,13 +122,20 @@ jobs:
           fi
 
           mkdir -p artifacts
-          for f in target/release/lib*.so; do
-            if [ ! -f "$f" ]; then continue; fi
-            base=$(basename "$f" .so)
-            dest="artifacts/${base}${SUFFIX}-${PLATFORM}.so.xz"
+          LIBS=$(cargo metadata --no-deps --format-version=1 \
+            | jq -r '.packages[].targets[] | select(.kind[] == "cdylib" or .kind[] == "dylib") | .name' \
+            | sed 's/-/_/g')
+          for name in $LIBS; do
+            f="target/release/lib${name}.so"
+            if [ ! -f "$f" ]; then
+              echo "WARNING: expected $f not found, skipping"
+              continue
+            fi
+            dest="artifacts/${name}${SUFFIX}-${PLATFORM}.so.xz"
             xz -c -9 "$f" > "$dest"
             echo "Compressed: $f -> $dest ($(stat -c%s "$dest" 2>/dev/null || stat -f%z "$dest") bytes)"
           done
+          echo "Artifacts:"
           ls -lh artifacts/
 
       - name: Publish to GitHub Release
@@ -138,7 +145,6 @@ jobs:
           TOKEN="${{ secrets.GH_RELEASE_TOKEN || secrets.GITHUB_TOKEN }}"
           API="https://api.github.com/repos/${REPO}"
           AUTH="Authorization: token ${TOKEN}"
-          CUDA_CC="${{ vars.CUDA_COMPUTE_CAP }}"
 
           echo "Creating release for tag: ${TAG} on repo: ${REPO}"
           CREATE_RESP=$(curl -s -w "\n%{http_code}" -X POST "${API}/releases" \
@@ -188,15 +194,10 @@ jobs:
               echo "No existing asset found"
             fi
 
-            LABEL_PARAM=""
-            if [ -n "$CUDA_CC" ]; then
-              LABEL_PARAM="&label=cuda"
-            fi
-
             echo "Uploading $filename..."
             UPLOAD_HTTP=$(curl -s -o /tmp/upload_resp.json -w "%{http_code}" \
               --max-time 600 \
-              -X POST "${UPLOAD_URL}?name=${filename}${LABEL_PARAM}" \
+              -X POST "${UPLOAD_URL}?name=${filename}" \
               -H "${AUTH}" \
               -H "Content-Type: application/octet-stream" \
               --data-binary "@${f}")

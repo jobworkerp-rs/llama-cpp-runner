@@ -19,7 +19,8 @@ jobs:
         if: vars.BUILD_CONTAINER != ''
         run: |
           apt-get update
-          apt-get install -y curl
+          apt-get update
+          apt-get install -y curl jq
           curl -fsSL https://deb.nodesource.com/setup_lts.x | bash -
           apt-get install -y nodejs
 
