@@ -91,7 +91,7 @@ impl PluginRunner for EmbeddingLlmRunnerPlugin {
     }
 
     fn load(&mut self, settings: Vec<u8>) -> Result<()> {
-        command_utils::util::tracing::tracing_init_test(tracing::Level::DEBUG);
+        // command_utils::util::tracing::tracing_init_test(tracing::Level::DEBUG);
         let settings = protobuf::embedding_llm::EmbeddingLlmRunnerSettings::decode(&settings[..])?;
 
         // llama.cpp版の検証

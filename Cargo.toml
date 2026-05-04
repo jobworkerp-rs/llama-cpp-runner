@@ -32,12 +32,18 @@ encoding_rs = "0.8"
 envy = { version = "0.4" }
 futures = { version = "0.3" }
 hf-hub = { version = "0.5" }
+# Force OpenSSL to be statically linked (vendored) so the resulting plugin .so
+# does not depend on the host's libssl/libcrypto versions. Without this, the
+# build host's OpenSSL (e.g. 3.6 on Manjaro) leaks symbol-version requirements
+# (OPENSSL_3.2.0 / 3.3.0) that runtime images on Ubuntu 24.04 (OpenSSL 3.0.x)
+# cannot satisfy, causing dlopen() to fail at plugin load.
+openssl = { version = "0.10", features = ["vendored"] }
 itertools = { version = "0.14" }
 # llama-cpp-2 = { git = "https://github.com/utilityai/llama-cpp-rs", rev = "2822e3ae86a66b571cc6de371feefb938f4f1da7" }
 #llama-cpp-2 = { git = "https://github.com/utilityai/llama-cpp-rs", rev = "4d1df04fb28b247494849d018d55a7fcf42c0ee1" }
 # `mtmd` feature enables the multimodal projector module used by image/audio inputs.
-llama-cpp-2 = { version = "0.1.144", features = ["mtmd", "llguidance"] }
-llama-cpp-sys-2 = { version = "0.1.144" }
+llama-cpp-2 = { version = "0.1.146", features = ["mtmd", "llguidance"] }
+llama-cpp-sys-2 = { version = "0.1.146" }
 once_cell = { version = "1" }
 opentelemetry = "0.31"
 prost = { version = "0.14" }

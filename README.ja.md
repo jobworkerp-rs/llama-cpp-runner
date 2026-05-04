@@ -70,11 +70,19 @@ cargo clippy --workspace --all-targets
 - ハードウェアアクセラレーションは、対応crateで `cuda`、`metal`、`openmp` などの feature として提供しています。
 - 共有処理はプラグインcrateへ複製せず、`modules/` または専用補助crateへ集約してください。
 - protobuf 契約や公開プラグイン挙動を変更する場合は、関連するcrate単位のドキュメントも更新してください。
-- **CUDA ビルド時の NCCL リンク問題**: ビルドホストに `libnccl` がインストールされている場合、`llama-cpp-sys-2` は ggml-cuda に NCCL サポートをコンパイルしますが、対応するリンカ指示を出力しません。さらに Cargo の制限（[rust-lang/cargo#7506](https://github.com/rust-lang/cargo/issues/7506)）により、`build.rs` のリンク指示が `bin` ターゲットに伝播しないため、バイナリcrateのリンクが失敗します。回避策として、CUDA ビルド時に `RUSTFLAGS` へ `-C link-arg=-lnccl` を追加してください:
-  ```bash
-  RUSTFLAGS="-C relocation-model=pic -C link-arg=-lnccl" cargo build --release --features cuda
-  ```
-  この回避策は、`llama-cpp-sys-2` の `build.rs` が `cargo:rustc-link-lib=nccl` を出力するよう修正されるか、Cargo #7506 が解決された時点で不要になります。
+- **CUDA ビルド時の NCCL 依存問題**: ビルドホストに `libnccl` と `nccl.h` がインストールされている場合、`llama.cpp` の CMake が `find_package(NCCL)` で自動検出し、ggml-cuda に NCCL サポートをコンパイルします。これにより生成された `.so` は `libnccl.so.2` をロード時依存として持つため、NCCL がインストールされていない実行環境（例: `ghcr.io/jobworkerp-rs/grpc-front` イメージ）で `dlopen()` が失敗します。
+
+  本プロジェクトは現状 NCCL を使用しない（複数 GPU の集団通信を行わない）ため、以下のいずれかでビルド時に NCCL を検出させないことを推奨します:
+
+  1. ビルドホストから `libnccl*` と `nccl.h` を一時的に隠す（CI で採用）:
+     ```bash
+     sudo find /usr /opt/cuda /usr/local/cuda \( -name 'nccl.h' -o -name 'libnccl*' \) \
+       -exec mv {} {}.disabled-for-build \;
+     cargo build --release --features cuda
+     ```
+  2. または、ビルドホストに NCCL をインストールしない。
+
+  なお、`llama-cpp-sys-2` には NCCL を制御する Cargo feature がなく、外部から CMake オプション (`-DGGML_CUDA_NCCL=OFF`) を渡す手段も提供されていないため、上記の方法が現実的です。
 
 ## ライセンス
 

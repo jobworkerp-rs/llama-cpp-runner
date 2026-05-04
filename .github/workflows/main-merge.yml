@@ -34,16 +34,29 @@ jobs:
           echo "NVIDIA_DRIVER_CAPABILITIES=compute,utility" >> $GITHUB_ENV
           echo "NVIDIA_DISABLE_REQUIRE=true" >> $GITHUB_ENV
           echo "CUDA_COMPUTE_CAP=${{ vars.CUDA_COMPUTE_CAP }}" >> $GITHUB_ENV
-          # Workaround: llama-cpp-sys-2 builds ggml-cuda with NCCL support when
-          # libnccl is detected, but does not emit cargo:rustc-link-lib=nccl.
-          # Additionally, Cargo does not propagate build.rs link directives to
-          # bin targets when the crate also has a lib target (rust-lang/cargo#7506).
-          # This flag can be removed once llama-cpp-sys-2 fixes its build.rs to
-          # emit the missing link directive, or once Cargo #7506 is resolved.
-          echo "RUSTFLAGS=-C relocation-model=pic -C link-arg=-lnccl" >> $GITHUB_ENV
+          echo "RUSTFLAGS=-C relocation-model=pic" >> $GITHUB_ENV
           echo "CFLAGS=-fPIC" >> $GITHUB_ENV
           echo "CXXFLAGS=-fPIC" >> $GITHUB_ENV
           echo "CMAKE_POSITION_INDEPENDENT_CODE=ON" >> $GITHUB_ENV
+
+      # Hide NCCL from the build host so llama.cpp's CMake `find_package(NCCL)`
+      # fails and ggml-cuda is compiled without NCCL. Otherwise the resulting
+      # .so links libnccl.so.2, which is unavailable on runtime images such as
+      # ghcr.io/jobworkerp-rs/grpc-front and dlopen() fails at plugin load.
+      # NCCL is only needed for multi-GPU collective ops, which these plugins
+      # do not use.
+      - name: Disable NCCL detection for CUDA build
+        if: vars.CUDA_COMPUTE_CAP != ''
+        run: |
+          set -e
+          for header in $(find /usr /opt/cuda /usr/local/cuda -name 'nccl.h' 2>/dev/null); do
+            echo "Hiding NCCL header: $header"
+            mv "$header" "${header}.disabled-for-build"
+          done
+          for lib in $(find /usr /opt/cuda /usr/local/cuda -name 'libnccl*' 2>/dev/null); do
+            echo "Hiding NCCL library: $lib"
+            mv "$lib" "${lib}.disabled-for-build"
+          done
 
       - name: Checkout code
         uses: actions/checkout@v4

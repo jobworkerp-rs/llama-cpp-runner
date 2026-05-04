@@ -70,11 +70,19 @@ For iterative work, prefer validating the target crate first before running the 
 - Hardware acceleration is exposed through crate features such as `cuda`, `metal`, and `openmp` where supported.
 - Shared code should stay in `modules/` or dedicated helper crates instead of being copied into plugin crates.
 - If you change protobuf contracts or public plugin behavior, update the relevant crate-level documentation as well.
-- **CUDA build with NCCL**: When `libnccl` is installed on the build host, `llama-cpp-sys-2` compiles NCCL support into ggml-cuda but does not emit the corresponding linker directive. Combined with a Cargo limitation ([rust-lang/cargo#7506](https://github.com/rust-lang/cargo/issues/7506)) where `build.rs` link directives are not propagated to `bin` targets, binary crates will fail to link. As a workaround, add `-C link-arg=-lnccl` to `RUSTFLAGS` when building with CUDA:
-  ```bash
-  RUSTFLAGS="-C relocation-model=pic -C link-arg=-lnccl" cargo build --release --features cuda
-  ```
-  This workaround can be removed once `llama-cpp-sys-2` fixes its `build.rs` to emit `cargo:rustc-link-lib=nccl`, or once Cargo #7506 is resolved.
+- **CUDA build / NCCL runtime dependency**: When `libnccl` and `nccl.h` are installed on the build host, `llama.cpp`'s CMake auto-detects NCCL via `find_package(NCCL)` and compiles NCCL support into ggml-cuda. The resulting `.so` then has `libnccl.so.2` as a load-time dependency, so `dlopen()` will fail at plugin load on runtime images that do not ship NCCL (for example `ghcr.io/jobworkerp-rs/grpc-front`).
+
+  This project does not currently use NCCL (no multi-GPU collective operations), so we recommend hiding NCCL from CMake at build time with one of the following:
+
+  1. Temporarily move `libnccl*` and `nccl.h` out of the way on the build host (this is what CI does):
+     ```bash
+     sudo find /usr /opt/cuda /usr/local/cuda \( -name 'nccl.h' -o -name 'libnccl*' \) \
+       -exec mv {} {}.disabled-for-build \;
+     cargo build --release --features cuda
+     ```
+  2. Or simply do not install NCCL on the build host.
+
+  Note: `llama-cpp-sys-2` exposes no Cargo feature to disable NCCL and provides no way to forward an external CMake option (`-DGGML_CUDA_NCCL=OFF`) to the underlying build, so the approaches above are the practical workarounds today.
 
 ## License
 
