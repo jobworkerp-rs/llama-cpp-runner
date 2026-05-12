@@ -2,7 +2,8 @@ use anyhow::{Context, Result, anyhow, bail};
 use hf_hub::api::sync::ApiBuilder;
 use jobworkerp_llama_protobuf::protobuf::llama_cpp::{LlamaArg, LlamaRunnerSettings, MediaInput};
 use jobworkerp_llama_protobuf::protobuf::llm::{
-    LlmChatArgs, LlmChatResult, llm_chat_args, llm_chat_result,
+    LlmChatArgs, LlmChatResult, LlmCompletionArgs, LlmCompletionResult, llm_chat_args,
+    llm_chat_result, llm_completion_result,
 };
 use llama_cpp_2::{
     context::{LlamaContext, params::LlamaContextParams},
@@ -218,6 +219,15 @@ impl std::fmt::Debug for InferenceArgs {
 
 const DEFAULT_SAMPLER_SEED: u32 = 1234;
 
+/// Result of a single decode pass, carrying both the generated text and the
+/// token counts needed to populate `Usage` in chat/completion responses.
+#[derive(Debug, Clone)]
+pub struct DecodeOutput {
+    pub text: String,
+    pub prompt_tokens: u32,
+    pub completion_tokens: u32,
+}
+
 impl From<LlamaArg> for InferenceArgs {
     fn from(req: LlamaArg) -> Self {
         Self {
@@ -382,7 +392,7 @@ impl LlamaModelWrapper {
         };
 
         // tokenize the prompt
-        self.decode(args)
+        self.decode(args).map(|o| o.text)
     }
 
     fn check_token_length(
@@ -446,7 +456,7 @@ impl LlamaModelWrapper {
     //     Ok(())
     // }
 
-    fn decode(&mut self, args: InferenceArgs) -> Result<String> {
+    fn decode(&mut self, args: InferenceArgs) -> Result<DecodeOutput> {
         match (args.medias.is_empty(), self.mtmd.is_some()) {
             (true, _) => self.decode_text_only(args),
             (false, false) => bail!("multimodal input given but mmproj is not configured"),
@@ -454,33 +464,23 @@ impl LlamaModelWrapper {
         }
     }
 
-    fn decode_text_only(&mut self, args: InferenceArgs) -> Result<String> {
-        let chats = match (
-            LlamaChatMessage::new("system".to_string(), self.system_prompt.clone()),
-            LlamaChatMessage::new("user".to_string(), args.prompt.clone()),
-        ) {
-            (Ok(system), Ok(user)) => Some(vec![system, user]),
-            (e1, e2) => {
-                tracing::warn!("cannot create chat messages: {:?}, {:?}", e1, e2);
-                None
-            }
-        };
-        let prompt = if let Some(vec) = chats {
-            let tmpl = self.model.chat_template(None)?;
-            match self.model.apply_chat_template(&tmpl, vec.as_slice(), true) {
-                Ok(v) => {
-                    tracing::debug!("applied chat template: {}", &v);
-                    v
-                }
-                Err(e) => {
-                    tracing::warn!("cannot apply chat template (use simple prompt): {:?}", e);
-                    format!("{}\n\n{}", self.system_prompt, &args.prompt)
-                }
-            }
-        } else {
-            format!("{}\n\n{}", self.system_prompt, &args.prompt)
-        };
+    /// Legacy entry point: wraps the user prompt in a system+user chat template
+    /// (or falls back to plain concatenation) before delegating to the core
+    /// generation loop. Used by the `run` (LlamaArg) path.
+    fn decode_text_only(&mut self, args: InferenceArgs) -> Result<DecodeOutput> {
+        let formatted = self.format_single_turn(&args.prompt)?;
+        self.decode_text_only_core(&formatted, &args)
+    }
 
+    /// Core text-only generation loop. Receives a `formatted_prompt` that the
+    /// caller is responsible for templating; no chat template or system/user
+    /// wrapping happens here. This keeps `run_chat` / `run_completion` from
+    /// applying the template twice.
+    fn decode_text_only_core(
+        &mut self,
+        formatted_prompt: &str,
+        args: &InferenceArgs,
+    ) -> Result<DecodeOutput> {
         let mut ctx: LlamaContext = self
             .model
             .new_context(&self.backend, self.ctx_params.clone())
@@ -488,14 +488,18 @@ impl LlamaModelWrapper {
 
         let tokens_list = self
             .model
-            .str_to_token(&prompt, AddBos::Always)
+            .str_to_token(formatted_prompt, AddBos::Always)
             .with_context(|| "failed to tokenize prompt")?;
         let prompt_tokens = tokens_list.len() as i32;
 
+        // Cap the position budget at n_ctx so a default `max_new_tokens` of
+        // 4096 doesn't fail outright on small-context models. This mirrors
+        // the multimodal core path which already applies `.min(n_ctx)`.
+        let n_ctx = ctx.n_ctx() as i32;
         let n_len: i32 = if let Some(max_new) = args.max_new_tokens {
-            prompt_tokens + max_new
+            (prompt_tokens + max_new).min(n_ctx)
         } else {
-            args.sample_len.unwrap_or(4096)
+            args.sample_len.unwrap_or(4096).min(n_ctx)
         };
         self.check_token_length(&tokens_list, &ctx, n_len)?;
 
@@ -521,7 +525,7 @@ impl LlamaModelWrapper {
 
         // XXX assume string byte size 4
         let mut output_buffer = String::with_capacity((n_len * 4) as usize);
-        let mut sampler = self.build_sampler(&args)?;
+        let mut sampler = self.build_sampler(args)?;
 
         while n_cur < n_len {
             // sample the next token
@@ -597,22 +601,22 @@ impl LlamaModelWrapper {
 
         tracing::info!("{}", ctx.timings());
 
-        Ok(output_buffer)
+        Ok(DecodeOutput {
+            text: output_buffer,
+            prompt_tokens: prompt_tokens as u32,
+            completion_tokens: n_decode as u32,
+        })
     }
 
-    fn decode_multimodal(&mut self, args: InferenceArgs) -> Result<String> {
-        let max_new_tokens = args.max_new_tokens;
-
+    /// Legacy entry point: builds the user prompt with media markers, applies
+    /// the chat template (wrapping in system+user), and forwards to the
+    /// multimodal core. The system_prompt marker check is performed here so
+    /// that core callers (chat/completion) can skip it.
+    fn decode_multimodal(&mut self, args: InferenceArgs) -> Result<DecodeOutput> {
         let mtmd = self
             .mtmd
             .as_ref()
             .expect("mtmd should be Some in multimodal path");
-
-        let mut ctx: LlamaContext = self
-            .model
-            .new_context(&self.backend, self.ctx_params.clone())
-            .with_context(|| "unable to create context for multimodal")?;
-        let n_ctx = ctx.n_ctx() as i32;
 
         let bitmaps = mtmd
             .prepare_bitmaps(&args.medias, &self.media_limits)
@@ -631,64 +635,43 @@ impl LlamaModelWrapper {
             );
         }
 
-        // Build chat messages with markers inside the user turn.
-        // Use the same fallback strategy as the text-only path: if chat
-        // template application fails, fall back to simple concatenation.
-        let chats = match (
-            LlamaChatMessage::new("system".to_string(), self.system_prompt.clone()),
-            LlamaChatMessage::new("user".to_string(), prompt_with_markers.clone()),
-        ) {
-            (Ok(system), Ok(user)) => Some(vec![system, user]),
-            (e1, e2) => {
-                tracing::warn!(
-                    "cannot create chat messages in multimodal path: {:?}, {:?}",
-                    e1,
-                    e2
-                );
-                None
-            }
-        };
-        let formatted = if let Some(vec) = chats {
-            let tmpl = self.model.chat_template(None);
-            match tmpl {
-                Ok(tmpl) => match self.model.apply_chat_template(&tmpl, vec.as_slice(), true) {
-                    Ok(v) => {
-                        tracing::debug!("multimodal: applied chat template: {}", &v);
-                        v
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            "multimodal: cannot apply chat template (use simple prompt): {:?}",
-                            e
-                        );
-                        format!("{}\n\n{}", self.system_prompt, &prompt_with_markers)
-                    }
-                },
-                Err(e) => {
-                    tracing::warn!(
-                        "multimodal: cannot get chat template (use simple prompt): {:?}",
-                        e
-                    );
-                    format!("{}\n\n{}", self.system_prompt, &prompt_with_markers)
-                }
-            }
-        } else {
-            format!("{}\n\n{}", self.system_prompt, &prompt_with_markers)
-        };
+        // Markers are embedded inside the user prompt; chat template
+        // application preserves them so tokenize_and_prefill can match the
+        // marker count with bitmaps.len().
+        let formatted = self.format_single_turn(&prompt_with_markers)?;
+        self.decode_multimodal_core(&formatted, &bitmaps, &args)
+    }
 
-        tracing::debug!("multimodal formatted prompt: {}", &formatted);
+    /// Core multimodal generation loop. The caller must supply a
+    /// `formatted_prompt` that already contains the correct number of media
+    /// markers (matching `bitmaps.len()`); marker injection and chat template
+    /// application happen in the caller. Marker/bitmap mismatch surfaces as a
+    /// `Tokenize` error from `tokenize_and_prefill`.
+    fn decode_multimodal_core(
+        &mut self,
+        formatted_prompt: &str,
+        bitmaps: &[llama_cpp_2::mtmd::MtmdBitmap],
+        args: &InferenceArgs,
+    ) -> Result<DecodeOutput> {
+        let mtmd = self
+            .mtmd
+            .as_ref()
+            .expect("mtmd should be Some in multimodal path");
 
-        // Marker count is validated by inject_markers() on the user prompt.
-        // system_prompt markers are stripped above. The final formatted
-        // prompt should contain exactly bitmaps.len() markers; if not,
-        // tokenize_and_prefill() will return a Tokenize error.
+        let mut ctx: LlamaContext = self
+            .model
+            .new_context(&self.backend, self.ctx_params.clone())
+            .with_context(|| "unable to create context for multimodal")?;
+        let n_ctx = ctx.n_ctx() as i32;
+
+        tracing::debug!("multimodal formatted prompt: {}", formatted_prompt);
 
         // Prefill via mtmd (tokenize + eval_chunks)
         let n_past = mtmd
-            .tokenize_and_prefill(&mut ctx, &formatted, &bitmaps, /* n_batch= */ 512)
+            .tokenize_and_prefill(&mut ctx, formatted_prompt, bitmaps, /* n_batch= */ 512)
             .map_err(|e| anyhow::anyhow!(e).context("mtmd: tokenize_and_prefill"))?;
 
-        let n_len = if let Some(max_new) = max_new_tokens {
+        let n_len = if let Some(max_new) = args.max_new_tokens {
             (n_past + max_new).min(n_ctx)
         } else {
             args.sample_len.unwrap_or(4096).min(n_ctx)
@@ -703,7 +686,7 @@ impl LlamaModelWrapper {
         let mut batch = LlamaBatch::new(1, 1);
         let mut n_cur = n_past;
         let n_stop = n_len;
-        let mut sampler = self.build_sampler(&args)?;
+        let mut sampler = self.build_sampler(args)?;
         let mut decoder = encoding_rs::UTF_8.new_decoder();
         let mut output_buffer = String::with_capacity(((n_len - n_past) * 4) as usize);
         let mut first = true;
@@ -746,7 +729,11 @@ impl LlamaModelWrapper {
         );
         tracing::info!("{}", ctx.timings());
 
-        Ok(output_buffer)
+        Ok(DecodeOutput {
+            text: output_buffer,
+            prompt_tokens: n_past as u32,
+            completion_tokens: n_decode as u32,
+        })
     }
 
     pub fn run_chat(&mut self, args: LlmChatArgs) -> Result<LlmChatResult> {
@@ -765,10 +752,13 @@ impl LlamaModelWrapper {
         let extract_reasoning = options.extract_reasoning_content.unwrap_or(false);
 
         let (chat_messages, raw_messages, medias) = self.build_chat_messages(&args.messages)?;
-        let prompt = self.apply_chat_template_multi(&chat_messages, &raw_messages)?;
+        let formatted_prompt = self.apply_chat_template_multi(&chat_messages, &raw_messages)?;
 
+        // `prompt` is left empty and `medias` is empty because the core path
+        // consumes `formatted_prompt` and `bitmaps` directly; only the
+        // sampler/limits fields of InferenceArgs are read downstream.
         let inference_args = InferenceArgs {
-            prompt,
+            prompt: String::new(),
             sample_len: None,
             max_new_tokens: Some(options.max_tokens.unwrap_or(4096)),
             temperature: options.temperature.map(f64::from),
@@ -777,19 +767,30 @@ impl LlamaModelWrapper {
             repeat_last_n: options.repeat_last_n.map(|v| v as u32),
             seed: options.seed.map(|s| s as u32),
             json_schema: args.json_schema,
-            medias,
+            medias: Vec::new(),
         };
 
         let t_start = ggml_time_us();
-        let output = self.decode(inference_args)?;
+        let output: DecodeOutput = if medias.is_empty() {
+            self.decode_text_only_core(&formatted_prompt, &inference_args)?
+        } else {
+            let mtmd = self
+                .mtmd
+                .as_ref()
+                .context("multimodal input given but mmproj is not configured")?;
+            let bitmaps = mtmd
+                .prepare_bitmaps(&medias, &self.media_limits)
+                .map_err(|e| anyhow::anyhow!(e).context("mtmd: preparing bitmaps"))?;
+            self.decode_multimodal_core(&formatted_prompt, &bitmaps, &inference_args)?
+        };
         let t_end = ggml_time_us();
         let total_time = Duration::from_micros((t_end - t_start) as u64);
 
         // Split reasoning content from the output if requested
         let (text_content, reasoning_content) = if extract_reasoning {
-            Self::extract_reasoning(&output)
+            Self::extract_reasoning(&output.text)
         } else {
-            (output, None)
+            (output.text, None)
         };
 
         Ok(LlmChatResult {
@@ -802,8 +803,8 @@ impl LlamaModelWrapper {
             done: true,
             usage: Some(llm_chat_result::Usage {
                 model: String::new(),
-                prompt_tokens: None,
-                completion_tokens: None,
+                prompt_tokens: Some(output.prompt_tokens),
+                completion_tokens: Some(output.completion_tokens),
                 total_prompt_time_sec: None,
                 total_completion_time_sec: Some(total_time.as_secs_f32()),
             }),
@@ -811,6 +812,70 @@ impl LlamaModelWrapper {
             requires_tool_execution: None,
             tool_execution_results: vec![],
             tool_execution_started: None,
+        })
+    }
+
+    /// Execute a text-only completion request. Unlike `run_chat`, this method
+    /// does NOT accept media — multimodal callers must use the chat method.
+    /// `args.context.ollama_context` and `args.model` are accepted with a warn
+    /// (see `validate_completion_args`) so jobworkerp completion workers can
+    /// reuse their existing payload shape.
+    pub fn run_completion(&mut self, args: LlmCompletionArgs) -> Result<LlmCompletionResult> {
+        validate_completion_args(&args)?;
+
+        let options = args.options.unwrap_or_default();
+        let extract_reasoning = options.extract_reasoning_content.unwrap_or(false);
+
+        // Per-request system_prompt overrides the load-time one for this call
+        // only. `Some("")` is preserved as an explicit "no system message"
+        // signal so callers can disable the runner's default without changing
+        // runner state; `format_single_turn_inner` drops empty system content.
+        let sys = args
+            .system_prompt
+            .as_deref()
+            .unwrap_or(self.system_prompt.as_str());
+        let formatted_prompt = self.format_single_turn_inner(sys, &args.prompt)?;
+
+        let inference_args = InferenceArgs {
+            prompt: String::new(),
+            sample_len: None,
+            max_new_tokens: Some(options.max_tokens.unwrap_or(4096)),
+            temperature: options.temperature.map(f64::from),
+            top_p: options.top_p.map(f64::from),
+            repeat_penalty: options.repeat_penalty,
+            repeat_last_n: options.repeat_last_n.map(|v| v as u32),
+            seed: options.seed.map(|s| s as u32),
+            json_schema: args.json_schema,
+            medias: Vec::new(),
+        };
+
+        let t_start = ggml_time_us();
+        let output = self.decode_text_only_core(&formatted_prompt, &inference_args)?;
+        let t_end = ggml_time_us();
+        let total_time = Duration::from_micros((t_end - t_start) as u64);
+
+        let (text_content, reasoning_content) = if extract_reasoning {
+            Self::extract_reasoning(&output.text)
+        } else {
+            (output.text, None)
+        };
+
+        Ok(LlmCompletionResult {
+            content: Some(llm_completion_result::MessageContent {
+                content: Some(llm_completion_result::message_content::Content::Text(
+                    text_content,
+                )),
+            }),
+            reasoning_content,
+            done: true,
+            context: None,
+            usage: Some(llm_completion_result::Usage {
+                model: String::new(),
+                prompt_tokens: Some(output.prompt_tokens),
+                completion_tokens: Some(output.completion_tokens),
+                total_prompt_time_sec: None,
+                total_completion_time_sec: Some(total_time.as_secs_f32()),
+            }),
         })
     }
 
@@ -906,6 +971,38 @@ impl LlamaModelWrapper {
         Ok((chat_msgs, raw_msgs, medias))
     }
 
+    /// Format a single user turn using the model's chat template, preserving
+    /// the runner's load-time `system_prompt`. Used by the legacy `run` path
+    /// and multimodal generation, both of which lack an explicit per-request
+    /// system message.
+    fn format_single_turn(&self, user_prompt: &str) -> Result<String> {
+        self.format_single_turn_inner(self.system_prompt.as_str(), user_prompt)
+    }
+
+    /// Format a single user turn with an explicit system prompt. An empty
+    /// `system` is treated as "no system message" — common in completion
+    /// requests where the caller wants raw user continuation without the
+    /// runner's default system message.
+    fn format_single_turn_inner(&self, system: &str, user_prompt: &str) -> Result<String> {
+        let mut chat_msgs: Vec<LlamaChatMessage> = Vec::with_capacity(2);
+        let mut raw_msgs: Vec<(String, String)> = Vec::with_capacity(2);
+        if !system.is_empty() {
+            let sys_owned = system.to_string();
+            chat_msgs.push(
+                LlamaChatMessage::new("system".to_string(), sys_owned.clone())
+                    .map_err(|e| anyhow!("invalid system message: {e}"))?,
+            );
+            raw_msgs.push(("system".to_string(), sys_owned));
+        }
+        let user_owned = user_prompt.to_string();
+        chat_msgs.push(
+            LlamaChatMessage::new("user".to_string(), user_owned.clone())
+                .map_err(|e| anyhow!("invalid user message: {e}"))?,
+        );
+        raw_msgs.push(("user".to_string(), user_owned));
+        self.apply_chat_template_multi(&chat_msgs, &raw_msgs)
+    }
+
     fn apply_chat_template_multi(
         &self,
         messages: &[LlamaChatMessage],
@@ -946,18 +1043,31 @@ impl LlamaModelWrapper {
     }
 
     pub(crate) fn extract_reasoning(output: &str) -> (String, Option<String>) {
-        if let Some(start) = output.find("<think>") {
-            let after_open = start + 7;
-            if let Some(rel_end) = output[after_open..].find("</think>") {
-                let end = after_open + rel_end;
-                let reasoning = output[after_open..end].trim().to_string();
-                let mut text = String::with_capacity(output.len());
-                text.push_str(&output[..start]);
-                text.push_str(&output[end + 8..]);
-                return (text.trim().to_string(), Some(reasoning));
-            }
+        let Some(start) = output.find("<think>") else {
+            return (output.to_string(), None);
+        };
+        let after_open = start + 7;
+        if let Some(rel_end) = output[after_open..].find("</think>") {
+            let end = after_open + rel_end;
+            let reasoning = output[after_open..end].trim().to_string();
+            let mut text = String::with_capacity(output.len());
+            text.push_str(&output[..start]);
+            text.push_str(&output[end + 8..]);
+            return (text.trim().to_string(), Some(reasoning));
         }
-        (output.to_string(), None)
+        // Open <think> with no matching </think>: max_tokens cut off the
+        // reasoning block before the answer started. Treat the tail as
+        // reasoning so callers don't receive a half-open <think>...</think>
+        // structure in `content.text` and so the answer field stays empty
+        // (no answer was actually produced).
+        let reasoning = output[after_open..].trim().to_string();
+        let text = output[..start].trim().to_string();
+        let reasoning_opt = if reasoning.is_empty() {
+            None
+        } else {
+            Some(reasoning)
+        };
+        (text, reasoning_opt)
     }
 }
 
@@ -976,6 +1086,32 @@ fn token_to_piece_bytes_retry(
         }
         other => other,
     }
+}
+
+/// Validate `LlmCompletionArgs` independently of model loading state so that
+/// rejections (empty prompt, function calling) can be unit tested without a
+/// model. Warn-only fields (`model`, `context`) are observed here.
+pub fn validate_completion_args(args: &LlmCompletionArgs) -> Result<()> {
+    if args.prompt.is_empty() {
+        bail!("prompt is empty");
+    }
+    if let Some(fo) = &args.function_options
+        && fo.use_function_calling
+    {
+        bail!("function calling is not supported by this plugin");
+    }
+    if args.model.is_some() {
+        tracing::warn!(
+            "LLMCompletionArgs.model is ignored: model is fixed at load time in this plugin"
+        );
+    }
+    if args.context.is_some() {
+        tracing::warn!(
+            "ollama_context is ignored: llama-cpp completion does not preserve KV cache; \
+             use the chat method for multi-turn conversations"
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1297,5 +1433,72 @@ mod tests {
             result.ends_with("assistant:"),
             "fallback must end with assistant generation prefix"
         );
+    }
+
+    fn make_completion_args(prompt: &str) -> LlmCompletionArgs {
+        LlmCompletionArgs {
+            model: None,
+            system_prompt: None,
+            prompt: prompt.to_string(),
+            options: None,
+            context: None,
+            function_options: None,
+            json_schema: None,
+        }
+    }
+
+    #[test]
+    fn test_validate_completion_rejects_empty_prompt() {
+        let args = make_completion_args("");
+        let err = validate_completion_args(&args).expect_err("empty prompt must be rejected");
+        assert!(
+            err.to_string().contains("prompt is empty"),
+            "error message must mention 'prompt is empty': {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_completion_rejects_function_calling() {
+        use jobworkerp_llama_protobuf::protobuf::llm::llm_completion_args;
+        let mut args = make_completion_args("hi");
+        args.function_options = Some(llm_completion_args::FunctionOptions {
+            use_function_calling: true,
+            ..Default::default()
+        });
+        let err =
+            validate_completion_args(&args).expect_err("function_calling=true must be rejected");
+        assert!(
+            err.to_string().contains("function calling"),
+            "error message must mention 'function calling': {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_completion_accepts_ollama_context() {
+        use jobworkerp_llama_protobuf::protobuf::llm::llm_completion_args;
+        let mut args = make_completion_args("hi");
+        args.context = Some(llm_completion_args::GenerationContext {
+            context: Some(
+                llm_completion_args::generation_context::Context::OllamaContext(
+                    llm_completion_args::OllamaContext {
+                        data: vec![1, 2, 3],
+                    },
+                ),
+            ),
+        });
+        assert!(validate_completion_args(&args).is_ok());
+    }
+
+    #[test]
+    fn test_validate_completion_accepts_model_field() {
+        let mut args = make_completion_args("hi");
+        args.model = Some("override-model".to_string());
+        assert!(validate_completion_args(&args).is_ok());
+    }
+
+    #[test]
+    fn test_validate_completion_minimal_args_ok() {
+        let args = make_completion_args("hello");
+        assert!(validate_completion_args(&args).is_ok());
     }
 }

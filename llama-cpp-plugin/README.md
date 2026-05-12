@@ -6,10 +6,11 @@
 
 ## Overview
 
-This crate loads GGUF models through `llama.cpp` and exposes two execution methods through the JobworkerP plugin interface:
+This crate loads GGUF models through `llama.cpp` and exposes three execution methods through the JobworkerP plugin interface:
 
 - `run`: prompt-based text generation using the crate-specific `llama_cpp.LlamaArg`
 - `chat`: conversation-based generation using `jobworkerp.runner.llm.LLMChatArgs`
+- `completion`: single-turn text completion using `jobworkerp.runner.llm.LLMCompletionArgs`
 
 The protobuf definitions used by this crate live in `llama-protobuf/`, and shared support code lives in sibling crates such as `mtmd-support/` and `modules/jobworkerp-client/`.
 
@@ -18,6 +19,7 @@ The protobuf definitions used by this crate live in `llama-protobuf/`, and share
 - Loads local GGUF files or downloads model files from Hugging Face
 - Supports text generation with sampling controls
 - Supports chat-style requests with multi-turn messages
+- Supports single-prompt completion requests compatible with the jobworkerp Ollama/GenAI completion API
 - Supports tool calling via the chat method
 - Supports structured output through JSON Schema constraints
 - Supports multimodal inputs when `MtmdSettings` and media inputs are provided
@@ -48,6 +50,27 @@ Relevant protobuf:
 
 - args: `llama-protobuf/protobuf/jobworkerp/runner/llm/chat_args.proto`
 - result: `llama-protobuf/protobuf/jobworkerp/runner/llm/chat_result.proto`
+
+### `completion`
+
+The `completion` method accepts `jobworkerp.runner.llm.LLMCompletionArgs` and returns `jobworkerp.runner.llm.LLMCompletionResult`. It is intended for the single-turn "continue the prompt" use case and is wire-compatible with the jobworkerp Ollama/GenAI completion API.
+
+This method is text-only by design; multimodal inputs must use `chat`.
+
+Differences from the jobworkerp standard completion runner (Ollama / GenAI):
+
+| Field | jobworkerp standard | this plugin |
+|---|---|---|
+| `output_type` | `Both` (streaming + non-streaming) | `NonStreaming` |
+| `context.ollama_context` | persisted as KV cache | dropped with a warn (no KV cache reuse — use `chat` for multi-turn) |
+| `model` field | switchable per request | fixed at load time; warn and ignored |
+| `function_options.use_function_calling = true` | supported | rejected with an error |
+| multimodal input | text-only on both sides; use chat for media | text-only |
+
+Relevant protobuf:
+
+- args: `llama-protobuf/protobuf/jobworkerp/runner/llm/completion_args.proto`
+- result: `llama-protobuf/protobuf/jobworkerp/runner/llm/completion_result.proto`
 
 ## Runner Settings
 
