@@ -13,6 +13,8 @@ fn main() {
                 "llama_cpp/llama_cpp_arg.proto",
                 "jobworkerp/runner/llm/chat_args.proto",
                 "jobworkerp/runner/llm/chat_result.proto",
+                "jobworkerp/runner/llm/completion_args.proto",
+                "jobworkerp/runner/llm/completion_result.proto",
             ],
             &["./protobuf"],
         )

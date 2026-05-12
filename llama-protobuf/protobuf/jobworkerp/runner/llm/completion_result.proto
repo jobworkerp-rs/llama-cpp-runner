@@ -1,0 +1,51 @@
+syntax = "proto3";
+package jobworkerp.runner.llm;
+
+// Container for various LLM response formats
+message LLMCompletionResult {
+
+  // Usage statistics for a request
+  message Usage {
+    // The name of the model used for the completion.
+    string model = 1;
+    // The number of tokens used in the prompt.
+    optional uint32 prompt_tokens = 2;
+    // The number of tokens used in the completion.
+    optional uint32 completion_tokens = 3;
+    // The total seconds taken to process the request prompt.
+    optional float total_prompt_time_sec = 4;
+    // The total seconds taken to process the completion.
+    optional float total_completion_time_sec = 5;
+  }
+  // An encoding of a conversation returned by Ollama after a completion request
+  message OllamaContext { repeated int32 data = 1; }
+
+  message GenerationContext {
+    oneof context {
+      // The context returned by Ollama.
+      OllamaContext ollama = 1;
+    }
+  }
+
+  message MessageContent {
+    oneof content { string text = 1; }
+  }
+  // The response of the completion. This can be the entire completion or only
+  // a token if the completion is streaming.
+  optional MessageContent content = 1;
+
+  // The response of the reasoning content(think tag etc). This can be the
+  // entire completion or only
+  optional string reasoning_content = 2;
+
+  // Whether the completion is done. If the completion is streaming, this will
+  // be false until the last response.
+  bool done = 3;
+
+  // An encoding of the conversation used in this response, this can be sent in
+  // the next request to keep a conversational memory
+  optional GenerationContext context = 4;
+
+  // information about the inferencing process
+  optional Usage usage = 5;
+}

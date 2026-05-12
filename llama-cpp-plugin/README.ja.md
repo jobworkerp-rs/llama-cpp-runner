@@ -6,10 +6,11 @@
 
 ## 概要
 
-このcrateは、GGUF モデルを `llama.cpp` 経由で読み込み、JobworkerP のプラグインインターフェースへ 2 つの実行メソッドを公開します。
+このcrateは、GGUF モデルを `llama.cpp` 経由で読み込み、JobworkerP のプラグインインターフェースへ 3 つの実行メソッドを公開します。
 
 - `run`: このプラグイン独自の `llama_cpp.LlamaArg` を使う prompt ベース生成
 - `chat`: `jobworkerp.runner.llm.LLMChatArgs` を使う chat completion 互換の生成
+- `completion`: `jobworkerp.runner.llm.LLMCompletionArgs` を使う単一プロンプトの text completion
 
 このcrateが使う protobuf 定義は `llama-protobuf/` にあり、共通処理は `mtmd-support/` や `modules/jobworkerp-client/` などのcrateにあります。
 
@@ -18,6 +19,7 @@
 - ローカル GGUF ファイル、または Hugging Face から取得したモデルの読み込み
 - サンプリング設定付きのテキスト生成
 - 複数ターンの chat 形式リクエスト
+- jobworkerp Ollama / GenAI completion API 互換の単一プロンプト completion
 - chat メソッドでの tool calling
 - JSON Schema 制約による structured output
 - `MtmdSettings` と media input を使ったマルチモーダル入力
@@ -48,6 +50,27 @@
 
 - args: `llama-protobuf/protobuf/jobworkerp/runner/llm/chat_args.proto`
 - result: `llama-protobuf/protobuf/jobworkerp/runner/llm/chat_result.proto`
+
+### `completion`
+
+`completion` メソッドは `jobworkerp.runner.llm.LLMCompletionArgs` を受け取り、`jobworkerp.runner.llm.LLMCompletionResult` を返します。単一ターンの「プロンプトの続きを生成する」用途を想定しており、jobworkerp の Ollama / GenAI completion API とワイヤ互換です。
+
+multimodal 入力は本メソッドのスコープ外で、必要な場合は `chat` メソッドを使ってください。
+
+jobworkerp 標準 completion runner (Ollama / GenAI) との互換性差分:
+
+| 項目 | jobworkerp 標準 | 本プラグイン |
+|---|---|---|
+| `output_type` | `Both`(streaming + non-streaming) | `NonStreaming` |
+| `context.ollama_context` | KV キャッシュとして保持 | warn を出して捨てる(multi-turn は `chat` を利用) |
+| `model` フィールド | リクエストごとに切替可 | load 時固定。warn を出して無視 |
+| `function_options.use_function_calling = true` | 対応 | エラーで拒否 |
+| マルチモーダル入力 | completion 自体は両者とも text-only(chat 側で対応) | text-only |
+
+関連 protobuf:
+
+- args: `llama-protobuf/protobuf/jobworkerp/runner/llm/completion_args.proto`
+- result: `llama-protobuf/protobuf/jobworkerp/runner/llm/completion_result.proto`
 
 ## Runner Settings
 
