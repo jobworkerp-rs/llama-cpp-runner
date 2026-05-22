@@ -302,6 +302,12 @@ impl LlamaModelWrapper {
             } else {
                 LLAMA_FLASH_ATTN_TYPE_DISABLED
             });
+        // n_batch must cover the whole prompt (decoded in one call): the C++
+        // core aborts the process (GGML_ASSERT n_tokens_all <= n_batch) when a
+        // prompt exceeds n_batch, so keep it in step with n_ctx.
+        if let Some(n_ctx) = config.ctx_size {
+            ctx_params = ctx_params.with_n_batch(n_ctx.get());
+        }
         if let Some(threads) = config.threads {
             ctx_params = ctx_params.with_n_threads(threads as i32);
         }
@@ -503,7 +509,9 @@ impl LlamaModelWrapper {
         };
         self.check_token_length(&tokens_list, &ctx, n_len)?;
 
-        let mut batch = LlamaBatch::new(7542, 1);
+        // The prompt is decoded in one shot, so the batch must hold every
+        // token. check_token_length already bounds prompt_tokens by n_ctx.
+        let mut batch = LlamaBatch::new(prompt_tokens as usize, 1);
         let last_index: i32 = prompt_tokens - 1;
         for (i, token) in (0_i32..).zip(tokens_list) {
             batch.add(token, i, &[0], i == last_index)?;
@@ -1141,6 +1149,14 @@ mod tests {
             source: Some(Source::Encoded(vec![0xFF, 0xD8, 0xFF])),
             id: None,
         }
+    }
+
+    #[test]
+    fn with_n_batch_raises_batch_to_n_ctx() {
+        // Regression for the `GGML_ASSERT(n_tokens_all <= cparams.n_batch)`
+        // process abort when a prompt exceeds n_batch.
+        let p = LlamaContextParams::default().with_n_batch(262_144);
+        assert_eq!(p.n_batch(), 262_144);
     }
 
     #[test]
