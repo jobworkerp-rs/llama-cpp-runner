@@ -20,7 +20,7 @@ use llama_cpp_2::{
 use llama_cpp_sys_2::{LLAMA_FLASH_ATTN_TYPE_DISABLED, LLAMA_FLASH_ATTN_TYPE_ENABLED};
 use mtmd_support::{MediaLimits, MtmdRuntime};
 use serde::{Deserialize, Serialize};
-use std::{ffi::CString, num::NonZeroU32, path::PathBuf, time::Duration};
+use std::{ffi::CString, num::NonZeroU32, path::PathBuf, sync::OnceLock, time::Duration};
 
 /// for deserialization.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -245,9 +245,28 @@ impl From<LlamaArg> for InferenceArgs {
     }
 }
 
+/// `LlamaBackend::init()` may only succeed once per process (it guards a global
+/// atomic and errors on the second call). The plugin can build a new
+/// `LlamaModelWrapper` on every `load`, so the backend is shared process-wide
+/// rather than owned per wrapper. `LlamaBackend` is `Send + Sync` and only ever
+/// borrowed (`new_context`, `load_from_file`), so a `&'static` is sufficient.
+///
+/// `get_or_init` runs the closure exactly once even under races, so `init()` is
+/// never called twice and the stored backend is never dropped (which would reset
+/// the global atomic). A genuine init failure is fatal to the plugin, so it
+/// panics here and is caught by `catch_unwind` in the plugin loader.
+fn shared_backend() -> &'static LlamaBackend {
+    static BACKEND: OnceLock<LlamaBackend> = OnceLock::new();
+    BACKEND.get_or_init(|| {
+        let mut backend = LlamaBackend::init().expect("failed to init llama backend");
+        backend.void_logs();
+        backend
+    })
+}
+
 pub struct LlamaModelWrapper {
     model: LlamaModel,
-    backend: LlamaBackend,
+    backend: &'static LlamaBackend,
     ctx_params: LlamaContextParams,
     system_prompt: String,
     /// No Mutex needed: all access is through `&mut self` on `run()`,
@@ -258,8 +277,7 @@ pub struct LlamaModelWrapper {
 
 impl LlamaModelWrapper {
     pub fn new(config: LlamaModelConfig) -> Result<Self> {
-        let mut backend = LlamaBackend::init()?;
-        backend.void_logs();
+        let backend = shared_backend();
 
         let model_paths = config
             .get_or_load_model()
@@ -287,7 +305,7 @@ impl LlamaModelWrapper {
             }
         }
         let model = LlamaModel::load_from_file(
-            &backend,
+            backend,
             model_paths[0].as_ref() as &std::path::Path,
             &model_params,
         )
@@ -304,10 +322,13 @@ impl LlamaModelWrapper {
             });
         // n_batch must cover the whole prompt (decoded in one call): the C++
         // core aborts the process (GGML_ASSERT n_tokens_all <= n_batch) when a
-        // prompt exceeds n_batch, so keep it in step with n_ctx.
-        if let Some(n_ctx) = config.ctx_size {
-            ctx_params = ctx_params.with_n_batch(n_ctx.get());
-        }
+        // prompt exceeds n_batch. Keep it in step with the effective n_ctx,
+        // which falls back to the model's trained context when ctx_size is unset
+        // (with_n_ctx(None) lets llama.cpp adopt n_ctx_train).
+        let effective_n_ctx = config
+            .ctx_size
+            .map_or_else(|| model.n_ctx_train(), NonZeroU32::get);
+        ctx_params = ctx_params.with_n_batch(effective_n_ctx);
         if let Some(threads) = config.threads {
             ctx_params = ctx_params.with_n_threads(threads as i32);
         }
@@ -489,7 +510,7 @@ impl LlamaModelWrapper {
     ) -> Result<DecodeOutput> {
         let mut ctx: LlamaContext = self
             .model
-            .new_context(&self.backend, self.ctx_params.clone())
+            .new_context(self.backend, self.ctx_params.clone())
             .with_context(|| "unable to create the llama_context")?;
 
         let tokens_list = self
@@ -509,8 +530,11 @@ impl LlamaModelWrapper {
         };
         self.check_token_length(&tokens_list, &ctx, n_len)?;
 
-        // The prompt is decoded in one shot, so the batch must hold every
-        // token. check_token_length already bounds prompt_tokens by n_ctx.
+        // Allocate only for the prompt actually decoded here. Sizing to n_ctx
+        // would make llama_batch_init malloc per-token buffers for the full
+        // context (e.g. 262k) on every request, even for a few tokens. The
+        // ctx-level n_batch already permits the whole prompt in one decode; the
+        // generation loop below reuses this batch one token at a time.
         let mut batch = LlamaBatch::new(prompt_tokens as usize, 1);
         let last_index: i32 = prompt_tokens - 1;
         for (i, token) in (0_i32..).zip(tokens_list) {
@@ -668,15 +692,18 @@ impl LlamaModelWrapper {
 
         let mut ctx: LlamaContext = self
             .model
-            .new_context(&self.backend, self.ctx_params.clone())
+            .new_context(self.backend, self.ctx_params.clone())
             .with_context(|| "unable to create context for multimodal")?;
         let n_ctx = ctx.n_ctx() as i32;
+        // Use the context's configured n_batch (kept in step with n_ctx) so the
+        // prefill chunk size matches the text path instead of a fixed 512.
+        let n_batch = ctx.n_batch() as i32;
 
         tracing::debug!("multimodal formatted prompt: {}", formatted_prompt);
 
         // Prefill via mtmd (tokenize + eval_chunks)
         let n_past = mtmd
-            .tokenize_and_prefill(&mut ctx, formatted_prompt, bitmaps, /* n_batch= */ 512)
+            .tokenize_and_prefill(&mut ctx, formatted_prompt, bitmaps, n_batch)
             .map_err(|e| anyhow::anyhow!(e).context("mtmd: tokenize_and_prefill"))?;
 
         let n_len = if let Some(max_new) = args.max_new_tokens {
@@ -1157,6 +1184,21 @@ mod tests {
         // process abort when a prompt exceeds n_batch.
         let p = LlamaContextParams::default().with_n_batch(262_144);
         assert_eq!(p.n_batch(), 262_144);
+    }
+
+    #[test]
+    fn effective_n_ctx_falls_back_to_trained_context() {
+        // The n_batch sizing must cover the prompt even when ctx_size is unset:
+        // an explicit ctx_size wins, otherwise the model's trained context is
+        // used (the same value llama.cpp adopts for with_n_ctx(None)). Without
+        // the fallback, n_batch stays at the 2048 default and a longer prompt
+        // aborts the process. n_ctx_train() is stubbed here since loading a
+        // model is not possible in a unit test.
+        let pick = |ctx_size: Option<NonZeroU32>, n_ctx_train: u32| {
+            ctx_size.map_or(n_ctx_train, NonZeroU32::get)
+        };
+        assert_eq!(pick(NonZeroU32::new(8192), 4096), 8192);
+        assert_eq!(pick(None, 32_768), 32_768);
     }
 
     #[test]
