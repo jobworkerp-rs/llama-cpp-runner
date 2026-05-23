@@ -84,11 +84,47 @@ jobworkerp 標準 completion runner (Ollama / GenAI) との互換性差分:
 - `threads`: 生成時のスレッド数
 - `threads_batch`: prompt / batch 処理のスレッド数
 - `ctx_size`: コンテキストサイズ
+- `n_batch`: prompt 処理の論理バッチサイズ。プロンプト評価 (TTFT) に影響し、トークン毎の生成速度そのものには影響しません。**未指定時は実効コンテキスト長 (`ctx_size`、未指定ならモデルの学習時コンテキスト長) に揃えます**。これによりプロンプト全体を 1 回の decode で処理できます。
+- `n_ubatch`: 物理マイクロバッチサイズ。`n_batch` より小さくすると prompt 評価時のピークメモリを抑えられます。デフォルト挙動はバックエンド依存です。**Metal / ROCm ビルド時**は速度重視のため実効 `n_batch` に追従させますが、計算バッファ肥大を防ぐため上限 2048 で頭打ちにします (例: 実効 n_batch が 262144 でも n_ubatch は 2048)。それ以外のバックエンドは llama.cpp 既定値 (512) のままです。いずれも明示指定すれば常にその値が優先されます。
+- `type_k`: KV キャッシュの K 側データ型。未指定時は llama.cpp 既定値 (F16)。`KV_CACHE_TYPE_Q8_0` 等に量子化すると長コンテキストの KV キャッシュ使用量を削減できます。
+- `type_v`: KV キャッシュの V 側データ型。未指定時は llama.cpp 既定値 (F16)。**V 側の量子化は通常 flash attention が必須**です(`use_flash_attention` が無効だと warn を出します)。
 - `use_flash_attention`: 対応環境で flash attention を有効化
 - `system_prompt`: ランナー既定の system prompt
 - `mtmd`: マルチモーダル projector 設定
 
 `hf_repo` を省略した場合、`model` はローカルパスとして扱います。`hf_repo` を指定した場合は、Hugging Face からモデルを取得するか、既存キャッシュを再利用します。
+
+## 推論速度の計測と切り分け
+
+macOS (Metal) などで生成速度 (token/sec) が想定より遅い場合、まず原因を計測で切り分けてください。
+
+### 計測方法
+
+プラグイン経由 (`run` / `chat` / `completion`) で実行すると、`RUST_LOG=info` 時に以下のログが出力されます。
+
+- `context created in N s (n_batch=..., n_ubatch=...)`: リクエストごとの `LlamaContext` 生成 (KV キャッシュ確保) にかかった時間。Metal では毎リクエストでこのコストが発生します。
+- `decoded N tokens in N s, speed N t/s`: 実際のトークン生成速度。
+- `ctx.timings()`: llama.cpp が計測した prompt eval (プロンプト評価) と eval (生成) の内訳。
+
+### 切り分けの指針
+
+- **context 生成時間が支配的**: リクエストごとに新しい `LlamaContext` を生成しているため。短いプロンプト / 短い生成を繰り返す用途では特に顕著です。
+- **eval (生成) の token/sec 自体が低い**: Metal が実際に使われているか確認してください。`--features metal` 付きでビルドし、`disable_gpu` が `false` であることが前提です。
+- **prompt eval (TTFT) が遅い**: `n_batch` / `n_ubatch` の調整が効く余地があります。ただし既定値 (n_batch=2048) で十分大きいため、効果は限定的です。
+
+### ollama との比較
+
+同一モデル・同一プロンプトで `ollama run --verbose` を実行し、`eval rate` (token/sec) を本プラグインの `speed N t/s` と並べて比較すると、差がどのフェーズで生じているか判断しやすくなります。
+
+> 注意: `cargo run --bin sample` はプラグインとは別の独自コンテキスト構築・生成ループを使っており、上記のプラグイン用ログは出力されません。プラグインの挙動を計測したい場合は JobworkerP 経由で実行してください。
+
+### 超ロングコンテキスト (数万〜数十万 token) 向けチューニング
+
+巨大なコンテキスト (例: ctx_size=20万、入力数万 token) を Apple Silicon の unified memory で扱う場合、ボトルネックは prompt eval (大量の入力トークンの処理) と KV キャッシュのメモリ帯域に移ります。以下が効きます。
+
+- **`n_ubatch` を大きくする (例: 2048)**: 数万 token の入力は `n_ubatch` 単位のチャンクに分割して処理されます。`n_ubatch` を上げるとチャンク分割が減り、prefill が速くなります。Apple も大プロンプト処理で `-ub 2048` を推奨しています。**Metal / ROCm ビルドでは `n_ubatch` 未指定時に実効 `n_batch` へ自動追従 (上限 2048)** するため、明示設定しなくても 2048 になります。さらに上げたい場合は `n_ubatch` を明示指定してください (上限を超えられます)。代償は計算バッファのメモリ増ですが、unified memory に余裕があれば許容範囲です。
+- **KV キャッシュを量子化する (`type_k` / `type_v` = `KV_CACHE_TYPE_Q8_0`)**: 長コンテキストでは KV キャッシュが巨大になります。F16 → Q8_0 でフットプリントが半減し、メモリ帯域も削減できます。`type_v` の量子化には flash attention が必要です (本プラグインは既定で有効)。
+- **注意: `n_ubatch` は「大きいほど速い」ではありません**。GPU のキャッシュ特性に依存し、ある値で急に速くなったり遅くなったりします。M 系チップ・対象モデルでの最適値は `llama-bench` で 512 / 1024 / 2048 / 4096 をスイープして決めてください。`n_ubatch` ≤ `n_batch` の制約があります。
 
 ## ビルド
 
@@ -112,6 +148,12 @@ Metal ビルド:
 
 ```bash
 cargo build --release -p jobworkerp-llama-cpp-plugin --features metal
+```
+
+ROCm (AMD GPU) ビルド:
+
+```bash
+cargo build --release -p jobworkerp-llama-cpp-plugin --features rocm
 ```
 
 ## テストと静的解析

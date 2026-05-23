@@ -17,6 +17,7 @@ c-api = []
 # Hardware acceleration (llama.cpp features)
 cuda = ["llama-cpp-2/cuda"]
 metal = ["llama-cpp-2/metal"]
+rocm = ["llama-cpp-2/rocm"]
 openmp = ["llama-cpp-2/openmp"]
 
 [dependencies]

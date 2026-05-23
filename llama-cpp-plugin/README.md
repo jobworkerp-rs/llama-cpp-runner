@@ -84,11 +84,41 @@ Key fields:
 - `threads`: generation thread count
 - `threads_batch`: prompt and batch processing thread count
 - `ctx_size`: context window size
+- `n_batch`: logical batch size for prompt processing. Affects prompt evaluation (time-to-first-token), not per-token generation speed. **When omitted it is set to the effective context length** (`ctx_size`, or the model's trained context when unset) so the whole prompt fits in one decode.
+- `n_ubatch`: physical micro-batch size. Setting it lower than `n_batch` reduces peak memory during prompt eval. The default is backend-dependent: **Metal / ROCm builds** follow the effective `n_batch`, capped at 2048 to keep the compute buffer bounded (e.g. n_ubatch stays 2048 even when n_batch is 262144); other backends keep llama.cpp's default (512). An explicit value always wins.
+- `type_k`: KV cache data type for K. Defaults to the llama.cpp default (F16) when omitted. Quantizing (e.g. `KV_CACHE_TYPE_Q8_0`) reduces KV cache memory for long contexts.
+- `type_v`: KV cache data type for V. Defaults to the llama.cpp default (F16) when omitted. **V-cache quantization typically requires flash attention** (a warning is logged if `use_flash_attention` is disabled).
 - `use_flash_attention`: enables flash attention when supported
 - `system_prompt`: default system prompt applied by the runner
 - `mtmd`: multimodal projector settings
 
 If `hf_repo` is omitted, `model` is treated as a local path. If `hf_repo` is set, the plugin downloads or reuses cached model files from Hugging Face.
+
+## Diagnosing Inference Speed
+
+If generation speed (token/sec) is slower than expected (e.g. on macOS/Metal), measure first to isolate the cause. When running through the plugin (`run` / `chat` / `completion`) with `RUST_LOG=info`, the following logs are emitted:
+
+- `context created in N s (n_batch=..., n_ubatch=...)`: per-request `LlamaContext` creation (KV cache allocation). On Metal this cost is incurred on every request.
+- `decoded N tokens in N s, speed N t/s`: actual token generation speed.
+- `ctx.timings()`: llama.cpp's own breakdown of prompt eval vs. generation.
+
+Interpretation:
+
+- **Context creation dominates**: a fresh `LlamaContext` is created per request; pronounced for short prompt/short output workloads.
+- **Low eval token/sec**: verify Metal is actually used — build with `--features metal` and ensure `disable_gpu` is `false`.
+- **Slow prompt eval (TTFT)**: `n_batch` / `n_ubatch` may help, but the default (n_batch=2048) is already large, so the effect is limited.
+
+For comparison, run the same model and prompt with `ollama run --verbose` and compare its `eval rate` against the plugin's `speed N t/s`.
+
+> Note: `cargo run --bin sample` uses its own context setup and decode loop, separate from the plugin path, so the plugin logs above are not emitted there. Measure via JobworkerP to observe plugin behavior.
+
+### Tuning for very long contexts (tens of thousands of tokens)
+
+When handling huge contexts (e.g. ctx_size=200k with tens of thousands of input tokens) on Apple Silicon unified memory, the bottleneck shifts to prompt eval (processing the large input) and KV cache memory bandwidth. The following help:
+
+- **Raise `n_ubatch` (e.g. 2048)**: large inputs are processed in `n_ubatch`-sized chunks; a larger `n_ubatch` means fewer chunks and faster prefill. Apple recommends roughly `-ub 2048` for large-prompt processing. **Metal / ROCm builds auto-follow the effective `n_batch`, capped at 2048**, so you already get 2048 without setting anything; set `n_ubatch` explicitly to go higher (the cap is bypassed for explicit values). The cost is a larger compute buffer, acceptable with ample unified memory.
+- **Quantize the KV cache (`type_k` / `type_v` = `KV_CACHE_TYPE_Q8_0`)**: the KV cache grows large for long contexts; F16 → Q8_0 halves its footprint and reduces memory bandwidth. `type_v` quantization requires flash attention (enabled by default here).
+- **Caveat: bigger `n_ubatch` is not always faster** — the optimal value depends on GPU cache behavior and can collapse if set too high. Sweep 512 / 1024 / 2048 / 4096 with `llama-bench` on your hardware/model. Note `n_ubatch` ≤ `n_batch`.
 
 ## Build
 
@@ -112,6 +142,12 @@ Metal build:
 
 ```bash
 cargo build --release -p jobworkerp-llama-cpp-plugin --features metal
+```
+
+ROCm (AMD GPU) build:
+
+```bash
+cargo build --release -p jobworkerp-llama-cpp-plugin --features rocm
 ```
 
 ## Test And Lint

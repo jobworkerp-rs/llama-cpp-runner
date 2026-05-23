@@ -200,6 +200,8 @@ mod binary_compat_tests {
             "disableGpu": true,
             "seed": 42,
             "ctxSize": 4096,
+            "typeK": "KV_CACHE_TYPE_Q8_0",
+            "typeV": "KV_CACHE_TYPE_F16",
             "useFlashAttention": true,
             "systemPrompt": "You are helpful.",
             "mtmd": {
@@ -223,6 +225,14 @@ mod binary_compat_tests {
         assert!(decoded.disable_gpu);
         assert_eq!(decoded.seed, Some(42));
         assert_eq!(decoded.ctx_size, Some(4096));
+        assert_eq!(
+            decoded.type_k,
+            Some(crate::protobuf::llama_cpp::KvCacheType::Q80 as i32)
+        );
+        assert_eq!(
+            decoded.type_v,
+            Some(crate::protobuf::llama_cpp::KvCacheType::F16 as i32)
+        );
         assert_eq!(decoded.use_flash_attention, Some(true));
 
         let mtmd = decoded.mtmd.expect("mtmd present");
@@ -256,6 +266,10 @@ mod binary_compat_tests {
             threads: Some(4),
             threads_batch: Some(2),
             ctx_size: Some(2048),
+            n_batch: Some(1024),
+            n_ubatch: Some(256),
+            type_k: Some(crate::protobuf::llama_cpp::KvCacheType::Q80 as i32),
+            type_v: Some(crate::protobuf::llama_cpp::KvCacheType::Q80 as i32),
             use_flash_attention: Some(false),
             system_prompt: Some("Be concise.".into()),
             mtmd: Some(crate::protobuf::llama_cpp::MtmdSettings {
@@ -278,6 +292,10 @@ mod binary_compat_tests {
         assert_eq!(json["model"], "my-model.gguf");
         assert_eq!(json["hfRepo"], "user/model");
         assert_eq!(json["disableGpu"], true);
+        assert_eq!(json["nBatch"], 1024);
+        assert_eq!(json["nUbatch"], 256);
+        assert_eq!(json["typeK"], "KV_CACHE_TYPE_Q8_0");
+        assert_eq!(json["typeV"], "KV_CACHE_TYPE_Q8_0");
         assert_eq!(json["mtmd"]["mmproj"], "proj.gguf");
         assert_eq!(json["mtmd"]["allowUrlFetch"], true);
         assert_eq!(json["mtmd"]["maxMediaBytes"], 5000);

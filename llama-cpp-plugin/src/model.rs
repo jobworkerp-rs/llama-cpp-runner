@@ -6,7 +6,10 @@ use jobworkerp_llama_protobuf::protobuf::llm::{
     llm_chat_result, llm_completion_result,
 };
 use llama_cpp_2::{
-    context::{LlamaContext, params::LlamaContextParams},
+    context::{
+        LlamaContext,
+        params::{KvCacheType, LlamaContextParams},
+    },
     ggml_time_us,
     llama_backend::LlamaBackend,
     llama_batch::LlamaBatch,
@@ -68,6 +71,73 @@ impl From<ParamOverrideValueWrapper> for ParamOverrideValue {
 //     hf_model: Option<String>,
 // }
 
+/// Map a proto `KvCacheType` enum value to a `llama_cpp_2::KvCacheType`.
+/// Returns `None` for `UNSPECIFIED` (keep llama.cpp default F16) and for any
+/// unrecognized value (so an out-of-range int silently keeps the default
+/// rather than failing model load).
+fn proto_kv_cache_type(value: i32) -> Option<KvCacheType> {
+    use jobworkerp_llama_protobuf::protobuf::llama_cpp::KvCacheType as Proto;
+    let proto = Proto::try_from(value).ok()?;
+    let mapped = match proto {
+        Proto::Unspecified => return None,
+        Proto::F32 => KvCacheType::F32,
+        Proto::F16 => KvCacheType::F16,
+        Proto::Q40 => KvCacheType::Q4_0,
+        Proto::Q41 => KvCacheType::Q4_1,
+        Proto::Q50 => KvCacheType::Q5_0,
+        Proto::Q51 => KvCacheType::Q5_1,
+        Proto::Q80 => KvCacheType::Q8_0,
+        Proto::Q81 => KvCacheType::Q8_1,
+        Proto::Q2K => KvCacheType::Q2_K,
+        Proto::Q3K => KvCacheType::Q3_K,
+        Proto::Q4K => KvCacheType::Q4_K,
+        Proto::Q5K => KvCacheType::Q5_K,
+        Proto::Q6K => KvCacheType::Q6_K,
+        Proto::Q8K => KvCacheType::Q8_K,
+        Proto::Iq2Xxs => KvCacheType::IQ2_XXS,
+        Proto::Iq2Xs => KvCacheType::IQ2_XS,
+        Proto::Iq3Xxs => KvCacheType::IQ3_XXS,
+        Proto::Iq1S => KvCacheType::IQ1_S,
+        Proto::Iq4Nl => KvCacheType::IQ4_NL,
+        Proto::Iq3S => KvCacheType::IQ3_S,
+        Proto::Iq2S => KvCacheType::IQ2_S,
+        Proto::Iq4Xs => KvCacheType::IQ4_XS,
+        Proto::I8 => KvCacheType::I8,
+        Proto::I16 => KvCacheType::I16,
+        Proto::I32 => KvCacheType::I32,
+        Proto::I64 => KvCacheType::I64,
+        Proto::F64 => KvCacheType::F64,
+        Proto::Iq1M => KvCacheType::IQ1_M,
+        Proto::Bf16 => KvCacheType::BF16,
+        Proto::Tq10 => KvCacheType::TQ1_0,
+        Proto::Tq20 => KvCacheType::TQ2_0,
+        Proto::Mxfp4 => KvCacheType::MXFP4,
+    };
+    Some(mapped)
+}
+
+/// Normalize a batch-size setting, treating an explicit 0 as "unset".
+/// These fields arrive as proto `optional uint32`, so a caller can send 0.
+/// 0 is not a valid batch size: llama.cpp clamps n_batch to 0, after which
+/// chunked prefill (`tokens_list.chunks(n_batch)`) panics and the multimodal
+/// `eval_chunks` hits `GGML_ASSERT(n_batch > 0)`. Mirrors how ctx_size drops 0.
+fn normalize_batch_size(value: Option<u32>) -> Option<u32> {
+    value.filter(|&v| v != 0)
+}
+
+/// Resolve the n_ubatch to apply. An explicit value always wins. Otherwise, on
+/// GPU backends with large memory budgets (`gpu_default = true`), follow the
+/// effective n_batch (capped at [`MAX_AUTO_N_UBATCH`]) so prompt eval runs in a
+/// single large micro-batch; on other backends return `None` to keep llama.cpp's
+/// memory-conservative default (512).
+fn resolve_n_ubatch(
+    explicit_n_ubatch: Option<u32>,
+    effective_n_batch: u32,
+    gpu_default: bool,
+) -> Option<u32> {
+    explicit_n_ubatch.or_else(|| gpu_default.then(|| effective_n_batch.min(MAX_AUTO_N_UBATCH)))
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct LlamaModelConfig {
     /// The path or name to the model
@@ -90,6 +160,12 @@ pub struct LlamaModelConfig {
     threads_batch: Option<u32>,
     // size of the prompt context (default: model size)
     ctx_size: Option<NonZeroU32>,
+    n_batch: Option<u32>,
+    n_ubatch: Option<u32>,
+    // Raw proto `KvCacheType` enum values; converted to `llama_cpp_2::KvCacheType`
+    // via `proto_kv_cache_type` at context build time.
+    type_k: Option<i32>,
+    type_v: Option<i32>,
     // use flash attention (default true)
     use_flash_attention: Option<bool>,
     // system prompt before the user prompt
@@ -112,6 +188,10 @@ impl From<LlamaRunnerSettings> for LlamaModelConfig {
             threads: op.threads,
             threads_batch: op.threads_batch,
             ctx_size: op.ctx_size.and_then(NonZeroU32::new),
+            n_batch: op.n_batch,
+            n_ubatch: op.n_ubatch,
+            type_k: op.type_k,
+            type_v: op.type_v,
             use_flash_attention: op.use_flash_attention,
             system_prompt: op.system_prompt,
             mtmd: op.mtmd,
@@ -153,6 +233,10 @@ impl Default for LlamaModelConfig {
             threads: None,
             threads_batch: None,
             ctx_size: None,
+            n_batch: None,
+            n_ubatch: None,
+            type_k: None,
+            type_v: None,
             use_flash_attention: None,
             system_prompt: None,
             mtmd: None,
@@ -218,6 +302,13 @@ impl std::fmt::Debug for InferenceArgs {
 }
 
 const DEFAULT_SAMPLER_SEED: u32 = 1234;
+
+/// Upper bound for the auto-derived n_ubatch on Metal/ROCm. n_ubatch follows
+/// the effective n_batch but is capped here: a very large n_ctx (e.g. 262k)
+/// would otherwise blow up the per-ubatch compute buffer, and llama.cpp's own
+/// guidance is that prompt-eval throughput collapses past a few thousand. 2048
+/// matches Apple's recommended `-ub 2048` for large-prompt processing.
+const MAX_AUTO_N_UBATCH: u32 = 2048;
 
 /// Result of a single decode pass, carrying both the generated text and the
 /// token counts needed to populate `Usage` in chat/completion responses.
@@ -334,6 +425,37 @@ impl LlamaModelWrapper {
         }
         if let Some(threads_batch) = config.threads_batch.or(config.threads) {
             ctx_params = ctx_params.with_n_threads_batch(threads_batch as i32);
+        }
+        let n_batch = normalize_batch_size(config.n_batch);
+        let n_ubatch = normalize_batch_size(config.n_ubatch);
+        // The effective n_batch actually applied to the context: an explicit
+        // n_batch overrides the `with_n_batch(effective_n_ctx)` set above.
+        let effective_n_batch = n_batch.unwrap_or(effective_n_ctx);
+        if let Some(n_batch) = n_batch {
+            ctx_params = ctx_params.with_n_batch(n_batch);
+        }
+        let ubatch = resolve_n_ubatch(
+            n_ubatch,
+            effective_n_batch,
+            cfg!(any(feature = "metal", feature = "rocm")),
+        );
+        if let Some(n_ubatch) = ubatch {
+            ctx_params = ctx_params.with_n_ubatch(n_ubatch);
+        }
+        if let Some(type_k) = config.type_k.and_then(proto_kv_cache_type) {
+            ctx_params = ctx_params.with_type_k(type_k);
+        }
+        if let Some(type_v) = config.type_v.and_then(proto_kv_cache_type) {
+            // V-cache quantization requires flash attention on most backends
+            // (including Metal). Warn instead of failing so callers who know
+            // their backend supports it can still proceed.
+            if !config.use_flash_attention.unwrap_or(true) {
+                tracing::warn!(
+                    "type_v KV cache quantization typically requires flash attention, \
+                     but use_flash_attention is disabled — generation may fail or be slow"
+                );
+            }
+            ctx_params = ctx_params.with_type_v(type_v);
         }
 
         // Initialize multimodal projector when settings are provided.
@@ -508,10 +630,21 @@ impl LlamaModelWrapper {
         formatted_prompt: &str,
         args: &InferenceArgs,
     ) -> Result<DecodeOutput> {
+        // Per-request context creation reallocates the KV cache (and Metal
+        // command buffers on macOS). Log the cost so it can be weighed against
+        // prompt-eval / generation time from `ctx.timings()` when diagnosing
+        // throughput regressions.
+        let t_ctx_start = ggml_time_us();
         let mut ctx: LlamaContext = self
             .model
             .new_context(self.backend, self.ctx_params.clone())
             .with_context(|| "unable to create the llama_context")?;
+        tracing::info!(
+            "context created in {:.3} s (n_batch={}, n_ubatch={})",
+            Duration::from_micros((ggml_time_us() - t_ctx_start) as u64).as_secs_f32(),
+            ctx.n_batch(),
+            ctx.n_ubatch(),
+        );
 
         let tokens_list = self
             .model
@@ -530,24 +663,32 @@ impl LlamaModelWrapper {
         };
         self.check_token_length(&tokens_list, &ctx, n_len)?;
 
-        // Allocate only for the prompt actually decoded here. Sizing to n_ctx
-        // would make llama_batch_init malloc per-token buffers for the full
-        // context (e.g. 262k) on every request, even for a few tokens. The
-        // ctx-level n_batch already permits the whole prompt in one decode; the
-        // generation loop below reuses this batch one token at a time.
-        let mut batch = LlamaBatch::new(prompt_tokens as usize, 1);
+        // Prefill the prompt in chunks of at most `n_batch` tokens. A single
+        // `llama_decode` call asserts `n_tokens <= cparams.n_batch`, so a prompt
+        // longer than the effective n_batch (e.g. >2048 tokens by default) must
+        // be split — otherwise generation aborts. Mirrors the multimodal path
+        // and llama.cpp's own `mtmd_helper_eval_chunk_single`. Only the final
+        // token requests logits, for sampling the first generated token.
+        let n_batch = ctx.n_batch() as usize;
+        // Allocate only what a single chunk needs: capping at prompt_tokens
+        // avoids llama_batch_init mallocing n_batch-sized buffers for a short
+        // prompt, while never exceeding n_batch (the per-decode hard limit).
+        let mut batch = LlamaBatch::new(n_batch.min(prompt_tokens as usize), 1);
         let last_index: i32 = prompt_tokens - 1;
-        for (i, token) in (0_i32..).zip(tokens_list) {
-            batch.add(token, i, &[0], i == last_index)?;
+        let mut pos: i32 = 0;
+        for chunk in tokens_list.chunks(n_batch) {
+            batch.clear();
+            for &token in chunk {
+                batch.add(token, pos, &[0], pos == last_index)?;
+                pos += 1;
+            }
+            ctx.decode(&mut batch)
+                .with_context(|| "llama_decode() failed during prompt prefill")?;
         }
-
-        // first decode the prompt
-        ctx.decode(&mut batch)
-            .with_context(|| "llama_decode() failed")?;
 
         // main loop
 
-        let mut n_cur = batch.n_tokens();
+        let mut n_cur = prompt_tokens;
         let mut n_decode = 0;
 
         let t_main_start = ggml_time_us();
@@ -690,13 +831,24 @@ impl LlamaModelWrapper {
             .as_ref()
             .expect("mtmd should be Some in multimodal path");
 
+        // See `decode_text_only_core`: per-request context creation reallocates
+        // the KV cache; log the cost for throughput diagnosis.
+        let t_ctx_start = ggml_time_us();
         let mut ctx: LlamaContext = self
             .model
             .new_context(self.backend, self.ctx_params.clone())
             .with_context(|| "unable to create context for multimodal")?;
+        tracing::info!(
+            "context created in {:.3} s (n_batch={}, n_ubatch={})",
+            Duration::from_micros((ggml_time_us() - t_ctx_start) as u64).as_secs_f32(),
+            ctx.n_batch(),
+            ctx.n_ubatch(),
+        );
         let n_ctx = ctx.n_ctx() as i32;
-        // Use the context's configured n_batch (kept in step with n_ctx) so the
-        // prefill chunk size matches the text path instead of a fixed 512.
+        // Use the context's effective n_batch for prefill chunking so the
+        // configured n_batch is honored (matching the text path) instead of a
+        // fixed 512. It must not exceed cparams.n_batch: `llama_decode` asserts
+        // `n_tokens <= n_batch`, so a hardcoded larger value would abort.
         let n_batch = ctx.n_batch() as i32;
 
         tracing::debug!("multimodal formatted prompt: {}", formatted_prompt);
@@ -1253,6 +1405,158 @@ mod tests {
         assert_eq!(args.medias.len(), 2);
     }
 
+    /// Regression test: a prompt longer than the configured `n_batch` must be
+    /// prefilled in chunks. Before chunking, the single-batch decode tripped
+    /// `llama_decode`'s `n_tokens <= n_batch` assertion and aborted. Uses a
+    /// small `n_batch` so a short prompt already exceeds it.
+    ///
+    /// ```bash
+    /// cargo test -p jobworkerp-llama-cpp-plugin test_text_only_prompt_exceeding_n_batch \
+    ///     --release -- --ignored --test-threads=1 --nocapture
+    /// ```
+    #[test]
+    #[ignore]
+    fn test_text_only_prompt_exceeding_n_batch() {
+        let config = LlamaModelConfig {
+            // Force a tiny logical batch so the prompt below exceeds it and
+            // must be split across multiple decode calls.
+            n_batch: Some(8),
+            n_ubatch: Some(8),
+            ctx_size: std::num::NonZeroU32::new(2048),
+            ..LlamaModelConfig::default()
+        };
+        let mut wrapper = LlamaModelWrapper::new(config).expect("Failed to load model");
+
+        // This prompt tokenizes to well over 8 tokens, so prefill spans
+        // multiple n_batch-sized chunks.
+        let prompt = "The quick brown fox jumps over the lazy dog. \
+                      Please continue this sentence in a few words.";
+        let args = InferenceArgs {
+            prompt: prompt.to_string(),
+            sample_len: Some(64),
+            max_new_tokens: None,
+            temperature: None,
+            top_p: None,
+            repeat_penalty: None,
+            repeat_last_n: None,
+            seed: Some(1234),
+            json_schema: None,
+            medias: vec![],
+        };
+
+        let output = wrapper
+            .run(args)
+            .expect("chunked-prefill generation failed");
+        assert!(!output.is_empty(), "Output should not be empty");
+        println!("chunked-prefill output: {output}");
+    }
+
+    #[test]
+    fn test_runner_settings_maps_batch_fields_to_config() {
+        use jobworkerp_llama_protobuf::protobuf::llama_cpp::KvCacheType as ProtoKv;
+        let settings = LlamaRunnerSettings {
+            model: "m.gguf".to_string(),
+            hf_repo: None,
+            disable_gpu: false,
+            seed: None,
+            threads: None,
+            threads_batch: None,
+            ctx_size: None,
+            n_batch: Some(2048),
+            n_ubatch: Some(512),
+            type_k: Some(ProtoKv::Q80 as i32),
+            type_v: Some(ProtoKv::Q80 as i32),
+            use_flash_attention: None,
+            system_prompt: None,
+            mtmd: None,
+        };
+        let config: LlamaModelConfig = settings.into();
+        assert_eq!(config.n_batch, Some(2048));
+        assert_eq!(config.n_ubatch, Some(512));
+        assert_eq!(config.type_k, Some(ProtoKv::Q80 as i32));
+        assert_eq!(config.type_v, Some(ProtoKv::Q80 as i32));
+    }
+
+    #[test]
+    fn test_proto_kv_cache_type_conversion() {
+        use jobworkerp_llama_protobuf::protobuf::llama_cpp::KvCacheType as ProtoKv;
+        // UNSPECIFIED and out-of-range values map to None so the llama.cpp
+        // default (F16) is kept rather than failing model load.
+        assert_eq!(proto_kv_cache_type(ProtoKv::Unspecified as i32), None);
+        assert_eq!(proto_kv_cache_type(9999), None);
+        assert_eq!(
+            proto_kv_cache_type(ProtoKv::Q80 as i32),
+            Some(KvCacheType::Q8_0)
+        );
+        assert_eq!(
+            proto_kv_cache_type(ProtoKv::F16 as i32),
+            Some(KvCacheType::F16)
+        );
+        assert_eq!(
+            proto_kv_cache_type(ProtoKv::Q40 as i32),
+            Some(KvCacheType::Q4_0)
+        );
+    }
+
+    #[test]
+    fn test_context_params_reflect_kv_cache_type() {
+        // Mirror the builder chain in `LlamaModelWrapper::new`.
+        let params = LlamaContextParams::default()
+            .with_type_k(KvCacheType::Q8_0)
+            .with_type_v(KvCacheType::Q8_0);
+        assert_eq!(params.type_k(), KvCacheType::Q8_0);
+        assert_eq!(params.type_v(), KvCacheType::Q8_0);
+
+        let default = LlamaContextParams::default();
+        assert_eq!(default.type_k(), KvCacheType::F16);
+        assert_eq!(default.type_v(), KvCacheType::F16);
+    }
+
+    #[test]
+    fn test_context_params_reflect_batch_settings() {
+        // Mirror the builder chain in `LlamaModelWrapper::new`: only apply
+        // n_batch/n_ubatch when present, otherwise keep the crate default.
+        let with_batch = LlamaContextParams::default()
+            .with_n_batch(2048)
+            .with_n_ubatch(512);
+        assert_eq!(with_batch.n_batch(), 2048);
+        assert_eq!(with_batch.n_ubatch(), 512);
+
+        // Crate defaults: n_batch 2048, n_ubatch 512 — the plugin already
+        // benefits from these without any explicit tuning.
+        let default = LlamaContextParams::default();
+        assert_eq!(default.n_batch(), 2048);
+        assert_eq!(default.n_ubatch(), 512);
+    }
+
+    #[test]
+    fn test_normalize_batch_size_treats_zero_as_unset() {
+        // An explicit 0 must become None so it never reaches with_n_batch /
+        // chunked prefill, which would clamp to 0 and then panic.
+        assert_eq!(normalize_batch_size(Some(0)), None);
+        assert_eq!(normalize_batch_size(None), None);
+        assert_eq!(normalize_batch_size(Some(2048)), Some(2048));
+    }
+
+    #[test]
+    fn test_resolve_n_ubatch() {
+        // Explicit n_ubatch always wins, regardless of backend.
+        assert_eq!(resolve_n_ubatch(Some(1024), 8192, true), Some(1024));
+        assert_eq!(resolve_n_ubatch(Some(1024), 8192, false), Some(1024));
+
+        // Non-GPU backends keep the llama.cpp default (None → 512 downstream).
+        assert_eq!(resolve_n_ubatch(None, 8192, false), None);
+
+        // GPU backends follow the effective n_batch when it is small...
+        assert_eq!(resolve_n_ubatch(None, 1024, true), Some(1024));
+        // ...and cap at MAX_AUTO_N_UBATCH for a large n_ctx (e.g. 262k), so the
+        // compute buffer stays bounded.
+        assert_eq!(
+            resolve_n_ubatch(None, 262_144, true),
+            Some(MAX_AUTO_N_UBATCH)
+        );
+    }
+
     /// Multimodal generation happy-path with a real model.
     ///
     /// Requires gemma-4-E4B-it (downloaded from HuggingFace on first run).
@@ -1280,6 +1584,10 @@ mod tests {
             threads: None,
             threads_batch: None,
             ctx_size: std::num::NonZeroU32::new(2048),
+            n_batch: None,
+            n_ubatch: None,
+            type_k: None,
+            type_v: None,
             use_flash_attention: Some(true),
             system_prompt: Some("You are a helpful assistant.".to_string()),
             mtmd: Some(jobworkerp_llama_protobuf::MtmdSettings {
@@ -1346,6 +1654,10 @@ mod tests {
             threads: None,
             threads_batch: None,
             ctx_size: std::num::NonZeroU32::new(4096),
+            n_batch: None,
+            n_ubatch: None,
+            type_k: None,
+            type_v: None,
             use_flash_attention: Some(true),
             system_prompt: Some("You are a helpful assistant.".to_string()),
             mtmd: Some(jobworkerp_llama_protobuf::MtmdSettings {

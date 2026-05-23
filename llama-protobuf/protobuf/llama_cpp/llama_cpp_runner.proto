@@ -4,6 +4,46 @@ package llama_cpp;
 
 import "llama_cpp/media_input.proto";
 
+// GGML data type used for the KV cache (maps to llama-cpp-2 `KvCacheType`).
+// Quantizing the KV cache (e.g. Q8_0) shrinks its memory footprint, which
+// matters for very long contexts. UNSPECIFIED keeps the llama.cpp default
+// (F16). Note: V-cache quantization typically requires flash attention.
+enum KvCacheType {
+    KV_CACHE_TYPE_UNSPECIFIED = 0;
+    KV_CACHE_TYPE_F32 = 1;
+    KV_CACHE_TYPE_F16 = 2;
+    KV_CACHE_TYPE_Q4_0 = 3;
+    KV_CACHE_TYPE_Q4_1 = 4;
+    KV_CACHE_TYPE_Q5_0 = 5;
+    KV_CACHE_TYPE_Q5_1 = 6;
+    KV_CACHE_TYPE_Q8_0 = 7;
+    KV_CACHE_TYPE_Q8_1 = 8;
+    KV_CACHE_TYPE_Q2_K = 9;
+    KV_CACHE_TYPE_Q3_K = 10;
+    KV_CACHE_TYPE_Q4_K = 11;
+    KV_CACHE_TYPE_Q5_K = 12;
+    KV_CACHE_TYPE_Q6_K = 13;
+    KV_CACHE_TYPE_Q8_K = 14;
+    KV_CACHE_TYPE_IQ2_XXS = 15;
+    KV_CACHE_TYPE_IQ2_XS = 16;
+    KV_CACHE_TYPE_IQ3_XXS = 17;
+    KV_CACHE_TYPE_IQ1_S = 18;
+    KV_CACHE_TYPE_IQ4_NL = 19;
+    KV_CACHE_TYPE_IQ3_S = 20;
+    KV_CACHE_TYPE_IQ2_S = 21;
+    KV_CACHE_TYPE_IQ4_XS = 22;
+    KV_CACHE_TYPE_I8 = 23;
+    KV_CACHE_TYPE_I16 = 24;
+    KV_CACHE_TYPE_I32 = 25;
+    KV_CACHE_TYPE_I64 = 26;
+    KV_CACHE_TYPE_F64 = 27;
+    KV_CACHE_TYPE_IQ1_M = 28;
+    KV_CACHE_TYPE_BF16 = 29;
+    KV_CACHE_TYPE_TQ1_0 = 30;
+    KV_CACHE_TYPE_TQ2_0 = 31;
+    KV_CACHE_TYPE_MXFP4 = 32;
+}
+
 message LlamaRunnerSettings {
     // The path or name to the model
     // if hf_repo is Some, the model is filename on huggingface
@@ -31,6 +71,22 @@ message LlamaRunnerSettings {
     // Multimodal projector settings. When omitted, the runner operates in
     // text-only mode (default; no behavior change from prior releases).
     optional MtmdSettings mtmd = 10;
+
+    // Logical max batch size for prompt processing. Affects prompt evaluation
+    // (time-to-first-token), not per-token generation speed. When omitted, the
+    // llama.cpp default (2048) is used.
+    optional uint32 n_batch = 11;
+    // Physical max micro-batch size. When omitted, the llama.cpp default (512)
+    // is used. Lower than n_batch reduces peak memory during prompt eval.
+    optional uint32 n_ubatch = 12;
+
+    // KV cache data type for K. When omitted (UNSPECIFIED), the llama.cpp
+    // default (F16) is used. Quantizing (e.g. Q8_0) reduces KV cache memory
+    // for long contexts.
+    optional KvCacheType type_k = 13;
+    // KV cache data type for V. When omitted (UNSPECIFIED), the llama.cpp
+    // default (F16) is used. Quantizing V typically requires flash attention.
+    optional KvCacheType type_v = 14;
 
     // TODO
     // override some parameters of the model

@@ -47,6 +47,7 @@ base64 = "0.22.1"
 default = []
 metal = ["llama-cpp-2/metal"]
 cuda = ["llama-cpp-2/cuda"]
+rocm = ["llama-cpp-2/rocm"]
 # `native` optimizations are now enabled by default in llama-cpp-2 >= 0.1.143.
 # This feature is kept as a no-op for backward compatibility.
 native = []
