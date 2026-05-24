@@ -94,22 +94,22 @@ fn main() -> Result<()> {
     let mut no_token_id = None;
 
     for variant in &yes_variants {
-        if let Ok(tokens) = model.str_to_token(variant, AddBos::Never) {
-            if tokens.len() == 1 {
-                yes_token_id = Some(tokens[0]);
-                println!("✓ Found 'yes' token: '{}' -> ID {}", variant, tokens[0].0);
-                break;
-            }
+        if let Ok(tokens) = model.str_to_token(variant, AddBos::Never)
+            && tokens.len() == 1
+        {
+            yes_token_id = Some(tokens[0]);
+            println!("✓ Found 'yes' token: '{}' -> ID {}", variant, tokens[0].0);
+            break;
         }
     }
 
     for variant in &no_variants {
-        if let Ok(tokens) = model.str_to_token(variant, AddBos::Never) {
-            if tokens.len() == 1 {
-                no_token_id = Some(tokens[0]);
-                println!("✓ Found 'no' token: '{}' -> ID {}", variant, tokens[0].0);
-                break;
-            }
+        if let Ok(tokens) = model.str_to_token(variant, AddBos::Never)
+            && tokens.len() == 1
+        {
+            no_token_id = Some(tokens[0]);
+            println!("✓ Found 'no' token: '{}' -> ID {}", variant, tokens[0].0);
+            break;
         }
     }
 

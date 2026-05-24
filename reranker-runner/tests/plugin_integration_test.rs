@@ -277,8 +277,8 @@ fn test_plugin_run_without_load() {
     // Should return an error (plugin not loaded)
     // Note: The current implementation may not check for plugin load state
     // before attempting to run. If it doesn't return an error, that's also acceptable.
-    if result.is_err() {
-        println!("Expected error: {:?}", result.unwrap_err());
+    if let Err(e) = result {
+        println!("Expected error: {e:?}");
     } else {
         println!("Plugin ran without explicit load check - implementation accepts this");
     }
@@ -308,8 +308,8 @@ fn test_empty_query_handling() {
     let (result, _) = plugin.run(buf, HashMap::new());
 
     // The error could be from not being loaded or from empty query validation
-    if result.is_err() {
-        println!("Error as expected: {:?}", result.unwrap_err());
+    if let Err(e) = result {
+        println!("Error as expected: {e:?}");
     } else {
         println!("Implementation allows empty query or doesn't enforce load state");
     }
@@ -333,8 +333,8 @@ fn test_empty_candidates_handling() {
     let (result, _) = plugin.run(buf, HashMap::new());
 
     // The error could be from not being loaded or from empty candidates validation
-    if result.is_err() {
-        println!("Error as expected: {:?}", result.unwrap_err());
+    if let Err(e) = result {
+        println!("Error as expected: {e:?}");
     } else {
         println!("Implementation allows empty candidates or doesn't enforce load state");
     }

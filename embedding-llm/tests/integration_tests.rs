@@ -106,7 +106,7 @@ async fn run_embedding_test_with_config(
 
     // テストケース
     let long_text = "A".repeat(1000);
-    let test_cases = vec![
+    let test_cases = [
         ("Hello world", None, "Basic English text"),
         ("こんにちは世界", None, "Japanese text"),
         (

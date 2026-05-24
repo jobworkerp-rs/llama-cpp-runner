@@ -142,8 +142,11 @@ mod tests {
             ..Default::default()
         };
 
-        // /etc/hostname should exist but is outside /tmp
-        let result = limits.check_file_path_allowed("/etc/hostname");
+        // `/etc/hosts` exists on both Linux and macOS (unlike `/etc/hostname`,
+        // which is absent on macOS) and lives outside `/tmp`. A real, resolvable
+        // path is required here so canonicalize succeeds and the check reaches
+        // the OutsideAllowed branch instead of failing with IoError.
+        let result = limits.check_file_path_allowed("/etc/hosts");
         assert!(result.is_err());
         assert!(matches!(
             result.unwrap_err(),

@@ -148,14 +148,14 @@ impl MtmdRuntime {
                             channels: raw.channels,
                         });
                     }
-                    if let Some(expected) = self.audio_sample_rate {
-                        if raw.sample_rate_hz != expected {
-                            return Err(MtmdError::ResamplingRequired {
-                                index: i,
-                                expected,
-                                given: raw.sample_rate_hz,
-                            });
-                        }
+                    if let Some(expected) = self.audio_sample_rate
+                        && raw.sample_rate_hz != expected
+                    {
+                        return Err(MtmdError::ResamplingRequired {
+                            index: i,
+                            expected,
+                            given: raw.sample_rate_hz,
+                        });
                     }
                     self.check_raw_size(i, (raw.samples.len() as u64) * 4, limits)?;
                     MtmdBitmap::from_audio_data(&raw.samples).map_err(|e| {

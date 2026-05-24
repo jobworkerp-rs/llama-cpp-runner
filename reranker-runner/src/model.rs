@@ -134,10 +134,10 @@ impl LlamaRerankerModel {
     /// Tries each variant and returns the first one found as a single token
     fn find_token_id(model: &LlamaModel, variants: &[&str]) -> Result<LlamaToken, RerankerError> {
         for variant in variants {
-            if let Ok(tokens) = model.str_to_token(variant, AddBos::Never) {
-                if tokens.len() == 1 {
-                    return Ok(tokens[0]);
-                }
+            if let Ok(tokens) = model.str_to_token(variant, AddBos::Never)
+                && tokens.len() == 1
+            {
+                return Ok(tokens[0]);
             }
         }
 
