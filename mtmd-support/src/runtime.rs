@@ -279,6 +279,58 @@ impl MtmdRuntime {
         Ok(n_past)
     }
 
+    /// Tokenize text + bitmaps into a chunk sequence without evaluating it.
+    ///
+    /// Pairs with [`Self::eval_chunks_from`] to support KV-cache prefix reuse:
+    /// the caller can inspect the chunks (compare against a cached sequence),
+    /// keep the matching KV prefix, and re-evaluate only the differing suffix.
+    pub fn tokenize(
+        &self,
+        prompt: &str,
+        bitmaps: &[MtmdBitmap],
+    ) -> Result<MtmdInputChunks, MtmdError> {
+        let bitmap_refs: Vec<&MtmdBitmap> = bitmaps.iter().collect();
+        let input_text = MtmdInputText {
+            text: prompt.to_owned(),
+            add_special: true,
+            parse_special: true,
+        };
+        self.ctx
+            .tokenize(input_text, &bitmap_refs)
+            .map_err(|e| MtmdError::Tokenize(e.to_string()))
+    }
+
+    /// Evaluate chunks `[start_index, len)` starting at KV position `n_past`,
+    /// returning the new `n_past`. Used to prefill only the suffix that differs
+    /// from a reused KV-cache prefix. `start_index == 0` is equivalent to a full
+    /// prefill. Only the final chunk requests logits (for the first sample).
+    pub fn eval_chunks_from(
+        &self,
+        chunks: &MtmdInputChunks,
+        start_index: usize,
+        n_past: i32,
+        llama_ctx: &mut LlamaContext,
+        n_batch: i32,
+    ) -> Result<i32, MtmdError> {
+        let len = chunks.len();
+        let mut n_past = n_past;
+        for index in start_index..len {
+            let logits_last = index + 1 == len;
+            n_past = chunks
+                .eval_chunk(
+                    index,
+                    &self.ctx,
+                    llama_ctx,
+                    n_past,
+                    /* seq_id = */ 0,
+                    n_batch,
+                    logits_last,
+                )
+                .map_err(|e| MtmdError::Eval(e.to_string()))?;
+        }
+        Ok(n_past)
+    }
+
     // -- Internal helpers ----------------------------------------------------
 
     fn check_raw_size(

@@ -329,15 +329,32 @@ const MAX_AUTO_N_UBATCH: u32 = 2048;
 /// context is therefore never accessed from two threads at once. This mirrors
 /// the rationale behind `llama-cpp-2`'s own `unsafe impl Send + Sync for
 /// LlamaModel`.
+/// A chunk recorded in the KV cache, for multimodal prefix reuse. Text chunks
+/// compare by their token list; media (image/audio) chunks compare by an
+/// identity key (hash of the decoded bitmap) plus their KV position count.
+///
+/// `key` is `None` when the chunk couldn't be paired with a bitmap (tiling
+/// models split one bitmap into several chunks, so chunks can outnumber
+/// bitmaps). Such chunks must never be treated as a reusable prefix match — see
+/// `plan_chunk_keep`, which stops at the first `None`-keyed media chunk.
+#[derive(Clone, PartialEq)]
+enum CachedChunk {
+    Text(Vec<LlamaToken>),
+    Media { key: Option<u64>, n_pos: i32 },
+}
+
 struct SyncContext {
     ctx: LlamaContext<'static>,
-    /// Tokens whose KV is currently present in `ctx` (the previous request's
-    /// prompt). Used for prefix reuse: the longest common prefix with the next
-    /// request's prompt is kept, the rest of the KV is dropped. Empty when the
-    /// KV cache is empty or its contents are unknown (e.g. after an error).
-    /// Bound to the context so a rebuilt context always starts with an empty
-    /// cache record, never a stale one.
+    /// Tokens whose KV is currently present in `ctx` (the previous text
+    /// request's prompt). Used for text prefix reuse. Empty when the KV cache is
+    /// empty or its contents are unknown (e.g. after an error). Bound to the
+    /// context so a rebuilt context always starts with an empty record.
     cached_tokens: Vec<LlamaToken>,
+    /// Chunk sequence whose KV is present in `ctx` (the previous multimodal
+    /// request's prompt). Used for multimodal prefix reuse. Empty when unknown.
+    /// Kept disjoint from `cached_tokens`: a text request clears this and vice
+    /// versa, so the record always describes whichever path last filled the KV.
+    cached_chunks: Vec<CachedChunk>,
 }
 
 // SAFETY: see the type-level comment — exclusive `&mut self` access plus
@@ -350,11 +367,28 @@ impl SyncContext {
         Self {
             ctx,
             cached_tokens: Vec::new(),
+            cached_chunks: Vec::new(),
         }
     }
 
     fn ctx_mut(&mut self) -> &mut LlamaContext<'static> {
         &mut self.ctx
+    }
+
+    /// Take the text prefix-reuse record (leaving it empty) and forget the
+    /// multimodal record. Only one path's record can describe the current KV, so
+    /// entering the text path always invalidates the multimodal one — otherwise a
+    /// later multimodal request could reuse a prefix this request's KV no longer
+    /// holds. The returned value is written back only on success.
+    fn take_text_cache(&mut self) -> Vec<LlamaToken> {
+        self.cached_chunks.clear();
+        std::mem::take(&mut self.cached_tokens)
+    }
+
+    /// Multimodal counterpart of [`Self::take_text_cache`].
+    fn take_chunk_cache(&mut self) -> Vec<CachedChunk> {
+        self.cached_tokens.clear();
+        std::mem::take(&mut self.cached_chunks)
     }
 }
 
@@ -814,11 +848,11 @@ impl LlamaModelWrapper {
         let mut ctx_guard = RestoreOnDrop::new(&mut self.context);
         let sync_ctx = ctx_guard.as_mut().expect("context ensured above");
 
-        // Decide how much of the existing KV cache to keep. `cached_tokens` is
-        // taken out (left empty) so any early return / panic before we write the
-        // new value back leaves the cache record empty — the next request then
-        // safely falls back to a full clear.
-        let cached = std::mem::take(&mut sync_ctx.cached_tokens);
+        // Take the prefix record (leaving it empty) so any early return / panic
+        // before we write the new value back leaves it empty — the next request
+        // then safely falls back to a full clear. Also forgets the multimodal
+        // record (this request's KV is text-only).
+        let cached = sync_ctx.take_text_cache();
         let want_keep = plan_kv_keep(
             &cached,
             &tokens_list,
@@ -1039,6 +1073,7 @@ impl LlamaModelWrapper {
         let model = self.model;
         let mut sampler = self.build_sampler(args)?;
 
+        let reuse_kv_prefix = self.reuse_kv_prefix;
         self.ensure_context()?;
         let mtmd = self
             .mtmd
@@ -1047,27 +1082,44 @@ impl LlamaModelWrapper {
         let mut ctx_guard = RestoreOnDrop::new(&mut self.context);
         let sync_ctx = ctx_guard.as_mut().expect("context ensured above");
 
-        // The multimodal path always starts from an empty KV cache (prefix reuse
-        // is text-only). Drop the prefix-reuse record too: otherwise a following
-        // text request would see stale `cached_tokens` describing a KV that this
-        // full clear just wiped, and skip prefilling tokens that aren't there.
-        sync_ctx.cached_tokens.clear();
-        let ctx = sync_ctx.ctx_mut();
-        ctx.clear_kv_cache();
-
-        let n_ctx = ctx.n_ctx() as i32;
-        // Use the context's effective n_batch for prefill chunking so the
-        // configured n_batch is honored (matching the text path) instead of a
-        // fixed 512. It must not exceed cparams.n_batch: `llama_decode` asserts
-        // `n_tokens <= n_batch`, so a hardcoded larger value would abort.
-        let n_batch = ctx.n_batch() as i32;
+        // Take the multimodal record (leaving it empty so an early return falls
+        // back to a full clear) and forget the text record.
+        let cached_chunks = sync_ctx.take_chunk_cache();
 
         tracing::debug!("multimodal formatted prompt: {}", formatted_prompt);
 
-        // Prefill via mtmd (tokenize + eval_chunks)
+        // Tokenize into chunks (without evaluating) so we can compare against the
+        // cached chunk sequence and reuse the matching KV prefix.
+        let chunks = mtmd
+            .tokenize(formatted_prompt, bitmaps)
+            .map_err(|e| anyhow::anyhow!(e).context("mtmd: tokenize"))?;
+        let (new_chunks, new_n_pos) = describe_chunks(&chunks, bitmaps);
+
+        let (start_index, want_keep) =
+            plan_chunk_keep(&cached_chunks, &new_chunks, &new_n_pos, reuse_kv_prefix);
+
+        let n_batch = sync_ctx.ctx_mut().n_batch() as i32;
+        let n_ctx = sync_ctx.ctx_mut().n_ctx() as i32;
+
+        // Keep [0, want_keep); a partial-removal failure or want_keep==0 falls
+        // back to a full clear (start from chunk 0).
+        let (start_index, n_keep) = if want_keep > 0
+            && matches!(
+                sync_ctx
+                    .ctx_mut()
+                    .clear_kv_cache_seq(Some(0), Some(want_keep as u32), None),
+                Ok(true)
+            ) {
+            (start_index, want_keep)
+        } else {
+            sync_ctx.ctx_mut().clear_kv_cache();
+            (0, 0)
+        };
+        let ctx = sync_ctx.ctx_mut();
+
         let n_past = mtmd
-            .tokenize_and_prefill(ctx, formatted_prompt, bitmaps, n_batch)
-            .map_err(|e| anyhow::anyhow!(e).context("mtmd: tokenize_and_prefill"))?;
+            .eval_chunks_from(&chunks, start_index, n_keep, ctx, n_batch)
+            .map_err(|e| anyhow::anyhow!(e).context("mtmd: eval_chunks_from"))?;
 
         let n_len = if let Some(max_new) = args.max_new_tokens {
             (n_past + max_new).min(n_ctx)
@@ -1127,6 +1179,13 @@ impl LlamaModelWrapper {
             n_decode as f32 / duration.as_secs_f32()
         );
         tracing::info!("{}", ctx.timings());
+
+        // Record the prompt's chunk sequence so the next multimodal request can
+        // reuse its shared prefix. Only on success — an error leaves the record
+        // empty (taken above), forcing a safe full clear next time.
+        if reuse_kv_prefix {
+            sync_ctx.cached_chunks = new_chunks;
+        }
 
         Ok(DecodeOutput {
             text: output_buffer,
@@ -1491,6 +1550,91 @@ fn plan_kv_keep(
         return 0;
     }
     common_prefix_len(cached, tokens).min(prompt_tokens - 1)
+}
+
+/// Identity key for an image/audio bitmap, used to decide whether a media chunk
+/// in a new prompt matches one already in the KV cache. Hashes the decoded
+/// pixel/sample data plus dimensions. A collision would reuse the wrong KV, so
+/// the full data is hashed (not just dimensions).
+fn bitmap_identity_key(bitmap: &llama_cpp_2::mtmd::MtmdBitmap) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    bitmap.is_audio().hash(&mut hasher);
+    bitmap.nx().hash(&mut hasher);
+    bitmap.ny().hash(&mut hasher);
+    bitmap.data().hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Plan how much of the multimodal KV cache to keep. Compares the cached chunk
+/// sequence against the new one chunk-by-chunk and returns
+/// `(start_index, n_keep)`: the number of leading chunks to reuse and the KV
+/// position count they occupy. Reuse stops at the first differing chunk.
+///
+/// If every new chunk matches, the last matching chunk is dropped (re-evaluated)
+/// so the final prompt position is re-decoded — the first sample needs fresh
+/// logits, mirroring the text path's `prompt_tokens - 1` cap. Returns `(0, 0)`
+/// (full clear) when reuse is off, there is no cache, or nothing matches.
+fn plan_chunk_keep(
+    cached: &[CachedChunk],
+    new_chunks: &[CachedChunk],
+    new_n_pos: &[i32],
+    reuse: bool,
+) -> (usize, i32) {
+    if !reuse || cached.is_empty() || new_chunks.is_empty() {
+        return (0, 0);
+    }
+    // A media chunk with no bitmap (`key: None`) can't be proven identical, so
+    // it ends the reusable prefix even though `None == None` — otherwise a later
+    // changed image could be mistaken for an unchanged one and reuse stale KV.
+    let reusable = |c: &CachedChunk| !matches!(c, CachedChunk::Media { key: None, .. });
+    let mut matched = cached
+        .iter()
+        .zip(new_chunks)
+        .take_while(|(a, b)| a == b && reusable(a))
+        .count();
+    // Never keep the entire new prompt: re-evaluate at least the last chunk.
+    if matched == new_chunks.len() {
+        matched -= 1;
+    }
+    let n_keep: i32 = new_n_pos[..matched].iter().sum();
+    (matched, n_keep)
+}
+
+/// Describe a tokenized chunk sequence for prefix comparison: a `CachedChunk`
+/// per chunk (text → tokens, media → bitmap identity key) and its KV position
+/// count. Media chunks consume `bitmaps` in order.
+///
+/// One media chunk is paired with one bitmap. Tiling models (e.g. MiniCPM-V,
+/// Idefics3) split a single bitmap into several image chunks, so chunks can
+/// outnumber bitmaps; once bitmaps run out, the remaining media chunks get
+/// `key: None`. `plan_chunk_keep` stops reuse at the first such chunk, so a
+/// later differing image can never be mistaken for an unchanged one — at the
+/// cost of no reuse past that point on tiling models. Per-tile keys would
+/// restore it.
+fn describe_chunks(
+    chunks: &llama_cpp_2::mtmd::MtmdInputChunks,
+    bitmaps: &[llama_cpp_2::mtmd::MtmdBitmap],
+) -> (Vec<CachedChunk>, Vec<i32>) {
+    use llama_cpp_2::mtmd::MtmdInputChunkType;
+    let mut described = Vec::with_capacity(chunks.len());
+    let mut n_pos = Vec::with_capacity(chunks.len());
+    let mut bitmaps = bitmaps.iter();
+    for i in 0..chunks.len() {
+        let chunk = chunks.get(i).expect("index < len");
+        let cached = match chunk.chunk_type() {
+            MtmdInputChunkType::Text => {
+                CachedChunk::Text(chunk.text_tokens().unwrap_or_default().to_vec())
+            }
+            _ => CachedChunk::Media {
+                key: bitmaps.next().map(bitmap_identity_key),
+                n_pos: chunk.n_positions(),
+            },
+        };
+        n_pos.push(chunk.n_positions());
+        described.push(cached);
+    }
+    (described, n_pos)
 }
 
 /// Validate the position budget against the context size. Free function (not a
@@ -2004,6 +2148,56 @@ mod tests {
     }
 
     #[test]
+    fn test_plan_chunk_keep() {
+        let txt = |ids: &[i32]| CachedChunk::Text(ids.iter().map(|&i| LlamaToken(i)).collect());
+        let img = |key: u64, n_pos: i32| CachedChunk::Media {
+            key: Some(key),
+            n_pos,
+        };
+        // Media chunk with no paired bitmap (tiling overflow).
+        let img_unkeyed = |n_pos: i32| CachedChunk::Media { key: None, n_pos };
+
+        // Shared [image(256 pos), text(0,1)] prefix; the tail text chunk differs.
+        let cached = vec![img(7, 256), txt(&[0, 1]), txt(&[9])];
+        let new = vec![img(7, 256), txt(&[0, 1]), txt(&[5])];
+        let n_pos = vec![256, 2, 1];
+        // Keep the first 2 chunks (image + matching text) = 256 + 2 positions.
+        assert_eq!(
+            plan_chunk_keep(&cached, &new, &n_pos, true),
+            (2, 258),
+            "keep the matching image+text prefix, re-eval the differing tail"
+        );
+
+        // Reuse off → full clear.
+        assert_eq!(plan_chunk_keep(&cached, &new, &n_pos, false), (0, 0));
+        // Empty cache → full clear.
+        assert_eq!(plan_chunk_keep(&[], &new, &n_pos, true), (0, 0));
+        // Differing image at index 0 → nothing matches.
+        let other_img = vec![img(99, 256), txt(&[0, 1]), txt(&[5])];
+        assert_eq!(plan_chunk_keep(&other_img, &new, &n_pos, true), (0, 0));
+
+        // Full match drops the last chunk so the final position is re-decoded.
+        let same = vec![img(7, 256), txt(&[0, 1])];
+        let same_n_pos = vec![256, 2];
+        assert_eq!(
+            plan_chunk_keep(&same, &same, &same_n_pos, true),
+            (1, 256),
+            "full match keeps all but the last chunk"
+        );
+
+        // An unkeyed media chunk (tiling overflow) ends the prefix even when
+        // both sides are byte-identical: its image can't be proven unchanged, so
+        // reusing its KV could serve a stale image. Keep only the chunk before.
+        let unkeyed = vec![img(7, 256), img_unkeyed(256), txt(&[0, 1])];
+        let unkeyed_n_pos = vec![256, 256, 2];
+        assert_eq!(
+            plan_chunk_keep(&unkeyed, &unkeyed, &unkeyed_n_pos, true),
+            (1, 256),
+            "reuse stops at the first unkeyed media chunk"
+        );
+    }
+
+    #[test]
     fn test_model_load_identity_distinguishes_load_settings() {
         let paths = vec![PathBuf::from("model.gguf")];
         let base = LlamaModelConfig::default();
@@ -2180,6 +2374,161 @@ mod tests {
         assert_eq!(
             after, baseline,
             "text output after a multimodal request must match a fresh context"
+        );
+    }
+
+    /// With `reuse_kv_prefix=true`, two requests sharing the same image but
+    /// asking different questions must reuse the image KV and produce output
+    /// identical to a full-clear baseline (correctness of partial KV removal at
+    /// a chunk boundary). A changed image must break the prefix and still match.
+    ///
+    /// ```bash
+    /// cargo test -p jobworkerp-llama-cpp-plugin test_multimodal_prefix_reuse_matches_full_clear \
+    ///     --release -- --ignored --test-threads=1 --nocapture
+    /// ```
+    #[test]
+    #[ignore]
+    fn test_multimodal_prefix_reuse_matches_full_clear() {
+        use jobworkerp_llama_protobuf::protobuf::llama_cpp::MediaKind;
+        use jobworkerp_llama_protobuf::protobuf::llama_cpp::media_input::Source;
+
+        let image_bytes =
+            std::fs::read(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../output.png"))
+                .expect("output.png should exist in repo root");
+        let cfg = || LlamaModelConfig {
+            model: "gemma-4-E4B-it-Q4_K_M.gguf".to_string(),
+            hf_repo: Some("unsloth/gemma-4-E4B-it-GGUF".to_string()),
+            ctx_size: std::num::NonZeroU32::new(2048),
+            reuse_kv_prefix: true,
+            use_flash_attention: Some(true),
+            system_prompt: Some("You are a helpful assistant.".to_string()),
+            mtmd: Some(jobworkerp_llama_protobuf::MtmdSettings {
+                mmproj: "mmproj-F16.gguf".to_string(),
+                mmproj_hf_repo: Some("unsloth/gemma-4-E4B-it-GGUF".to_string()),
+                mmproj_use_gpu: None,
+                media_marker: None,
+                allow_url_fetch: false,
+                max_media_bytes: 10_000_000,
+                max_decoded_media_bytes: 100_000_000,
+                allowed_media_dirs: vec![],
+            }),
+            ..LlamaModelConfig::default()
+        };
+        // Same image, two different questions.
+        let img_args = |prompt: &str| InferenceArgs {
+            prompt: prompt.to_string(),
+            sample_len: Some(48),
+            max_new_tokens: None,
+            temperature: None,
+            top_p: None,
+            repeat_penalty: None,
+            repeat_last_n: None,
+            seed: Some(1234),
+            json_schema: None,
+            medias: vec![MediaInput {
+                kind: MediaKind::Image as i32,
+                source: Some(Source::Encoded(image_bytes.clone())),
+                id: None,
+            }],
+        };
+        let q_a = "What is in this image?";
+        let q_b = "What colors appear in this image?";
+
+        // Baseline: question B on a fresh context (full clear, full re-eval).
+        let baseline_b = LlamaModelWrapper::new(cfg())
+            .expect("load")
+            .run(img_args(q_b))
+            .expect("baseline b");
+
+        // Reuse: A then B on one wrapper. B reuses the image (and shared system
+        // prompt) KV; its output must equal the full-clear baseline.
+        let mut wrapper = LlamaModelWrapper::new(cfg()).expect("load");
+        wrapper.run(img_args(q_a)).expect("reuse a");
+        let reuse_b = wrapper.run(img_args(q_b)).expect("reuse b");
+        assert_eq!(
+            reuse_b, baseline_b,
+            "multimodal prefix reuse changed the output for question B"
+        );
+    }
+
+    /// Regression: a text request between two multimodal requests must invalidate
+    /// the multimodal prefix record. The text request fully clears the KV cache;
+    /// if it left `cached_chunks` stale, the second multimodal request would reuse
+    /// an image prefix no longer in the KV and corrupt its output. This is the
+    /// mirror of `test_multimodal_between_text_clears_prefix_cache`.
+    ///
+    /// ```bash
+    /// cargo test -p jobworkerp-llama-cpp-plugin test_text_between_multimodal_clears_chunk_cache \
+    ///     --release -- --ignored --test-threads=1 --nocapture
+    /// ```
+    #[test]
+    #[ignore]
+    fn test_text_between_multimodal_clears_chunk_cache() {
+        use jobworkerp_llama_protobuf::protobuf::llama_cpp::MediaKind;
+        use jobworkerp_llama_protobuf::protobuf::llama_cpp::media_input::Source;
+
+        let image_bytes =
+            std::fs::read(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../output.png"))
+                .expect("output.png should exist in repo root");
+        let cfg = || LlamaModelConfig {
+            model: "gemma-4-E4B-it-Q4_K_M.gguf".to_string(),
+            hf_repo: Some("unsloth/gemma-4-E4B-it-GGUF".to_string()),
+            ctx_size: std::num::NonZeroU32::new(2048),
+            reuse_kv_prefix: true,
+            use_flash_attention: Some(true),
+            system_prompt: Some("You are a helpful assistant.".to_string()),
+            mtmd: Some(jobworkerp_llama_protobuf::MtmdSettings {
+                mmproj: "mmproj-F16.gguf".to_string(),
+                mmproj_hf_repo: Some("unsloth/gemma-4-E4B-it-GGUF".to_string()),
+                mmproj_use_gpu: None,
+                media_marker: None,
+                allow_url_fetch: false,
+                max_media_bytes: 10_000_000,
+                max_decoded_media_bytes: 100_000_000,
+                allowed_media_dirs: vec![],
+            }),
+            ..LlamaModelConfig::default()
+        };
+        let args = |prompt: &str, medias: Vec<MediaInput>| InferenceArgs {
+            prompt: prompt.to_string(),
+            sample_len: Some(48),
+            max_new_tokens: None,
+            temperature: None,
+            top_p: None,
+            repeat_penalty: None,
+            repeat_last_n: None,
+            seed: Some(1234),
+            json_schema: None,
+            medias,
+        };
+        let img_args = || {
+            args(
+                "What is in this image?",
+                vec![MediaInput {
+                    kind: MediaKind::Image as i32,
+                    source: Some(Source::Encoded(image_bytes.clone())),
+                    id: None,
+                }],
+            )
+        };
+        let text_args = || args("The capital of France is", vec![]);
+
+        // Baseline: the image request on a fresh context (full clear).
+        let baseline = LlamaModelWrapper::new(cfg())
+            .expect("load")
+            .run(img_args())
+            .expect("baseline image");
+
+        // image -> text -> image on one wrapper. The text request wipes the KV
+        // and must clear the multimodal record so the second image request does
+        // not reuse a stale image prefix.
+        let mut wrapper = LlamaModelWrapper::new(cfg()).expect("load");
+        wrapper.run(img_args()).expect("first image");
+        wrapper.run(text_args()).expect("text between");
+        let after = wrapper.run(img_args()).expect("image after text");
+        assert_eq!(
+            after, baseline,
+            "image output after an intervening text request must match a fresh context"
         );
     }
 

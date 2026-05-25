@@ -88,7 +88,7 @@ jobworkerp 標準 completion runner (Ollama / GenAI) との互換性差分:
 - `n_ubatch`: 物理マイクロバッチサイズ。`n_batch` より小さくすると prompt 評価時のピークメモリを抑えられます。デフォルト挙動はバックエンド依存です。**Metal / ROCm ビルド時**は速度重視のため実効 `n_batch` に追従させますが、計算バッファ肥大を防ぐため上限 2048 で頭打ちにします (例: 実効 n_batch が 262144 でも n_ubatch は 2048)。それ以外のバックエンドは llama.cpp 既定値 (512) のままです。いずれも明示指定すれば常にその値が優先されます。
 - `type_k`: KV キャッシュの K 側データ型。未指定時は llama.cpp 既定値 (F16)。`KV_CACHE_TYPE_Q8_0` 等に量子化すると長コンテキストの KV キャッシュ使用量を削減できます。
 - `type_v`: KV キャッシュの V 側データ型。未指定時は llama.cpp 既定値 (F16)。**V 側の量子化は通常 flash attention が必須**です(`use_flash_attention` が無効だと warn を出します)。
-- `reuse_kv_prefix`: リクエスト間で共通する先頭トークン列(システムプロンプト+文書など)の KV を残し、差分だけ prefill します(テキストのみ)。共通文脈を更新しながら連続リクエストするワークロードで TTFT を大幅短縮できます。デフォルト false では毎回 KV を全消去し、リクエストは完全独立・決定的です。
+- `reuse_kv_prefix`: リクエスト間で共通する先頭(システムプロンプト+文書、または同一画像など)の KV を残し、差分だけ prefill します。テキストはトークン単位、画像は内容ハッシュで同一性を判定し、共通する chunk を再利用します(同一画像+異なる質問の連続では画像の encode/decode もスキップ)。共通文脈を更新しながら連続リクエストするワークロードで TTFT を大幅短縮できます。デフォルト false では毎回 KV を全消去し、リクエストは完全独立・決定的です。
 - `use_flash_attention`: 対応環境で flash attention を有効化
 - `system_prompt`: ランナー既定の system prompt
 - `mtmd`: マルチモーダル projector 設定
