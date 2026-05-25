@@ -88,6 +88,7 @@ Key fields:
 - `n_ubatch`: physical micro-batch size. Setting it lower than `n_batch` reduces peak memory during prompt eval. The default is backend-dependent: **Metal / ROCm builds** follow the effective `n_batch`, capped at 2048 to keep the compute buffer bounded (e.g. n_ubatch stays 2048 even when n_batch is 262144); other backends keep llama.cpp's default (512). An explicit value always wins.
 - `type_k`: KV cache data type for K. Defaults to the llama.cpp default (F16) when omitted. Quantizing (e.g. `KV_CACHE_TYPE_Q8_0`) reduces KV cache memory for long contexts.
 - `type_v`: KV cache data type for V. Defaults to the llama.cpp default (F16) when omitted. **V-cache quantization typically requires flash attention** (a warning is logged if `use_flash_attention` is disabled).
+- `reuse_kv_prefix`: keep the KV of the longest common token prefix (shared system prompt / document) across requests and prefill only the differing suffix (text-only). Cuts time-to-first-token for workloads that update a shared context across consecutive requests. Defaults to false, which clears the KV cache before each request so requests stay fully independent and deterministic.
 - `use_flash_attention`: enables flash attention when supported
 - `system_prompt`: default system prompt applied by the runner
 - `mtmd`: multimodal projector settings
@@ -118,6 +119,7 @@ When handling huge contexts (e.g. ctx_size=200k with tens of thousands of input 
 
 - **Raise `n_ubatch` (e.g. 2048)**: large inputs are processed in `n_ubatch`-sized chunks; a larger `n_ubatch` means fewer chunks and faster prefill. Apple recommends roughly `-ub 2048` for large-prompt processing. **Metal / ROCm builds auto-follow the effective `n_batch`, capped at 2048**, so you already get 2048 without setting anything; set `n_ubatch` explicitly to go higher (the cap is bypassed for explicit values). The cost is a larger compute buffer, acceptable with ample unified memory.
 - **Quantize the KV cache (`type_k` / `type_v` = `KV_CACHE_TYPE_Q8_0`)**: the KV cache grows large for long contexts; F16 → Q8_0 halves its footprint and reduces memory bandwidth. `type_v` quantization requires flash attention (enabled by default here).
+- **Enable `reuse_kv_prefix=true` to reuse the shared prefix**: when consecutive requests share a system prompt / document and differ only in the tail, the shared KV is kept and only the suffix is prefilled. This nearly eliminates prompt eval (re-evaluating tens of thousands of tokens), dramatically cutting TTFT — the largest win for this workload. Leave it false (default) if requests must stay fully independent.
 - **Caveat: bigger `n_ubatch` is not always faster** — the optimal value depends on GPU cache behavior and can collapse if set too high. Sweep 512 / 1024 / 2048 / 4096 with `llama-bench` on your hardware/model. Note `n_ubatch` ≤ `n_batch`.
 
 ## Build

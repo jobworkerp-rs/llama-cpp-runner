@@ -166,6 +166,10 @@ pub struct LlamaModelConfig {
     // via `proto_kv_cache_type` at context build time.
     type_k: Option<i32>,
     type_v: Option<i32>,
+    // Reuse the KV cache across requests by keeping the longest common prompt
+    // prefix (text-only). Default false keeps requests independent/deterministic.
+    #[serde(default)]
+    reuse_kv_prefix: bool,
     // use flash attention (default true)
     use_flash_attention: Option<bool>,
     // system prompt before the user prompt
@@ -192,6 +196,7 @@ impl From<LlamaRunnerSettings> for LlamaModelConfig {
             n_ubatch: op.n_ubatch,
             type_k: op.type_k,
             type_v: op.type_v,
+            reuse_kv_prefix: op.reuse_kv_prefix.unwrap_or(false),
             use_flash_attention: op.use_flash_attention,
             system_prompt: op.system_prompt,
             mtmd: op.mtmd,
@@ -237,6 +242,7 @@ impl Default for LlamaModelConfig {
             n_ubatch: None,
             type_k: None,
             type_v: None,
+            reuse_kv_prefix: false,
             use_flash_attention: None,
             system_prompt: None,
             mtmd: None,
@@ -313,6 +319,79 @@ const GRAMMAR_TYPE_JSON: &str = "json";
 /// matches Apple's recommended `-ub 2048` for large-prompt processing.
 const MAX_AUTO_N_UBATCH: u32 = 2048;
 
+/// A reusable `LlamaContext` held across requests so the (expensive) KV-cache
+/// allocation happens once per process instead of per request.
+///
+/// `LlamaContext` is `!Send + !Sync` because it wraps a raw pointer. We assert
+/// both here because jobworkerp guarantees a single execution at a time per
+/// runner instance (use-and-discard, or runner-pool serialization when
+/// `use_static=true`), and every plugin entry point takes `&mut self`. The
+/// context is therefore never accessed from two threads at once. This mirrors
+/// the rationale behind `llama-cpp-2`'s own `unsafe impl Send + Sync for
+/// LlamaModel`.
+struct SyncContext {
+    ctx: LlamaContext<'static>,
+    /// Tokens whose KV is currently present in `ctx` (the previous request's
+    /// prompt). Used for prefix reuse: the longest common prefix with the next
+    /// request's prompt is kept, the rest of the KV is dropped. Empty when the
+    /// KV cache is empty or its contents are unknown (e.g. after an error).
+    /// Bound to the context so a rebuilt context always starts with an empty
+    /// cache record, never a stale one.
+    cached_tokens: Vec<LlamaToken>,
+}
+
+// SAFETY: see the type-level comment — exclusive `&mut self` access plus
+// jobworkerp's one-execution-at-a-time guarantee preclude concurrent use.
+unsafe impl Send for SyncContext {}
+unsafe impl Sync for SyncContext {}
+
+impl SyncContext {
+    fn new(ctx: LlamaContext<'static>) -> Self {
+        Self {
+            ctx,
+            cached_tokens: Vec::new(),
+        }
+    }
+
+    fn ctx_mut(&mut self) -> &mut LlamaContext<'static> {
+        &mut self.ctx
+    }
+}
+
+/// Moves a value out of an `&mut Option<T>` and guarantees it is put back when
+/// the guard drops — including on `?`/early-return and panics. Used so the
+/// reusable context is never lost if a decode fails partway through.
+struct RestoreOnDrop<'a, T> {
+    slot: &'a mut Option<T>,
+    value: Option<T>,
+}
+
+impl<'a, T> RestoreOnDrop<'a, T> {
+    fn new(slot: &'a mut Option<T>) -> Self {
+        let value = slot.take();
+        Self { slot, value }
+    }
+}
+
+impl<T> std::ops::Deref for RestoreOnDrop<'_, T> {
+    type Target = Option<T>;
+    fn deref(&self) -> &Self::Target {
+        &self.value
+    }
+}
+
+impl<T> std::ops::DerefMut for RestoreOnDrop<'_, T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.value
+    }
+}
+
+impl<T> Drop for RestoreOnDrop<'_, T> {
+    fn drop(&mut self) {
+        *self.slot = self.value.take();
+    }
+}
+
 /// Result of a single decode pass, carrying both the generated text and the
 /// token counts needed to populate `Usage` in chat/completion responses.
 #[derive(Debug, Clone)]
@@ -358,13 +437,67 @@ fn shared_backend() -> &'static LlamaBackend {
     })
 }
 
+/// Build a string capturing every config field that affects how the model is
+/// loaded (resolved paths, GPU offload, KV overrides) — i.e. the inputs to
+/// `LlamaModel::load_from_file`. Two configs that load an identical model
+/// produce the same string. Context-side settings (ctx_size/n_batch/mtmd) are
+/// excluded: they don't affect the model, and mmproj is rebuilt per wrapper.
+fn model_load_identity(model_paths: &[PathBuf], config: &LlamaModelConfig) -> String {
+    format!(
+        "paths={:?};disable_gpu={};kv_overrides={:?}",
+        model_paths, config.disable_gpu, config.key_value_overrides
+    )
+}
+
+/// The model is stored process-wide so a reused `LlamaContext` can borrow it for
+/// `'static` (a `LlamaContext<'a>` borrows `&'a LlamaModel`). Like the backend,
+/// it is loaded once and never dropped, which matches the deployment model
+/// (one model loaded at startup) and avoids leaking a model on every reload.
+///
+/// The first load wins; a later load with a **different** `identity` (see
+/// `model_load_identity`) is rejected rather than silently serving the original
+/// model under settings it wasn't loaded with. A reload with the same identity
+/// reuses the stored model.
+fn shared_model(
+    identity: &str,
+    build: impl FnOnce() -> Result<LlamaModel>,
+) -> Result<&'static LlamaModel> {
+    static MODEL: OnceLock<(LlamaModel, String)> = OnceLock::new();
+
+    if MODEL.get().is_none() {
+        // Build is fallible, so it can't run inside `get_or_init`.
+        let model = build()?;
+        // A racing thread may have stored first; ignore the loser's `set` — the
+        // identity check below validates every caller against whatever won.
+        let _ = MODEL.set((model, identity.to_string()));
+    }
+
+    let (stored_model, stored_identity) = MODEL.get().expect("model stored above");
+    if stored_identity != identity {
+        bail!(
+            "a different model is already loaded in this process \
+             (loaded: {stored_identity}, requested: {identity}). \
+             This plugin supports a single model per process."
+        );
+    }
+    Ok(stored_model)
+}
+
 pub struct LlamaModelWrapper {
-    model: LlamaModel,
+    model: &'static LlamaModel,
     backend: &'static LlamaBackend,
     ctx_params: LlamaContextParams,
     system_prompt: String,
-    /// No Mutex needed: all access is through `&mut self` on `run()`,
-    /// which provides exclusive access at the Rust borrow-checker level.
+    /// Reused across requests: built lazily on the first decode, then kept so
+    /// the KV-cache allocation happens once. KV is cleared at the start of each
+    /// request for isolation. `None` until the first decode.
+    ///
+    /// No Mutex needed: all access is through `&mut self` on `run()`, which
+    /// provides exclusive access at the Rust borrow-checker level.
+    context: Option<SyncContext>,
+    /// When true, keep the longest common prompt prefix in the KV cache across
+    /// requests (text-only) instead of clearing it each time. See [`SyncContext`].
+    reuse_kv_prefix: bool,
     mtmd: Option<MtmdRuntime>,
     media_limits: MediaLimits,
 }
@@ -398,12 +531,19 @@ impl LlamaModelWrapper {
                     .append_kv_override(k.as_c_str(), v.clone().into());
             }
         }
-        let model = LlamaModel::load_from_file(
-            backend,
-            model_paths[0].as_ref() as &std::path::Path,
-            &model_params,
-        )
-        .with_context(|| "unable to load model")?;
+        // Identity of everything that affects how the model is loaded. A second
+        // load with a different identity is rejected (see `shared_model`) so the
+        // process never silently serves a model built with other settings.
+        let model_identity = model_load_identity(&model_paths, &config);
+        // Load once per process and share for `'static` (see `shared_model`).
+        let model: &'static LlamaModel = shared_model(&model_identity, || {
+            LlamaModel::load_from_file(
+                backend,
+                model_paths[0].as_ref() as &std::path::Path,
+                &model_params,
+            )
+            .with_context(|| "unable to load model")
+        })?;
 
         // initialize the context
         let mut ctx_params = LlamaContextParams::default()
@@ -471,7 +611,7 @@ impl LlamaModelWrapper {
                 let use_gpu = mtmd_settings.mmproj_use_gpu.unwrap_or(!config.disable_gpu);
                 let runtime = MtmdRuntime::from_settings(
                     mmproj_path.to_string_lossy().as_ref(),
-                    &model,
+                    model,
                     use_gpu,
                     mtmd_settings.media_marker.as_deref(),
                 )
@@ -487,6 +627,8 @@ impl LlamaModelWrapper {
             backend,
             ctx_params,
             system_prompt: config.system_prompt.unwrap_or_default(),
+            context: None,
+            reuse_kv_prefix: config.reuse_kv_prefix,
             mtmd,
             media_limits,
         })
@@ -532,7 +674,7 @@ impl LlamaModelWrapper {
         let mut samplers: Vec<LlamaSampler> = Vec::new();
 
         if let Some(schema) = &args.json_schema {
-            let llg = LlamaSampler::llguidance(&self.model, GRAMMAR_TYPE_JSON, schema)
+            let llg = LlamaSampler::llguidance(self.model, GRAMMAR_TYPE_JSON, schema)
                 .map_err(|e| anyhow!("llguidance init failed: {e:?}"))?;
             samplers.push(llg);
         }
@@ -561,6 +703,31 @@ impl LlamaModelWrapper {
         Ok(LlamaSampler::chain_simple(samplers))
     }
 
+    /// Build the reusable context on first use; subsequent calls are no-ops.
+    /// Per-request KV isolation is handled by the caller (clear at request top).
+    /// Context creation reallocates the KV cache (and Metal command buffers on
+    /// macOS); doing it once instead of per request is the main throughput win
+    /// for large contexts. Lazy (first-decode) creation keeps `load` cheap,
+    /// matching the lazy-backend-init policy used for metadata-only loads.
+    fn ensure_context(&mut self) -> Result<()> {
+        if self.context.is_some() {
+            return Ok(());
+        }
+        let t_ctx_start = ggml_time_us();
+        let ctx = self
+            .model
+            .new_context(self.backend, self.ctx_params.clone())
+            .with_context(|| "unable to create the llama_context")?;
+        tracing::info!(
+            "context created in {:.3} s (n_batch={}, n_ubatch={}); reused for subsequent requests",
+            Duration::from_micros((ggml_time_us() - t_ctx_start) as u64).as_secs_f32(),
+            ctx.n_batch(),
+            ctx.n_ubatch(),
+        );
+        self.context = Some(SyncContext::new(ctx));
+        Ok(())
+    }
+
     pub fn run(&mut self, args: InferenceArgs) -> Result<String> {
         if args.prompt.is_empty() && args.medias.is_empty() {
             bail!("prompt is empty and no media provided")
@@ -568,34 +735,6 @@ impl LlamaModelWrapper {
 
         // tokenize the prompt
         self.decode(args).map(|o| o.text)
-    }
-
-    fn check_token_length(
-        &self,
-        tokens_list: &[LlamaToken],
-        ctx: &LlamaContext,
-        n_len: i32,
-    ) -> Result<()> {
-        // n_len is an absolute position cap (same semantics as multimodal).
-        let n_ctx = ctx.n_ctx() as i32;
-        let prompt_tokens = tokens_list.len() as i32;
-
-        tracing::info!("sample_len = {n_len}, n_ctx = {n_ctx}, prompt_tokens = {prompt_tokens}");
-
-        if n_len > n_ctx {
-            bail!(
-                "sample_len > n_ctx ({n_len} > {n_ctx}). \
-                 Increase ctx_size or reduce sample_len."
-            );
-        }
-        if prompt_tokens >= n_len {
-            bail!(
-                "prompt ({prompt_tokens} tokens) already meets or exceeds \
-                 sample_len ({n_len}). Increase sample_len to allow generation."
-            );
-        }
-
-        Ok(())
     }
 
     // #[inline]
@@ -656,27 +795,54 @@ impl LlamaModelWrapper {
         formatted_prompt: &str,
         args: &InferenceArgs,
     ) -> Result<DecodeOutput> {
-        // Per-request context creation reallocates the KV cache (and Metal
-        // command buffers on macOS). Log the cost so it can be weighed against
-        // prompt-eval / generation time from `ctx.timings()` when diagnosing
-        // throughput regressions.
-        let t_ctx_start = ggml_time_us();
-        let mut ctx: LlamaContext = self
-            .model
-            .new_context(self.backend, self.ctx_params.clone())
-            .with_context(|| "unable to create the llama_context")?;
-        tracing::info!(
-            "context created in {:.3} s (n_batch={}, n_ubatch={})",
-            Duration::from_micros((ggml_time_us() - t_ctx_start) as u64).as_secs_f32(),
-            ctx.n_batch(),
-            ctx.n_ubatch(),
-        );
-
-        let tokens_list = self
-            .model
+        // Hoist all `&self`-dependent work before borrowing the context field:
+        // a `&'static LlamaModel` is `Copy`, and `build_sampler`/`str_to_token`
+        // need `&self`, which would conflict with the `&mut self.context` borrow
+        // taken below. `model` is then used instead of `self.model` for the rest.
+        let model = self.model;
+        let mut sampler = self.build_sampler(args)?;
+        let tokens_list = model
             .str_to_token(formatted_prompt, AddBos::Always)
             .with_context(|| "failed to tokenize prompt")?;
         let prompt_tokens = tokens_list.len() as i32;
+
+        // Build the context once (lazy) then take it out of `self` for exclusive
+        // use; the guard restores it on every exit path (incl. `?`/panic) so the
+        // reused context survives a failed request.
+        self.ensure_context()?;
+        let reuse_kv_prefix = self.reuse_kv_prefix;
+        let mut ctx_guard = RestoreOnDrop::new(&mut self.context);
+        let sync_ctx = ctx_guard.as_mut().expect("context ensured above");
+
+        // Decide how much of the existing KV cache to keep. `cached_tokens` is
+        // taken out (left empty) so any early return / panic before we write the
+        // new value back leaves the cache record empty — the next request then
+        // safely falls back to a full clear.
+        let cached = std::mem::take(&mut sync_ctx.cached_tokens);
+        let want_keep = plan_kv_keep(
+            &cached,
+            &tokens_list,
+            prompt_tokens as usize,
+            reuse_kv_prefix,
+        );
+        // Keep [0, want_keep) by removing [want_keep, ∞). want_keep == 0 (default
+        // path, or no common prefix) means a full clear, so each request starts
+        // from an empty KV cache — output identical to a fresh context, while
+        // skipping the costly reallocation. `Ok(false)`/`Err` means the model
+        // can't do partial removal → fall back to a full clear.
+        let n_keep = if want_keep > 0
+            && matches!(
+                sync_ctx
+                    .ctx_mut()
+                    .clear_kv_cache_seq(Some(0), Some(want_keep as u32), None),
+                Ok(true)
+            ) {
+            want_keep
+        } else {
+            sync_ctx.ctx_mut().clear_kv_cache();
+            0
+        };
+        let ctx = sync_ctx.ctx_mut();
 
         // Cap the position budget at n_ctx so a default `max_new_tokens` of
         // 4096 doesn't fail outright on small-context models. This mirrors
@@ -687,22 +853,24 @@ impl LlamaModelWrapper {
         } else {
             args.sample_len.unwrap_or(4096).min(n_ctx)
         };
-        self.check_token_length(&tokens_list, &ctx, n_len)?;
+        check_token_length(&tokens_list, ctx, n_len)?;
 
-        // Prefill the prompt in chunks of at most `n_batch` tokens. A single
-        // `llama_decode` call asserts `n_tokens <= cparams.n_batch`, so a prompt
-        // longer than the effective n_batch (e.g. >2048 tokens by default) must
-        // be split — otherwise generation aborts. Mirrors the multimodal path
-        // and llama.cpp's own `mtmd_helper_eval_chunk_single`. Only the final
-        // token requests logits, for sampling the first generated token.
+        // Prefill the suffix after the reused prefix in chunks of at most
+        // `n_batch` tokens. A single `llama_decode` call asserts
+        // `n_tokens <= cparams.n_batch`, so a prompt longer than the effective
+        // n_batch (e.g. >2048 tokens by default) must be split — otherwise
+        // generation aborts. Mirrors the multimodal path and llama.cpp's own
+        // `mtmd_helper_eval_chunk_single`. Only the final token requests logits,
+        // for sampling the first generated token.
         let n_batch = ctx.n_batch() as usize;
-        // Allocate only what a single chunk needs: capping at prompt_tokens
+        let suffix = &tokens_list[n_keep..];
+        // Allocate only what a single chunk needs: capping at the suffix length
         // avoids llama_batch_init mallocing n_batch-sized buffers for a short
         // prompt, while never exceeding n_batch (the per-decode hard limit).
-        let mut batch = LlamaBatch::new(n_batch.min(prompt_tokens as usize), 1);
+        let mut batch = LlamaBatch::new(n_batch.min(suffix.len()), 1);
         let last_index: i32 = prompt_tokens - 1;
-        let mut pos: i32 = 0;
-        for chunk in tokens_list.chunks(n_batch) {
+        let mut pos: i32 = n_keep as i32;
+        for chunk in suffix.chunks(n_batch) {
             batch.clear();
             for &token in chunk {
                 batch.add(token, pos, &[0], pos == last_index)?;
@@ -724,7 +892,6 @@ impl LlamaModelWrapper {
 
         // XXX assume string byte size 4
         let mut output_buffer = String::with_capacity((n_len * 4) as usize);
-        let mut sampler = self.build_sampler(args)?;
 
         while n_cur < n_len {
             // sample the next token
@@ -735,15 +902,15 @@ impl LlamaModelWrapper {
                 // double-advance stateful samplers — for llguidance that
                 // consumes the just-sampled token twice, corrupting the grammar
                 // state and silently disabling all further masking.
-                let token = sampler.sample(&ctx, batch.n_tokens() - 1);
+                let token = sampler.sample(ctx, batch.n_tokens() - 1);
 
                 // is it an end of stream?
-                if self.model.is_eog_token(token) {
+                if model.is_eog_token(token) {
                     eprintln!();
                     break;
                 }
 
-                let output_bytes = token_to_piece_bytes_retry(&self.model, token)?;
+                let output_bytes = token_to_piece_bytes_retry(model, token)?;
                 // use `Decoder.decode_to_string()` to avoid the intermediate buffer
                 let mut output_string = String::with_capacity(32);
                 let _decode_result =
@@ -804,6 +971,16 @@ impl LlamaModelWrapper {
 
         tracing::info!("{}", ctx.timings());
 
+        // Record the prompt tokens now in the KV cache so the next request can
+        // reuse their shared prefix. Only the prompt (positions 0..prompt_tokens)
+        // is stored: generated tokens occupy positions >= prompt_tokens, which a
+        // future request always discards (they lie beyond any common prefix).
+        // Written only on success — an error leaves `cached_tokens` empty (taken
+        // above), forcing a safe full clear next time.
+        if reuse_kv_prefix {
+            sync_ctx.cached_tokens = tokens_list;
+        }
+
         Ok(DecodeOutput {
             text: output_buffer,
             prompt_tokens: prompt_tokens as u32,
@@ -856,24 +1033,28 @@ impl LlamaModelWrapper {
         bitmaps: &[llama_cpp_2::mtmd::MtmdBitmap],
         args: &InferenceArgs,
     ) -> Result<DecodeOutput> {
+        // Hoist `&self`-wide work (build_sampler, model copy) before borrowing
+        // the context field. `mtmd` is a separate field, so it can be borrowed
+        // alongside the `&mut self.context` guard below (disjoint borrows).
+        let model = self.model;
+        let mut sampler = self.build_sampler(args)?;
+
+        self.ensure_context()?;
         let mtmd = self
             .mtmd
             .as_ref()
             .expect("mtmd should be Some in multimodal path");
+        let mut ctx_guard = RestoreOnDrop::new(&mut self.context);
+        let sync_ctx = ctx_guard.as_mut().expect("context ensured above");
 
-        // See `decode_text_only_core`: per-request context creation reallocates
-        // the KV cache; log the cost for throughput diagnosis.
-        let t_ctx_start = ggml_time_us();
-        let mut ctx: LlamaContext = self
-            .model
-            .new_context(self.backend, self.ctx_params.clone())
-            .with_context(|| "unable to create context for multimodal")?;
-        tracing::info!(
-            "context created in {:.3} s (n_batch={}, n_ubatch={})",
-            Duration::from_micros((ggml_time_us() - t_ctx_start) as u64).as_secs_f32(),
-            ctx.n_batch(),
-            ctx.n_ubatch(),
-        );
+        // The multimodal path always starts from an empty KV cache (prefix reuse
+        // is text-only). Drop the prefix-reuse record too: otherwise a following
+        // text request would see stale `cached_tokens` describing a KV that this
+        // full clear just wiped, and skip prefilling tokens that aren't there.
+        sync_ctx.cached_tokens.clear();
+        let ctx = sync_ctx.ctx_mut();
+        ctx.clear_kv_cache();
+
         let n_ctx = ctx.n_ctx() as i32;
         // Use the context's effective n_batch for prefill chunking so the
         // configured n_batch is honored (matching the text path) instead of a
@@ -885,7 +1066,7 @@ impl LlamaModelWrapper {
 
         // Prefill via mtmd (tokenize + eval_chunks)
         let n_past = mtmd
-            .tokenize_and_prefill(&mut ctx, formatted_prompt, bitmaps, n_batch)
+            .tokenize_and_prefill(ctx, formatted_prompt, bitmaps, n_batch)
             .map_err(|e| anyhow::anyhow!(e).context("mtmd: tokenize_and_prefill"))?;
 
         let n_len = if let Some(max_new) = args.max_new_tokens {
@@ -903,7 +1084,6 @@ impl LlamaModelWrapper {
         let mut batch = LlamaBatch::new(1, 1);
         let mut n_cur = n_past;
         let n_stop = n_len;
-        let mut sampler = self.build_sampler(args)?;
         let mut decoder = encoding_rs::UTF_8.new_decoder();
         let mut output_buffer = String::with_capacity(((n_len - n_past) * 4) as usize);
         let mut first = true;
@@ -918,13 +1098,13 @@ impl LlamaModelWrapper {
             // `sample` accepts the token internally; do not call `accept` again
             // (see decode_text_only_core for why double-accept breaks the
             // llguidance grammar sampler).
-            let token = sampler.sample(&ctx, sample_idx);
+            let token = sampler.sample(ctx, sample_idx);
 
-            if self.model.is_eog_token(token) {
+            if model.is_eog_token(token) {
                 break;
             }
 
-            let output_bytes = token_to_piece_bytes_retry(&self.model, token)?;
+            let output_bytes = token_to_piece_bytes_retry(model, token)?;
             let mut output_string = String::with_capacity(32);
             let _ = decoder.decode_to_string(&output_bytes, &mut output_string, false);
             output_buffer.push_str(&output_string);
@@ -1290,6 +1470,55 @@ impl LlamaModelWrapper {
     }
 }
 
+/// Length of the longest common prefix of two token slices. Used for KV prefix
+/// reuse: tokens up to this length are already in the KV cache and can be kept.
+fn common_prefix_len(a: &[LlamaToken], b: &[LlamaToken]) -> usize {
+    a.iter().zip(b).take_while(|(x, y)| x == y).count()
+}
+
+/// Number of KV-cached prompt tokens to keep for prefix reuse. Returns 0 (full
+/// clear) when reuse is off or there is no cache. Capped at `prompt_tokens - 1`
+/// so the last prompt token is always re-decoded — the first sample needs fresh
+/// logits, and an empty prefill range would leave none. `prompt_tokens >= 1` is
+/// guaranteed by `AddBos::Always` plus the empty-prompt bail in `run`.
+fn plan_kv_keep(
+    cached: &[LlamaToken],
+    tokens: &[LlamaToken],
+    prompt_tokens: usize,
+    reuse: bool,
+) -> usize {
+    if !reuse || cached.is_empty() {
+        return 0;
+    }
+    common_prefix_len(cached, tokens).min(prompt_tokens - 1)
+}
+
+/// Validate the position budget against the context size. Free function (not a
+/// method) so it can be called while the context is borrowed out of `self` via
+/// the reuse guard, without also borrowing `&self`.
+fn check_token_length(tokens_list: &[LlamaToken], ctx: &LlamaContext, n_len: i32) -> Result<()> {
+    // n_len is an absolute position cap (same semantics as multimodal).
+    let n_ctx = ctx.n_ctx() as i32;
+    let prompt_tokens = tokens_list.len() as i32;
+
+    tracing::info!("sample_len = {n_len}, n_ctx = {n_ctx}, prompt_tokens = {prompt_tokens}");
+
+    if n_len > n_ctx {
+        bail!(
+            "sample_len > n_ctx ({n_len} > {n_ctx}). \
+             Increase ctx_size or reduce sample_len."
+        );
+    }
+    if prompt_tokens >= n_len {
+        bail!(
+            "prompt ({prompt_tokens} tokens) already meets or exceeds \
+             sample_len ({n_len}). Increase sample_len to allow generation."
+        );
+    }
+
+    Ok(())
+}
+
 /// Convert a token to bytes, retrying with a larger buffer if the first
 /// attempt reports `InsufficientBufferSpace`. Mirrors the internal retry
 /// logic of `LlamaModel::token_to_piece`, but returns raw bytes so the
@@ -1483,6 +1712,135 @@ mod tests {
         println!("chunked-prefill output: {output}");
     }
 
+    /// Context reuse across requests must be transparent: the reused context is
+    /// KV-cleared at each request top, so consecutive requests are independent
+    /// and deterministic, and a failed request does not poison the next one.
+    ///
+    /// ```bash
+    /// cargo test -p jobworkerp-llama-cpp-plugin test_context_reuse_is_isolated \
+    ///     --release -- --ignored --test-threads=1 --nocapture
+    /// ```
+    #[test]
+    #[ignore]
+    fn test_context_reuse_is_isolated() {
+        // Greedy (no temperature) for determinism.
+        fn args(prompt: &str) -> InferenceArgs {
+            InferenceArgs {
+                prompt: prompt.to_string(),
+                sample_len: Some(48),
+                max_new_tokens: None,
+                temperature: None,
+                top_p: None,
+                repeat_penalty: None,
+                repeat_last_n: None,
+                seed: Some(1234),
+                json_schema: None,
+                medias: vec![],
+            }
+        }
+        let prompt_a = "The capital of France is";
+        let prompt_b = "Two plus two equals";
+
+        // Baseline: each prompt run once on its own fresh wrapper (fresh context).
+        let baseline_b = LlamaModelWrapper::new(LlamaModelConfig::default())
+            .expect("load")
+            .run(args(prompt_b))
+            .expect("baseline b");
+
+        // Reuse: run A then B on the SAME wrapper (B reuses A's context).
+        let mut wrapper = LlamaModelWrapper::new(LlamaModelConfig::default()).expect("load");
+        let reuse_a1 = wrapper.run(args(prompt_a)).expect("reuse a1");
+        let reuse_b = wrapper.run(args(prompt_b)).expect("reuse b");
+        // (a) KV isolation: B after A equals B on a fresh context.
+        assert_eq!(
+            reuse_b, baseline_b,
+            "reused context must not leak prompt A's KV into prompt B"
+        );
+        // (b) Determinism: A again equals A the first time.
+        let reuse_a2 = wrapper.run(args(prompt_a)).expect("reuse a2");
+        assert_eq!(reuse_a1, reuse_a2, "reused context must be deterministic");
+
+        // (c) Error recovery: an oversized sample_len bails (sample_len > n_ctx
+        // is rejected), then a valid request must still succeed and match.
+        let mut bad = args(prompt_a);
+        bad.sample_len = Some(i32::MAX);
+        assert!(wrapper.run(bad).is_err(), "oversized request should fail");
+        let after_err = wrapper.run(args(prompt_a)).expect("recovers after error");
+        assert_eq!(
+            after_err, reuse_a1,
+            "context must recover cleanly after a failed request"
+        );
+    }
+
+    /// With `reuse_kv_prefix` on, keeping the shared prompt prefix in the KV
+    /// cache must produce output identical to a full clear (the kept KV is the
+    /// same computation), and a failed request must still recover.
+    ///
+    /// ```bash
+    /// cargo test -p jobworkerp-llama-cpp-plugin test_reuse_kv_prefix_matches_full_clear \
+    ///     --release -- --ignored --test-threads=1 --nocapture
+    /// ```
+    #[test]
+    #[ignore]
+    fn test_reuse_kv_prefix_matches_full_clear() {
+        fn args(prompt: &str) -> InferenceArgs {
+            InferenceArgs {
+                prompt: prompt.to_string(),
+                sample_len: Some(48),
+                max_new_tokens: None,
+                temperature: None,
+                top_p: None,
+                repeat_penalty: None,
+                repeat_last_n: None,
+                seed: Some(1234),
+                json_schema: None,
+                medias: vec![],
+            }
+        }
+        // Shared prefix, differing tails — the case prefix reuse optimizes.
+        let shared = "You are a helpful assistant. The user asks: ";
+        let prompt_a = format!("{shared}what is the capital of France?");
+        let prompt_b = format!("{shared}what is two plus two?");
+
+        let reuse_cfg = || LlamaModelConfig {
+            reuse_kv_prefix: true,
+            ..LlamaModelConfig::default()
+        };
+
+        // Baselines on fresh wrappers (each request = full clear).
+        let baseline_a = LlamaModelWrapper::new(reuse_cfg())
+            .expect("load")
+            .run(args(&prompt_a))
+            .expect("baseline a");
+        let baseline_b = LlamaModelWrapper::new(reuse_cfg())
+            .expect("load")
+            .run(args(&prompt_b))
+            .expect("baseline b");
+
+        // Same wrapper: A then B reuses the shared prefix; outputs must match
+        // the full-clear baselines (correctness of partial KV removal).
+        let mut wrapper = LlamaModelWrapper::new(reuse_cfg()).expect("load");
+        let reuse_a = wrapper.run(args(&prompt_a)).expect("reuse a");
+        let reuse_b = wrapper.run(args(&prompt_b)).expect("reuse b");
+        assert_eq!(reuse_a, baseline_a, "prefix reuse changed prompt A output");
+        assert_eq!(
+            reuse_b, baseline_b,
+            "prefix reuse (A→B) changed prompt B output"
+        );
+
+        // Determinism: A again (reuses its own full prefix) equals the first A.
+        let reuse_a2 = wrapper.run(args(&prompt_a)).expect("reuse a2");
+        assert_eq!(reuse_a2, baseline_a, "prefix reuse must be deterministic");
+
+        // Error recovery: a failed request empties the cache record; the next
+        // request falls back to a full clear and still matches the baseline.
+        let mut bad = args(&prompt_a);
+        bad.sample_len = Some(i32::MAX);
+        assert!(wrapper.run(bad).is_err(), "oversized request should fail");
+        let after_err = wrapper.run(args(&prompt_b)).expect("recovers after error");
+        assert_eq!(after_err, baseline_b, "must recover after a failed request");
+    }
+
     #[test]
     fn test_runner_settings_maps_batch_fields_to_config() {
         use jobworkerp_llama_protobuf::protobuf::llama_cpp::KvCacheType as ProtoKv;
@@ -1498,6 +1856,7 @@ mod tests {
             n_ubatch: Some(512),
             type_k: Some(ProtoKv::Q80 as i32),
             type_v: Some(ProtoKv::Q80 as i32),
+            reuse_kv_prefix: Some(true),
             use_flash_attention: None,
             system_prompt: None,
             mtmd: None,
@@ -1507,6 +1866,9 @@ mod tests {
         assert_eq!(config.n_ubatch, Some(512));
         assert_eq!(config.type_k, Some(ProtoKv::Q80 as i32));
         assert_eq!(config.type_v, Some(ProtoKv::Q80 as i32));
+        assert!(config.reuse_kv_prefix);
+        // Default keeps reuse off so requests stay independent.
+        assert!(!LlamaModelConfig::default().reuse_kv_prefix);
     }
 
     #[test]
@@ -1589,6 +1951,86 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_restore_on_drop_returns_value_on_normal_scope_exit() {
+        let mut slot = Some(42);
+        {
+            let mut guard = RestoreOnDrop::new(&mut slot);
+            assert_eq!(*guard, Some(42), "value is moved into the guard");
+            *guard = Some(7); // mutate while held
+        }
+        assert_eq!(slot, Some(7), "guard writes its value back on drop");
+    }
+
+    #[test]
+    fn test_restore_on_drop_returns_value_on_early_return() {
+        // Simulate an early `?`-style return while the guard is held: the value
+        // must still be restored to the slot (this is why a failed decode does
+        // not lose the reusable context).
+        let mut slot = Some(String::from("ctx"));
+        fn body(slot: &mut Option<String>) -> Result<()> {
+            let _guard = RestoreOnDrop::new(slot);
+            bail!("simulated mid-request failure");
+        }
+        let err = body(&mut slot);
+        assert!(err.is_err());
+        assert_eq!(slot.as_deref(), Some("ctx"), "value survives early return");
+    }
+
+    #[test]
+    fn test_common_prefix_len() {
+        let t = |ids: &[i32]| ids.iter().map(|&i| LlamaToken(i)).collect::<Vec<_>>();
+        assert_eq!(common_prefix_len(&t(&[]), &t(&[])), 0);
+        assert_eq!(common_prefix_len(&t(&[1, 2, 3]), &t(&[4, 5])), 0);
+        assert_eq!(common_prefix_len(&t(&[1, 2, 3]), &t(&[1, 2, 3])), 3);
+        // One is a prefix of the other → length of the shorter.
+        assert_eq!(common_prefix_len(&t(&[1, 2, 3, 4]), &t(&[1, 2])), 2);
+        // Diverge mid-sequence → index of the first difference.
+        assert_eq!(common_prefix_len(&t(&[1, 2, 9, 4]), &t(&[1, 2, 3, 4])), 2);
+    }
+
+    #[test]
+    fn test_plan_kv_keep() {
+        let t = |ids: &[i32]| ids.iter().map(|&i| LlamaToken(i)).collect::<Vec<_>>();
+        // Reuse off → always full clear, regardless of overlap.
+        assert_eq!(plan_kv_keep(&t(&[0, 1, 2]), &t(&[0, 1, 2]), 3, false), 0);
+        // Empty cache → full clear.
+        assert_eq!(plan_kv_keep(&t(&[]), &t(&[0, 1, 2]), 3, true), 0);
+        // Partial overlap → keep the common prefix.
+        assert_eq!(plan_kv_keep(&t(&[0, 1, 9]), &t(&[0, 1, 2]), 3, true), 2);
+        // Full match is capped to prompt_tokens - 1 so the last token is always
+        // re-decoded (the first sample needs fresh logits).
+        assert_eq!(plan_kv_keep(&t(&[0, 1, 2]), &t(&[0, 1, 2]), 3, true), 2);
+    }
+
+    #[test]
+    fn test_model_load_identity_distinguishes_load_settings() {
+        let paths = vec![PathBuf::from("model.gguf")];
+        let base = LlamaModelConfig::default();
+        let id_base = model_load_identity(&paths, &base);
+
+        // Same load-affecting settings → same identity (reload is allowed).
+        assert_eq!(id_base, model_load_identity(&paths, &base));
+
+        // A different model path → different identity (load is rejected).
+        let other_paths = vec![PathBuf::from("other.gguf")];
+        assert_ne!(id_base, model_load_identity(&other_paths, &base));
+
+        // disable_gpu changes how the model loads → different identity.
+        let gpu_off = LlamaModelConfig {
+            disable_gpu: true,
+            ..LlamaModelConfig::default()
+        };
+        assert_ne!(id_base, model_load_identity(&paths, &gpu_off));
+
+        // ctx_size does NOT affect model loading → identity unchanged.
+        let bigger_ctx = LlamaModelConfig {
+            ctx_size: std::num::NonZeroU32::new(8192),
+            ..LlamaModelConfig::default()
+        };
+        assert_eq!(id_base, model_load_identity(&paths, &bigger_ctx));
+    }
+
     /// Multimodal generation happy-path with a real model.
     ///
     /// Requires gemma-4-E4B-it (downloaded from HuggingFace on first run).
@@ -1620,6 +2062,7 @@ mod tests {
             n_ubatch: None,
             type_k: None,
             type_v: None,
+            reuse_kv_prefix: false,
             use_flash_attention: Some(true),
             system_prompt: Some("You are a helpful assistant.".to_string()),
             mtmd: Some(jobworkerp_llama_protobuf::MtmdSettings {
@@ -1659,6 +2102,87 @@ mod tests {
         println!("Multimodal output: {output}");
     }
 
+    /// Regression: with `reuse_kv_prefix=true`, a multimodal request between two
+    /// text requests must not corrupt the second text request. The multimodal
+    /// path fully clears the KV cache; if it left `cached_tokens` stale, the
+    /// following text request would skip prefilling a prefix that is no longer in
+    /// the KV cache and generate garbage. The final text output must match a
+    /// fresh-context baseline.
+    ///
+    /// ```bash
+    /// cargo test -p jobworkerp-llama-cpp-plugin test_multimodal_between_text_clears_prefix_cache \
+    ///     --release -- --ignored --test-threads=1 --nocapture
+    /// ```
+    #[test]
+    #[ignore]
+    fn test_multimodal_between_text_clears_prefix_cache() {
+        use jobworkerp_llama_protobuf::protobuf::llama_cpp::MediaKind;
+        use jobworkerp_llama_protobuf::protobuf::llama_cpp::media_input::Source;
+
+        let image_bytes =
+            std::fs::read(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../output.png"))
+                .expect("output.png should exist in repo root");
+        let mtmd_config = || LlamaModelConfig {
+            model: "gemma-4-E4B-it-Q4_K_M.gguf".to_string(),
+            hf_repo: Some("unsloth/gemma-4-E4B-it-GGUF".to_string()),
+            ctx_size: std::num::NonZeroU32::new(2048),
+            reuse_kv_prefix: true,
+            use_flash_attention: Some(true),
+            system_prompt: Some("You are a helpful assistant.".to_string()),
+            mtmd: Some(jobworkerp_llama_protobuf::MtmdSettings {
+                mmproj: "mmproj-F16.gguf".to_string(),
+                mmproj_hf_repo: Some("unsloth/gemma-4-E4B-it-GGUF".to_string()),
+                mmproj_use_gpu: None,
+                media_marker: None,
+                allow_url_fetch: false,
+                max_media_bytes: 10_000_000,
+                max_decoded_media_bytes: 100_000_000,
+                allowed_media_dirs: vec![],
+            }),
+            ..LlamaModelConfig::default()
+        };
+        let text_args = |prompt: &str| InferenceArgs {
+            prompt: prompt.to_string(),
+            sample_len: Some(48),
+            max_new_tokens: None,
+            temperature: None,
+            top_p: None,
+            repeat_penalty: None,
+            repeat_last_n: None,
+            seed: Some(1234),
+            json_schema: None,
+            medias: vec![],
+        };
+        let image_args = InferenceArgs {
+            medias: vec![MediaInput {
+                kind: MediaKind::Image as i32,
+                source: Some(Source::Encoded(image_bytes)),
+                id: None,
+            }],
+            ..text_args("What do you see in this image?")
+        };
+        let text_prompt = "The capital of France is";
+
+        // Baseline: the text prompt on a fresh context (full clear).
+        let baseline = LlamaModelWrapper::new(mtmd_config())
+            .expect("load")
+            .run(text_args(text_prompt))
+            .expect("baseline text");
+
+        // text → multimodal → text on one wrapper. The multimodal call wipes the
+        // KV and must also clear the prefix-reuse record.
+        let mut wrapper = LlamaModelWrapper::new(mtmd_config()).expect("load");
+        wrapper.run(text_args(text_prompt)).expect("first text");
+        wrapper.run(image_args).expect("multimodal");
+        let after = wrapper
+            .run(text_args(text_prompt))
+            .expect("text after image");
+        assert_eq!(
+            after, baseline,
+            "text output after a multimodal request must match a fresh context"
+        );
+    }
+
     /// Multimodal audio generation happy-path with a real model.
     ///
     /// Requires Qwen2.5-Omni-7B (audio-capable mmproj).
@@ -1690,6 +2214,7 @@ mod tests {
             n_ubatch: None,
             type_k: None,
             type_v: None,
+            reuse_kv_prefix: false,
             use_flash_attention: Some(true),
             system_prompt: Some("You are a helpful assistant.".to_string()),
             mtmd: Some(jobworkerp_llama_protobuf::MtmdSettings {
@@ -2140,11 +2665,17 @@ mod tests {
         );
         // The required `outcome` enum must appear with a legal value, confirming
         // the grammar is shaping keys/values (not just the opening brace).
-        assert!(text.contains("\"outcome\""), "missing required `outcome` key: {text}");
+        assert!(
+            text.contains("\"outcome\""),
+            "missing required `outcome` key: {text}"
+        );
         let outcome_ok = ["SUCCESS", "PARTIAL", "FAILURE", "ABORTED", "UNKNOWN"]
             .iter()
             .any(|v| text.contains(v));
-        assert!(outcome_ok, "expected a constrained `outcome` enum value: {text}");
+        assert!(
+            outcome_ok,
+            "expected a constrained `outcome` enum value: {text}"
+        );
     }
 
     // Test-only helper exposing the env-driven config builder so reproduction

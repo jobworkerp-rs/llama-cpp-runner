@@ -88,6 +88,14 @@ message LlamaRunnerSettings {
     // default (F16) is used. Quantizing V typically requires flash attention.
     optional KvCacheType type_v = 14;
 
+    // Reuse the KV cache across requests by keeping the longest common token
+    // prefix and prefilling only the differing suffix (text-only). Skips
+    // re-evaluating a shared system prompt / document on every request, cutting
+    // time-to-first-token for long-context workloads. When false (default), the
+    // KV cache is cleared before each request, so requests stay fully
+    // independent and deterministic.
+    optional bool reuse_kv_prefix = 15;
+
     // TODO
     // override some parameters of the model
     //key_value_overrides: Option<Vec<(String, ParamOverrideValueWrapper)>>,
