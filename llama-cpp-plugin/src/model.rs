@@ -23,7 +23,9 @@ use llama_cpp_2::{
 use llama_cpp_sys_2::{LLAMA_FLASH_ATTN_TYPE_DISABLED, LLAMA_FLASH_ATTN_TYPE_ENABLED};
 use mtmd_support::{MediaLimits, MtmdRuntime};
 use serde::{Deserialize, Serialize};
-use std::{ffi::CString, num::NonZeroU32, path::PathBuf, sync::OnceLock, time::Duration};
+use std::{
+    ffi::CString, num::NonZeroU32, ops::ControlFlow, path::PathBuf, sync::OnceLock, time::Duration,
+};
 
 /// for deserialization.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -829,6 +831,24 @@ impl LlamaModelWrapper {
         formatted_prompt: &str,
         args: &InferenceArgs,
     ) -> Result<DecodeOutput> {
+        // No-op sink: identical to the non-streaming path.
+        self.decode_text_only_core_with_sink(formatted_prompt, args, &mut |_| {
+            ControlFlow::Continue(())
+        })
+    }
+
+    /// Streaming-aware variant of [`Self::decode_text_only_core`]. Calls `sink`
+    /// once per generated piece (string slice of the just-decoded token), in
+    /// generation order. Returning `ControlFlow::Break(())` from the sink stops
+    /// generation cleanly without writing back the prefix-reuse cache (the
+    /// same invariant as an early error: cancel must not leak partial KV
+    /// metadata).
+    fn decode_text_only_core_with_sink(
+        &mut self,
+        formatted_prompt: &str,
+        args: &InferenceArgs,
+        sink: &mut dyn FnMut(&str) -> ControlFlow<()>,
+    ) -> Result<DecodeOutput> {
         // Hoist all `&self`-dependent work before borrowing the context field:
         // a `&'static LlamaModel` is `Copy`, and `build_sampler`/`str_to_token`
         // need `&self`, which would conflict with the `&mut self.context` borrow
@@ -918,6 +938,11 @@ impl LlamaModelWrapper {
 
         let mut n_cur = prompt_tokens;
         let mut n_decode = 0;
+        // Tracks whether the sink asked to stop (cancel). When true, the
+        // prefix-reuse write-back is skipped at the bottom of the function —
+        // a partially-consumed prompt must not be advertised as a reusable
+        // cache.
+        let mut cancelled = false;
 
         let t_main_start = ggml_time_us();
 
@@ -983,6 +1008,16 @@ impl LlamaModelWrapper {
 
                 // batch.clear();
                 // batch.add(new_token_id, n_cur, &[0], true)?;
+
+                // Stream the just-decoded piece; Break → drop out of the
+                // loop *before* the next decode and skip KV write-back below.
+                if sink_requests_stop(sink, &output_string) {
+                    cancelled = true;
+                }
+            }
+
+            if cancelled {
+                break;
             }
 
             n_cur += 1;
@@ -1009,9 +1044,10 @@ impl LlamaModelWrapper {
         // reuse their shared prefix. Only the prompt (positions 0..prompt_tokens)
         // is stored: generated tokens occupy positions >= prompt_tokens, which a
         // future request always discards (they lie beyond any common prefix).
-        // Written only on success — an error leaves `cached_tokens` empty (taken
-        // above), forcing a safe full clear next time.
-        if reuse_kv_prefix {
+        // Written only on natural completion — an error or a sink-driven
+        // cancel leaves `cached_tokens` empty (taken above), forcing a safe
+        // full clear next time.
+        if reuse_kv_prefix && !cancelled {
             sync_ctx.cached_tokens = tokens_list;
         }
 
@@ -1066,6 +1102,20 @@ impl LlamaModelWrapper {
         formatted_prompt: &str,
         bitmaps: &[llama_cpp_2::mtmd::MtmdBitmap],
         args: &InferenceArgs,
+    ) -> Result<DecodeOutput> {
+        self.decode_multimodal_core_with_sink(formatted_prompt, bitmaps, args, &mut |_| {
+            ControlFlow::Continue(())
+        })
+    }
+
+    /// Streaming-aware variant of [`Self::decode_multimodal_core`]. Same sink
+    /// contract as [`Self::decode_text_only_core_with_sink`].
+    fn decode_multimodal_core_with_sink(
+        &mut self,
+        formatted_prompt: &str,
+        bitmaps: &[llama_cpp_2::mtmd::MtmdBitmap],
+        args: &InferenceArgs,
+        sink: &mut dyn FnMut(&str) -> ControlFlow<()>,
     ) -> Result<DecodeOutput> {
         // Hoist `&self`-wide work (build_sampler, model copy) before borrowing
         // the context field. `mtmd` is a separate field, so it can be borrowed
@@ -1140,6 +1190,7 @@ impl LlamaModelWrapper {
         let mut output_buffer = String::with_capacity(((n_len - n_past) * 4) as usize);
         let mut first = true;
         let mut n_decode = 0;
+        let mut cancelled = false;
 
         let t_main_start = ggml_time_us();
 
@@ -1161,6 +1212,11 @@ impl LlamaModelWrapper {
             let _ = decoder.decode_to_string(&output_bytes, &mut output_string, false);
             output_buffer.push_str(&output_string);
 
+            if sink_requests_stop(sink, &output_string) {
+                cancelled = true;
+                break;
+            }
+
             batch.clear();
             batch.add(token, n_cur, &[0], true)?;
             n_cur += 1;
@@ -1181,9 +1237,10 @@ impl LlamaModelWrapper {
         tracing::info!("{}", ctx.timings());
 
         // Record the prompt's chunk sequence so the next multimodal request can
-        // reuse its shared prefix. Only on success — an error leaves the record
-        // empty (taken above), forcing a safe full clear next time.
-        if reuse_kv_prefix {
+        // reuse its shared prefix. Only on natural completion — an error or a
+        // sink-driven cancel leaves the record empty (taken above), forcing a
+        // safe full clear next time.
+        if reuse_kv_prefix && !cancelled {
             sync_ctx.cached_chunks = new_chunks;
         }
 
@@ -1195,6 +1252,21 @@ impl LlamaModelWrapper {
     }
 
     pub fn run_chat(&mut self, args: LlmChatArgs) -> Result<LlmChatResult> {
+        self.run_chat_with_sink(args, &mut |_| ControlFlow::Continue(()))
+    }
+
+    /// Streaming-aware variant of [`Self::run_chat`]. The `sink` is invoked
+    /// once per generated piece (already in raw form — `<think>` tags are
+    /// included). The returned `LlmChatResult` is the **final** chunk and
+    /// carries `done=true`, the full `usage` block, and (when requested) the
+    /// extracted reasoning_content. Callers that re-split reasoning in real
+    /// time should ignore the result's `reasoning_content`/`content` payload
+    /// (they will already have streamed both) and use only the metadata.
+    pub fn run_chat_with_sink(
+        &mut self,
+        args: LlmChatArgs,
+        sink: &mut dyn FnMut(&str) -> ControlFlow<()>,
+    ) -> Result<LlmChatResult> {
         if let Some(ref fo) = args.function_options
             && fo.use_function_calling
         {
@@ -1230,7 +1302,7 @@ impl LlamaModelWrapper {
 
         let t_start = ggml_time_us();
         let output: DecodeOutput = if medias.is_empty() {
-            self.decode_text_only_core(&formatted_prompt, &inference_args)?
+            self.decode_text_only_core_with_sink(&formatted_prompt, &inference_args, sink)?
         } else {
             let mtmd = self
                 .mtmd
@@ -1239,7 +1311,12 @@ impl LlamaModelWrapper {
             let bitmaps = mtmd
                 .prepare_bitmaps(&medias, &self.media_limits)
                 .map_err(|e| anyhow::anyhow!(e).context("mtmd: preparing bitmaps"))?;
-            self.decode_multimodal_core(&formatted_prompt, &bitmaps, &inference_args)?
+            self.decode_multimodal_core_with_sink(
+                &formatted_prompt,
+                &bitmaps,
+                &inference_args,
+                sink,
+            )?
         };
         let t_end = ggml_time_us();
         let total_time = Duration::from_micros((t_end - t_start) as u64);
@@ -1279,6 +1356,16 @@ impl LlamaModelWrapper {
     /// (see `validate_completion_args`) so jobworkerp completion workers can
     /// reuse their existing payload shape.
     pub fn run_completion(&mut self, args: LlmCompletionArgs) -> Result<LlmCompletionResult> {
+        self.run_completion_with_sink(args, &mut |_| ControlFlow::Continue(()))
+    }
+
+    /// Streaming-aware variant of [`Self::run_completion`]. See
+    /// [`Self::run_chat_with_sink`] for the sink contract.
+    pub fn run_completion_with_sink(
+        &mut self,
+        args: LlmCompletionArgs,
+        sink: &mut dyn FnMut(&str) -> ControlFlow<()>,
+    ) -> Result<LlmCompletionResult> {
         validate_completion_args(&args)?;
 
         let options = args.options.unwrap_or_default();
@@ -1308,7 +1395,8 @@ impl LlamaModelWrapper {
         };
 
         let t_start = ggml_time_us();
-        let output = self.decode_text_only_core(&formatted_prompt, &inference_args)?;
+        let output =
+            self.decode_text_only_core_with_sink(&formatted_prompt, &inference_args, sink)?;
         let t_end = ggml_time_us();
         let total_time = Duration::from_micros((t_end - t_start) as u64);
 
@@ -1661,6 +1749,13 @@ fn check_token_length(tokens_list: &[LlamaToken], ctx: &LlamaContext, n_len: i32
     }
 
     Ok(())
+}
+
+/// Returns `true` when the streaming sink asked to stop generation. Used by
+/// both core loops so the "Break → cancel + suppress KV write-back" rule is
+/// expressed in one place.
+fn sink_requests_stop(sink: &mut dyn FnMut(&str) -> ControlFlow<()>, chunk: &str) -> bool {
+    matches!(sink(chunk), ControlFlow::Break(()))
 }
 
 /// Convert a token to bytes, retrying with a larger buffer if the first
