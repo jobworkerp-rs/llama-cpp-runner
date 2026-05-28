@@ -23,7 +23,9 @@ use llama_cpp_2::{
 use llama_cpp_sys_2::{LLAMA_FLASH_ATTN_TYPE_DISABLED, LLAMA_FLASH_ATTN_TYPE_ENABLED};
 use mtmd_support::{MediaLimits, MtmdRuntime};
 use serde::{Deserialize, Serialize};
-use std::{ffi::CString, num::NonZeroU32, path::PathBuf, sync::OnceLock, time::Duration};
+use std::{
+    ffi::CString, num::NonZeroU32, ops::ControlFlow, path::PathBuf, sync::OnceLock, time::Duration,
+};
 
 /// for deserialization.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -166,6 +168,10 @@ pub struct LlamaModelConfig {
     // via `proto_kv_cache_type` at context build time.
     type_k: Option<i32>,
     type_v: Option<i32>,
+    // Reuse the KV cache across requests by keeping the longest common prompt
+    // prefix (text-only). Default false keeps requests independent/deterministic.
+    #[serde(default)]
+    reuse_kv_prefix: bool,
     // use flash attention (default true)
     use_flash_attention: Option<bool>,
     // system prompt before the user prompt
@@ -192,6 +198,7 @@ impl From<LlamaRunnerSettings> for LlamaModelConfig {
             n_ubatch: op.n_ubatch,
             type_k: op.type_k,
             type_v: op.type_v,
+            reuse_kv_prefix: op.reuse_kv_prefix.unwrap_or(false),
             use_flash_attention: op.use_flash_attention,
             system_prompt: op.system_prompt,
             mtmd: op.mtmd,
@@ -237,6 +244,7 @@ impl Default for LlamaModelConfig {
             n_ubatch: None,
             type_k: None,
             type_v: None,
+            reuse_kv_prefix: false,
             use_flash_attention: None,
             system_prompt: None,
             mtmd: None,
@@ -313,6 +321,113 @@ const GRAMMAR_TYPE_JSON: &str = "json";
 /// matches Apple's recommended `-ub 2048` for large-prompt processing.
 const MAX_AUTO_N_UBATCH: u32 = 2048;
 
+/// A reusable `LlamaContext` held across requests so the (expensive) KV-cache
+/// allocation happens once per process instead of per request.
+///
+/// `LlamaContext` is `!Send + !Sync` because it wraps a raw pointer. We assert
+/// both here because jobworkerp guarantees a single execution at a time per
+/// runner instance (use-and-discard, or runner-pool serialization when
+/// `use_static=true`), and every plugin entry point takes `&mut self`. The
+/// context is therefore never accessed from two threads at once. This mirrors
+/// the rationale behind `llama-cpp-2`'s own `unsafe impl Send + Sync for
+/// LlamaModel`.
+/// A chunk recorded in the KV cache, for multimodal prefix reuse. Text chunks
+/// compare by their token list; media (image/audio) chunks compare by an
+/// identity key (hash of the decoded bitmap) plus their KV position count.
+///
+/// `key` is `None` when the chunk couldn't be paired with a bitmap (tiling
+/// models split one bitmap into several chunks, so chunks can outnumber
+/// bitmaps). Such chunks must never be treated as a reusable prefix match — see
+/// `plan_chunk_keep`, which stops at the first `None`-keyed media chunk.
+#[derive(Clone, PartialEq)]
+enum CachedChunk {
+    Text(Vec<LlamaToken>),
+    Media { key: Option<u64>, n_pos: i32 },
+}
+
+struct SyncContext {
+    ctx: LlamaContext<'static>,
+    /// Tokens whose KV is currently present in `ctx` (the previous text
+    /// request's prompt). Used for text prefix reuse. Empty when the KV cache is
+    /// empty or its contents are unknown (e.g. after an error). Bound to the
+    /// context so a rebuilt context always starts with an empty record.
+    cached_tokens: Vec<LlamaToken>,
+    /// Chunk sequence whose KV is present in `ctx` (the previous multimodal
+    /// request's prompt). Used for multimodal prefix reuse. Empty when unknown.
+    /// Kept disjoint from `cached_tokens`: a text request clears this and vice
+    /// versa, so the record always describes whichever path last filled the KV.
+    cached_chunks: Vec<CachedChunk>,
+}
+
+// SAFETY: see the type-level comment — exclusive `&mut self` access plus
+// jobworkerp's one-execution-at-a-time guarantee preclude concurrent use.
+unsafe impl Send for SyncContext {}
+unsafe impl Sync for SyncContext {}
+
+impl SyncContext {
+    fn new(ctx: LlamaContext<'static>) -> Self {
+        Self {
+            ctx,
+            cached_tokens: Vec::new(),
+            cached_chunks: Vec::new(),
+        }
+    }
+
+    fn ctx_mut(&mut self) -> &mut LlamaContext<'static> {
+        &mut self.ctx
+    }
+
+    /// Take the text prefix-reuse record (leaving it empty) and forget the
+    /// multimodal record. Only one path's record can describe the current KV, so
+    /// entering the text path always invalidates the multimodal one — otherwise a
+    /// later multimodal request could reuse a prefix this request's KV no longer
+    /// holds. The returned value is written back only on success.
+    fn take_text_cache(&mut self) -> Vec<LlamaToken> {
+        self.cached_chunks.clear();
+        std::mem::take(&mut self.cached_tokens)
+    }
+
+    /// Multimodal counterpart of [`Self::take_text_cache`].
+    fn take_chunk_cache(&mut self) -> Vec<CachedChunk> {
+        self.cached_tokens.clear();
+        std::mem::take(&mut self.cached_chunks)
+    }
+}
+
+/// Moves a value out of an `&mut Option<T>` and guarantees it is put back when
+/// the guard drops — including on `?`/early-return and panics. Used so the
+/// reusable context is never lost if a decode fails partway through.
+struct RestoreOnDrop<'a, T> {
+    slot: &'a mut Option<T>,
+    value: Option<T>,
+}
+
+impl<'a, T> RestoreOnDrop<'a, T> {
+    fn new(slot: &'a mut Option<T>) -> Self {
+        let value = slot.take();
+        Self { slot, value }
+    }
+}
+
+impl<T> std::ops::Deref for RestoreOnDrop<'_, T> {
+    type Target = Option<T>;
+    fn deref(&self) -> &Self::Target {
+        &self.value
+    }
+}
+
+impl<T> std::ops::DerefMut for RestoreOnDrop<'_, T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.value
+    }
+}
+
+impl<T> Drop for RestoreOnDrop<'_, T> {
+    fn drop(&mut self) {
+        *self.slot = self.value.take();
+    }
+}
+
 /// Result of a single decode pass, carrying both the generated text and the
 /// token counts needed to populate `Usage` in chat/completion responses.
 #[derive(Debug, Clone)]
@@ -358,13 +473,67 @@ fn shared_backend() -> &'static LlamaBackend {
     })
 }
 
+/// Build a string capturing every config field that affects how the model is
+/// loaded (resolved paths, GPU offload, KV overrides) — i.e. the inputs to
+/// `LlamaModel::load_from_file`. Two configs that load an identical model
+/// produce the same string. Context-side settings (ctx_size/n_batch/mtmd) are
+/// excluded: they don't affect the model, and mmproj is rebuilt per wrapper.
+fn model_load_identity(model_paths: &[PathBuf], config: &LlamaModelConfig) -> String {
+    format!(
+        "paths={:?};disable_gpu={};kv_overrides={:?}",
+        model_paths, config.disable_gpu, config.key_value_overrides
+    )
+}
+
+/// The model is stored process-wide so a reused `LlamaContext` can borrow it for
+/// `'static` (a `LlamaContext<'a>` borrows `&'a LlamaModel`). Like the backend,
+/// it is loaded once and never dropped, which matches the deployment model
+/// (one model loaded at startup) and avoids leaking a model on every reload.
+///
+/// The first load wins; a later load with a **different** `identity` (see
+/// `model_load_identity`) is rejected rather than silently serving the original
+/// model under settings it wasn't loaded with. A reload with the same identity
+/// reuses the stored model.
+fn shared_model(
+    identity: &str,
+    build: impl FnOnce() -> Result<LlamaModel>,
+) -> Result<&'static LlamaModel> {
+    static MODEL: OnceLock<(LlamaModel, String)> = OnceLock::new();
+
+    if MODEL.get().is_none() {
+        // Build is fallible, so it can't run inside `get_or_init`.
+        let model = build()?;
+        // A racing thread may have stored first; ignore the loser's `set` — the
+        // identity check below validates every caller against whatever won.
+        let _ = MODEL.set((model, identity.to_string()));
+    }
+
+    let (stored_model, stored_identity) = MODEL.get().expect("model stored above");
+    if stored_identity != identity {
+        bail!(
+            "a different model is already loaded in this process \
+             (loaded: {stored_identity}, requested: {identity}). \
+             This plugin supports a single model per process."
+        );
+    }
+    Ok(stored_model)
+}
+
 pub struct LlamaModelWrapper {
-    model: LlamaModel,
+    model: &'static LlamaModel,
     backend: &'static LlamaBackend,
     ctx_params: LlamaContextParams,
     system_prompt: String,
-    /// No Mutex needed: all access is through `&mut self` on `run()`,
-    /// which provides exclusive access at the Rust borrow-checker level.
+    /// Reused across requests: built lazily on the first decode, then kept so
+    /// the KV-cache allocation happens once. KV is cleared at the start of each
+    /// request for isolation. `None` until the first decode.
+    ///
+    /// No Mutex needed: all access is through `&mut self` on `run()`, which
+    /// provides exclusive access at the Rust borrow-checker level.
+    context: Option<SyncContext>,
+    /// When true, keep the longest common prompt prefix in the KV cache across
+    /// requests (text-only) instead of clearing it each time. See [`SyncContext`].
+    reuse_kv_prefix: bool,
     mtmd: Option<MtmdRuntime>,
     media_limits: MediaLimits,
 }
@@ -398,12 +567,19 @@ impl LlamaModelWrapper {
                     .append_kv_override(k.as_c_str(), v.clone().into());
             }
         }
-        let model = LlamaModel::load_from_file(
-            backend,
-            model_paths[0].as_ref() as &std::path::Path,
-            &model_params,
-        )
-        .with_context(|| "unable to load model")?;
+        // Identity of everything that affects how the model is loaded. A second
+        // load with a different identity is rejected (see `shared_model`) so the
+        // process never silently serves a model built with other settings.
+        let model_identity = model_load_identity(&model_paths, &config);
+        // Load once per process and share for `'static` (see `shared_model`).
+        let model: &'static LlamaModel = shared_model(&model_identity, || {
+            LlamaModel::load_from_file(
+                backend,
+                model_paths[0].as_ref() as &std::path::Path,
+                &model_params,
+            )
+            .with_context(|| "unable to load model")
+        })?;
 
         // initialize the context
         let mut ctx_params = LlamaContextParams::default()
@@ -471,7 +647,7 @@ impl LlamaModelWrapper {
                 let use_gpu = mtmd_settings.mmproj_use_gpu.unwrap_or(!config.disable_gpu);
                 let runtime = MtmdRuntime::from_settings(
                     mmproj_path.to_string_lossy().as_ref(),
-                    &model,
+                    model,
                     use_gpu,
                     mtmd_settings.media_marker.as_deref(),
                 )
@@ -487,6 +663,8 @@ impl LlamaModelWrapper {
             backend,
             ctx_params,
             system_prompt: config.system_prompt.unwrap_or_default(),
+            context: None,
+            reuse_kv_prefix: config.reuse_kv_prefix,
             mtmd,
             media_limits,
         })
@@ -532,7 +710,7 @@ impl LlamaModelWrapper {
         let mut samplers: Vec<LlamaSampler> = Vec::new();
 
         if let Some(schema) = &args.json_schema {
-            let llg = LlamaSampler::llguidance(&self.model, GRAMMAR_TYPE_JSON, schema)
+            let llg = LlamaSampler::llguidance(self.model, GRAMMAR_TYPE_JSON, schema)
                 .map_err(|e| anyhow!("llguidance init failed: {e:?}"))?;
             samplers.push(llg);
         }
@@ -561,6 +739,31 @@ impl LlamaModelWrapper {
         Ok(LlamaSampler::chain_simple(samplers))
     }
 
+    /// Build the reusable context on first use; subsequent calls are no-ops.
+    /// Per-request KV isolation is handled by the caller (clear at request top).
+    /// Context creation reallocates the KV cache (and Metal command buffers on
+    /// macOS); doing it once instead of per request is the main throughput win
+    /// for large contexts. Lazy (first-decode) creation keeps `load` cheap,
+    /// matching the lazy-backend-init policy used for metadata-only loads.
+    fn ensure_context(&mut self) -> Result<()> {
+        if self.context.is_some() {
+            return Ok(());
+        }
+        let t_ctx_start = ggml_time_us();
+        let ctx = self
+            .model
+            .new_context(self.backend, self.ctx_params.clone())
+            .with_context(|| "unable to create the llama_context")?;
+        tracing::info!(
+            "context created in {:.3} s (n_batch={}, n_ubatch={}); reused for subsequent requests",
+            Duration::from_micros((ggml_time_us() - t_ctx_start) as u64).as_secs_f32(),
+            ctx.n_batch(),
+            ctx.n_ubatch(),
+        );
+        self.context = Some(SyncContext::new(ctx));
+        Ok(())
+    }
+
     pub fn run(&mut self, args: InferenceArgs) -> Result<String> {
         if args.prompt.is_empty() && args.medias.is_empty() {
             bail!("prompt is empty and no media provided")
@@ -568,34 +771,6 @@ impl LlamaModelWrapper {
 
         // tokenize the prompt
         self.decode(args).map(|o| o.text)
-    }
-
-    fn check_token_length(
-        &self,
-        tokens_list: &[LlamaToken],
-        ctx: &LlamaContext,
-        n_len: i32,
-    ) -> Result<()> {
-        // n_len is an absolute position cap (same semantics as multimodal).
-        let n_ctx = ctx.n_ctx() as i32;
-        let prompt_tokens = tokens_list.len() as i32;
-
-        tracing::info!("sample_len = {n_len}, n_ctx = {n_ctx}, prompt_tokens = {prompt_tokens}");
-
-        if n_len > n_ctx {
-            bail!(
-                "sample_len > n_ctx ({n_len} > {n_ctx}). \
-                 Increase ctx_size or reduce sample_len."
-            );
-        }
-        if prompt_tokens >= n_len {
-            bail!(
-                "prompt ({prompt_tokens} tokens) already meets or exceeds \
-                 sample_len ({n_len}). Increase sample_len to allow generation."
-            );
-        }
-
-        Ok(())
     }
 
     // #[inline]
@@ -656,27 +831,72 @@ impl LlamaModelWrapper {
         formatted_prompt: &str,
         args: &InferenceArgs,
     ) -> Result<DecodeOutput> {
-        // Per-request context creation reallocates the KV cache (and Metal
-        // command buffers on macOS). Log the cost so it can be weighed against
-        // prompt-eval / generation time from `ctx.timings()` when diagnosing
-        // throughput regressions.
-        let t_ctx_start = ggml_time_us();
-        let mut ctx: LlamaContext = self
-            .model
-            .new_context(self.backend, self.ctx_params.clone())
-            .with_context(|| "unable to create the llama_context")?;
-        tracing::info!(
-            "context created in {:.3} s (n_batch={}, n_ubatch={})",
-            Duration::from_micros((ggml_time_us() - t_ctx_start) as u64).as_secs_f32(),
-            ctx.n_batch(),
-            ctx.n_ubatch(),
-        );
+        // No-op sink: identical to the non-streaming path.
+        self.decode_text_only_core_with_sink(formatted_prompt, args, &mut |_| {
+            ControlFlow::Continue(())
+        })
+    }
 
-        let tokens_list = self
-            .model
+    /// Streaming-aware variant of [`Self::decode_text_only_core`]. Calls `sink`
+    /// once per generated piece (string slice of the just-decoded token), in
+    /// generation order. Returning `ControlFlow::Break(())` from the sink stops
+    /// generation cleanly without writing back the prefix-reuse cache (the
+    /// same invariant as an early error: cancel must not leak partial KV
+    /// metadata).
+    fn decode_text_only_core_with_sink(
+        &mut self,
+        formatted_prompt: &str,
+        args: &InferenceArgs,
+        sink: &mut dyn FnMut(&str) -> ControlFlow<()>,
+    ) -> Result<DecodeOutput> {
+        // Hoist all `&self`-dependent work before borrowing the context field:
+        // a `&'static LlamaModel` is `Copy`, and `build_sampler`/`str_to_token`
+        // need `&self`, which would conflict with the `&mut self.context` borrow
+        // taken below. `model` is then used instead of `self.model` for the rest.
+        let model = self.model;
+        let mut sampler = self.build_sampler(args)?;
+        let tokens_list = model
             .str_to_token(formatted_prompt, AddBos::Always)
             .with_context(|| "failed to tokenize prompt")?;
         let prompt_tokens = tokens_list.len() as i32;
+
+        // Build the context once (lazy) then take it out of `self` for exclusive
+        // use; the guard restores it on every exit path (incl. `?`/panic) so the
+        // reused context survives a failed request.
+        self.ensure_context()?;
+        let reuse_kv_prefix = self.reuse_kv_prefix;
+        let mut ctx_guard = RestoreOnDrop::new(&mut self.context);
+        let sync_ctx = ctx_guard.as_mut().expect("context ensured above");
+
+        // Take the prefix record (leaving it empty) so any early return / panic
+        // before we write the new value back leaves it empty — the next request
+        // then safely falls back to a full clear. Also forgets the multimodal
+        // record (this request's KV is text-only).
+        let cached = sync_ctx.take_text_cache();
+        let want_keep = plan_kv_keep(
+            &cached,
+            &tokens_list,
+            prompt_tokens as usize,
+            reuse_kv_prefix,
+        );
+        // Keep [0, want_keep) by removing [want_keep, ∞). want_keep == 0 (default
+        // path, or no common prefix) means a full clear, so each request starts
+        // from an empty KV cache — output identical to a fresh context, while
+        // skipping the costly reallocation. `Ok(false)`/`Err` means the model
+        // can't do partial removal → fall back to a full clear.
+        let n_keep = if want_keep > 0
+            && matches!(
+                sync_ctx
+                    .ctx_mut()
+                    .clear_kv_cache_seq(Some(0), Some(want_keep as u32), None),
+                Ok(true)
+            ) {
+            want_keep
+        } else {
+            sync_ctx.ctx_mut().clear_kv_cache();
+            0
+        };
+        let ctx = sync_ctx.ctx_mut();
 
         // Cap the position budget at n_ctx so a default `max_new_tokens` of
         // 4096 doesn't fail outright on small-context models. This mirrors
@@ -687,22 +907,24 @@ impl LlamaModelWrapper {
         } else {
             args.sample_len.unwrap_or(4096).min(n_ctx)
         };
-        self.check_token_length(&tokens_list, &ctx, n_len)?;
+        check_token_length(&tokens_list, ctx, n_len)?;
 
-        // Prefill the prompt in chunks of at most `n_batch` tokens. A single
-        // `llama_decode` call asserts `n_tokens <= cparams.n_batch`, so a prompt
-        // longer than the effective n_batch (e.g. >2048 tokens by default) must
-        // be split — otherwise generation aborts. Mirrors the multimodal path
-        // and llama.cpp's own `mtmd_helper_eval_chunk_single`. Only the final
-        // token requests logits, for sampling the first generated token.
+        // Prefill the suffix after the reused prefix in chunks of at most
+        // `n_batch` tokens. A single `llama_decode` call asserts
+        // `n_tokens <= cparams.n_batch`, so a prompt longer than the effective
+        // n_batch (e.g. >2048 tokens by default) must be split — otherwise
+        // generation aborts. Mirrors the multimodal path and llama.cpp's own
+        // `mtmd_helper_eval_chunk_single`. Only the final token requests logits,
+        // for sampling the first generated token.
         let n_batch = ctx.n_batch() as usize;
-        // Allocate only what a single chunk needs: capping at prompt_tokens
+        let suffix = &tokens_list[n_keep..];
+        // Allocate only what a single chunk needs: capping at the suffix length
         // avoids llama_batch_init mallocing n_batch-sized buffers for a short
         // prompt, while never exceeding n_batch (the per-decode hard limit).
-        let mut batch = LlamaBatch::new(n_batch.min(prompt_tokens as usize), 1);
+        let mut batch = LlamaBatch::new(n_batch.min(suffix.len()), 1);
         let last_index: i32 = prompt_tokens - 1;
-        let mut pos: i32 = 0;
-        for chunk in tokens_list.chunks(n_batch) {
+        let mut pos: i32 = n_keep as i32;
+        for chunk in suffix.chunks(n_batch) {
             batch.clear();
             for &token in chunk {
                 batch.add(token, pos, &[0], pos == last_index)?;
@@ -716,6 +938,11 @@ impl LlamaModelWrapper {
 
         let mut n_cur = prompt_tokens;
         let mut n_decode = 0;
+        // Tracks whether the sink asked to stop (cancel). When true, the
+        // prefix-reuse write-back is skipped at the bottom of the function —
+        // a partially-consumed prompt must not be advertised as a reusable
+        // cache.
+        let mut cancelled = false;
 
         let t_main_start = ggml_time_us();
 
@@ -724,7 +951,6 @@ impl LlamaModelWrapper {
 
         // XXX assume string byte size 4
         let mut output_buffer = String::with_capacity((n_len * 4) as usize);
-        let mut sampler = self.build_sampler(args)?;
 
         while n_cur < n_len {
             // sample the next token
@@ -735,15 +961,15 @@ impl LlamaModelWrapper {
                 // double-advance stateful samplers — for llguidance that
                 // consumes the just-sampled token twice, corrupting the grammar
                 // state and silently disabling all further masking.
-                let token = sampler.sample(&ctx, batch.n_tokens() - 1);
+                let token = sampler.sample(ctx, batch.n_tokens() - 1);
 
                 // is it an end of stream?
-                if self.model.is_eog_token(token) {
+                if model.is_eog_token(token) {
                     eprintln!();
                     break;
                 }
 
-                let output_bytes = token_to_piece_bytes_retry(&self.model, token)?;
+                let output_bytes = token_to_piece_bytes_retry(model, token)?;
                 // use `Decoder.decode_to_string()` to avoid the intermediate buffer
                 let mut output_string = String::with_capacity(32);
                 let _decode_result =
@@ -782,6 +1008,16 @@ impl LlamaModelWrapper {
 
                 // batch.clear();
                 // batch.add(new_token_id, n_cur, &[0], true)?;
+
+                // Stream the just-decoded piece; Break → drop out of the
+                // loop *before* the next decode and skip KV write-back below.
+                if sink_requests_stop(sink, &output_string) {
+                    cancelled = true;
+                }
+            }
+
+            if cancelled {
+                break;
             }
 
             n_cur += 1;
@@ -803,6 +1039,17 @@ impl LlamaModelWrapper {
         );
 
         tracing::info!("{}", ctx.timings());
+
+        // Record the prompt tokens now in the KV cache so the next request can
+        // reuse their shared prefix. Only the prompt (positions 0..prompt_tokens)
+        // is stored: generated tokens occupy positions >= prompt_tokens, which a
+        // future request always discards (they lie beyond any common prefix).
+        // Written only on natural completion — an error or a sink-driven
+        // cancel leaves `cached_tokens` empty (taken above), forcing a safe
+        // full clear next time.
+        if reuse_kv_prefix && !cancelled {
+            sync_ctx.cached_tokens = tokens_list;
+        }
 
         Ok(DecodeOutput {
             text: output_buffer,
@@ -856,37 +1103,73 @@ impl LlamaModelWrapper {
         bitmaps: &[llama_cpp_2::mtmd::MtmdBitmap],
         args: &InferenceArgs,
     ) -> Result<DecodeOutput> {
+        self.decode_multimodal_core_with_sink(formatted_prompt, bitmaps, args, &mut |_| {
+            ControlFlow::Continue(())
+        })
+    }
+
+    /// Streaming-aware variant of [`Self::decode_multimodal_core`]. Same sink
+    /// contract as [`Self::decode_text_only_core_with_sink`].
+    fn decode_multimodal_core_with_sink(
+        &mut self,
+        formatted_prompt: &str,
+        bitmaps: &[llama_cpp_2::mtmd::MtmdBitmap],
+        args: &InferenceArgs,
+        sink: &mut dyn FnMut(&str) -> ControlFlow<()>,
+    ) -> Result<DecodeOutput> {
+        // Hoist `&self`-wide work (build_sampler, model copy) before borrowing
+        // the context field. `mtmd` is a separate field, so it can be borrowed
+        // alongside the `&mut self.context` guard below (disjoint borrows).
+        let model = self.model;
+        let mut sampler = self.build_sampler(args)?;
+
+        let reuse_kv_prefix = self.reuse_kv_prefix;
+        self.ensure_context()?;
         let mtmd = self
             .mtmd
             .as_ref()
             .expect("mtmd should be Some in multimodal path");
+        let mut ctx_guard = RestoreOnDrop::new(&mut self.context);
+        let sync_ctx = ctx_guard.as_mut().expect("context ensured above");
 
-        // See `decode_text_only_core`: per-request context creation reallocates
-        // the KV cache; log the cost for throughput diagnosis.
-        let t_ctx_start = ggml_time_us();
-        let mut ctx: LlamaContext = self
-            .model
-            .new_context(self.backend, self.ctx_params.clone())
-            .with_context(|| "unable to create context for multimodal")?;
-        tracing::info!(
-            "context created in {:.3} s (n_batch={}, n_ubatch={})",
-            Duration::from_micros((ggml_time_us() - t_ctx_start) as u64).as_secs_f32(),
-            ctx.n_batch(),
-            ctx.n_ubatch(),
-        );
-        let n_ctx = ctx.n_ctx() as i32;
-        // Use the context's effective n_batch for prefill chunking so the
-        // configured n_batch is honored (matching the text path) instead of a
-        // fixed 512. It must not exceed cparams.n_batch: `llama_decode` asserts
-        // `n_tokens <= n_batch`, so a hardcoded larger value would abort.
-        let n_batch = ctx.n_batch() as i32;
+        // Take the multimodal record (leaving it empty so an early return falls
+        // back to a full clear) and forget the text record.
+        let cached_chunks = sync_ctx.take_chunk_cache();
 
         tracing::debug!("multimodal formatted prompt: {}", formatted_prompt);
 
-        // Prefill via mtmd (tokenize + eval_chunks)
+        // Tokenize into chunks (without evaluating) so we can compare against the
+        // cached chunk sequence and reuse the matching KV prefix.
+        let chunks = mtmd
+            .tokenize(formatted_prompt, bitmaps)
+            .map_err(|e| anyhow::anyhow!(e).context("mtmd: tokenize"))?;
+        let (new_chunks, new_n_pos) = describe_chunks(&chunks, bitmaps);
+
+        let (start_index, want_keep) =
+            plan_chunk_keep(&cached_chunks, &new_chunks, &new_n_pos, reuse_kv_prefix);
+
+        let n_batch = sync_ctx.ctx_mut().n_batch() as i32;
+        let n_ctx = sync_ctx.ctx_mut().n_ctx() as i32;
+
+        // Keep [0, want_keep); a partial-removal failure or want_keep==0 falls
+        // back to a full clear (start from chunk 0).
+        let (start_index, n_keep) = if want_keep > 0
+            && matches!(
+                sync_ctx
+                    .ctx_mut()
+                    .clear_kv_cache_seq(Some(0), Some(want_keep as u32), None),
+                Ok(true)
+            ) {
+            (start_index, want_keep)
+        } else {
+            sync_ctx.ctx_mut().clear_kv_cache();
+            (0, 0)
+        };
+        let ctx = sync_ctx.ctx_mut();
+
         let n_past = mtmd
-            .tokenize_and_prefill(&mut ctx, formatted_prompt, bitmaps, n_batch)
-            .map_err(|e| anyhow::anyhow!(e).context("mtmd: tokenize_and_prefill"))?;
+            .eval_chunks_from(&chunks, start_index, n_keep, ctx, n_batch)
+            .map_err(|e| anyhow::anyhow!(e).context("mtmd: eval_chunks_from"))?;
 
         let n_len = if let Some(max_new) = args.max_new_tokens {
             (n_past + max_new).min(n_ctx)
@@ -903,11 +1186,11 @@ impl LlamaModelWrapper {
         let mut batch = LlamaBatch::new(1, 1);
         let mut n_cur = n_past;
         let n_stop = n_len;
-        let mut sampler = self.build_sampler(args)?;
         let mut decoder = encoding_rs::UTF_8.new_decoder();
         let mut output_buffer = String::with_capacity(((n_len - n_past) * 4) as usize);
         let mut first = true;
         let mut n_decode = 0;
+        let mut cancelled = false;
 
         let t_main_start = ggml_time_us();
 
@@ -918,16 +1201,21 @@ impl LlamaModelWrapper {
             // `sample` accepts the token internally; do not call `accept` again
             // (see decode_text_only_core for why double-accept breaks the
             // llguidance grammar sampler).
-            let token = sampler.sample(&ctx, sample_idx);
+            let token = sampler.sample(ctx, sample_idx);
 
-            if self.model.is_eog_token(token) {
+            if model.is_eog_token(token) {
                 break;
             }
 
-            let output_bytes = token_to_piece_bytes_retry(&self.model, token)?;
+            let output_bytes = token_to_piece_bytes_retry(model, token)?;
             let mut output_string = String::with_capacity(32);
             let _ = decoder.decode_to_string(&output_bytes, &mut output_string, false);
             output_buffer.push_str(&output_string);
+
+            if sink_requests_stop(sink, &output_string) {
+                cancelled = true;
+                break;
+            }
 
             batch.clear();
             batch.add(token, n_cur, &[0], true)?;
@@ -948,6 +1236,14 @@ impl LlamaModelWrapper {
         );
         tracing::info!("{}", ctx.timings());
 
+        // Record the prompt's chunk sequence so the next multimodal request can
+        // reuse its shared prefix. Only on natural completion — an error or a
+        // sink-driven cancel leaves the record empty (taken above), forcing a
+        // safe full clear next time.
+        if reuse_kv_prefix && !cancelled {
+            sync_ctx.cached_chunks = new_chunks;
+        }
+
         Ok(DecodeOutput {
             text: output_buffer,
             prompt_tokens: n_past as u32,
@@ -956,6 +1252,21 @@ impl LlamaModelWrapper {
     }
 
     pub fn run_chat(&mut self, args: LlmChatArgs) -> Result<LlmChatResult> {
+        self.run_chat_with_sink(args, &mut |_| ControlFlow::Continue(()))
+    }
+
+    /// Streaming-aware variant of [`Self::run_chat`]. The `sink` is invoked
+    /// once per generated piece (already in raw form — `<think>` tags are
+    /// included). The returned `LlmChatResult` is the **final** chunk and
+    /// carries `done=true`, the full `usage` block, and (when requested) the
+    /// extracted reasoning_content. Callers that re-split reasoning in real
+    /// time should ignore the result's `reasoning_content`/`content` payload
+    /// (they will already have streamed both) and use only the metadata.
+    pub fn run_chat_with_sink(
+        &mut self,
+        args: LlmChatArgs,
+        sink: &mut dyn FnMut(&str) -> ControlFlow<()>,
+    ) -> Result<LlmChatResult> {
         if let Some(ref fo) = args.function_options
             && fo.use_function_calling
         {
@@ -991,7 +1302,7 @@ impl LlamaModelWrapper {
 
         let t_start = ggml_time_us();
         let output: DecodeOutput = if medias.is_empty() {
-            self.decode_text_only_core(&formatted_prompt, &inference_args)?
+            self.decode_text_only_core_with_sink(&formatted_prompt, &inference_args, sink)?
         } else {
             let mtmd = self
                 .mtmd
@@ -1000,7 +1311,12 @@ impl LlamaModelWrapper {
             let bitmaps = mtmd
                 .prepare_bitmaps(&medias, &self.media_limits)
                 .map_err(|e| anyhow::anyhow!(e).context("mtmd: preparing bitmaps"))?;
-            self.decode_multimodal_core(&formatted_prompt, &bitmaps, &inference_args)?
+            self.decode_multimodal_core_with_sink(
+                &formatted_prompt,
+                &bitmaps,
+                &inference_args,
+                sink,
+            )?
         };
         let t_end = ggml_time_us();
         let total_time = Duration::from_micros((t_end - t_start) as u64);
@@ -1040,6 +1356,16 @@ impl LlamaModelWrapper {
     /// (see `validate_completion_args`) so jobworkerp completion workers can
     /// reuse their existing payload shape.
     pub fn run_completion(&mut self, args: LlmCompletionArgs) -> Result<LlmCompletionResult> {
+        self.run_completion_with_sink(args, &mut |_| ControlFlow::Continue(()))
+    }
+
+    /// Streaming-aware variant of [`Self::run_completion`]. See
+    /// [`Self::run_chat_with_sink`] for the sink contract.
+    pub fn run_completion_with_sink(
+        &mut self,
+        args: LlmCompletionArgs,
+        sink: &mut dyn FnMut(&str) -> ControlFlow<()>,
+    ) -> Result<LlmCompletionResult> {
         validate_completion_args(&args)?;
 
         let options = args.options.unwrap_or_default();
@@ -1069,7 +1395,8 @@ impl LlamaModelWrapper {
         };
 
         let t_start = ggml_time_us();
-        let output = self.decode_text_only_core(&formatted_prompt, &inference_args)?;
+        let output =
+            self.decode_text_only_core_with_sink(&formatted_prompt, &inference_args, sink)?;
         let t_end = ggml_time_us();
         let total_time = Duration::from_micros((t_end - t_start) as u64);
 
@@ -1290,6 +1617,147 @@ impl LlamaModelWrapper {
     }
 }
 
+/// Length of the longest common prefix of two token slices. Used for KV prefix
+/// reuse: tokens up to this length are already in the KV cache and can be kept.
+fn common_prefix_len(a: &[LlamaToken], b: &[LlamaToken]) -> usize {
+    a.iter().zip(b).take_while(|(x, y)| x == y).count()
+}
+
+/// Number of KV-cached prompt tokens to keep for prefix reuse. Returns 0 (full
+/// clear) when reuse is off or there is no cache. Capped at `prompt_tokens - 1`
+/// so the last prompt token is always re-decoded — the first sample needs fresh
+/// logits, and an empty prefill range would leave none. `prompt_tokens >= 1` is
+/// guaranteed by `AddBos::Always` plus the empty-prompt bail in `run`.
+fn plan_kv_keep(
+    cached: &[LlamaToken],
+    tokens: &[LlamaToken],
+    prompt_tokens: usize,
+    reuse: bool,
+) -> usize {
+    if !reuse || cached.is_empty() {
+        return 0;
+    }
+    common_prefix_len(cached, tokens).min(prompt_tokens - 1)
+}
+
+/// Identity key for an image/audio bitmap, used to decide whether a media chunk
+/// in a new prompt matches one already in the KV cache. Hashes the decoded
+/// pixel/sample data plus dimensions. A collision would reuse the wrong KV, so
+/// the full data is hashed (not just dimensions).
+fn bitmap_identity_key(bitmap: &llama_cpp_2::mtmd::MtmdBitmap) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    bitmap.is_audio().hash(&mut hasher);
+    bitmap.nx().hash(&mut hasher);
+    bitmap.ny().hash(&mut hasher);
+    bitmap.data().hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Plan how much of the multimodal KV cache to keep. Compares the cached chunk
+/// sequence against the new one chunk-by-chunk and returns
+/// `(start_index, n_keep)`: the number of leading chunks to reuse and the KV
+/// position count they occupy. Reuse stops at the first differing chunk.
+///
+/// If every new chunk matches, the last matching chunk is dropped (re-evaluated)
+/// so the final prompt position is re-decoded — the first sample needs fresh
+/// logits, mirroring the text path's `prompt_tokens - 1` cap. Returns `(0, 0)`
+/// (full clear) when reuse is off, there is no cache, or nothing matches.
+fn plan_chunk_keep(
+    cached: &[CachedChunk],
+    new_chunks: &[CachedChunk],
+    new_n_pos: &[i32],
+    reuse: bool,
+) -> (usize, i32) {
+    if !reuse || cached.is_empty() || new_chunks.is_empty() {
+        return (0, 0);
+    }
+    // A media chunk with no bitmap (`key: None`) can't be proven identical, so
+    // it ends the reusable prefix even though `None == None` — otherwise a later
+    // changed image could be mistaken for an unchanged one and reuse stale KV.
+    let reusable = |c: &CachedChunk| !matches!(c, CachedChunk::Media { key: None, .. });
+    let mut matched = cached
+        .iter()
+        .zip(new_chunks)
+        .take_while(|(a, b)| a == b && reusable(a))
+        .count();
+    // Never keep the entire new prompt: re-evaluate at least the last chunk.
+    if matched == new_chunks.len() {
+        matched -= 1;
+    }
+    let n_keep: i32 = new_n_pos[..matched].iter().sum();
+    (matched, n_keep)
+}
+
+/// Describe a tokenized chunk sequence for prefix comparison: a `CachedChunk`
+/// per chunk (text → tokens, media → bitmap identity key) and its KV position
+/// count. Media chunks consume `bitmaps` in order.
+///
+/// One media chunk is paired with one bitmap. Tiling models (e.g. MiniCPM-V,
+/// Idefics3) split a single bitmap into several image chunks, so chunks can
+/// outnumber bitmaps; once bitmaps run out, the remaining media chunks get
+/// `key: None`. `plan_chunk_keep` stops reuse at the first such chunk, so a
+/// later differing image can never be mistaken for an unchanged one — at the
+/// cost of no reuse past that point on tiling models. Per-tile keys would
+/// restore it.
+fn describe_chunks(
+    chunks: &llama_cpp_2::mtmd::MtmdInputChunks,
+    bitmaps: &[llama_cpp_2::mtmd::MtmdBitmap],
+) -> (Vec<CachedChunk>, Vec<i32>) {
+    use llama_cpp_2::mtmd::MtmdInputChunkType;
+    let mut described = Vec::with_capacity(chunks.len());
+    let mut n_pos = Vec::with_capacity(chunks.len());
+    let mut bitmaps = bitmaps.iter();
+    for i in 0..chunks.len() {
+        let chunk = chunks.get(i).expect("index < len");
+        let cached = match chunk.chunk_type() {
+            MtmdInputChunkType::Text => {
+                CachedChunk::Text(chunk.text_tokens().unwrap_or_default().to_vec())
+            }
+            _ => CachedChunk::Media {
+                key: bitmaps.next().map(bitmap_identity_key),
+                n_pos: chunk.n_positions(),
+            },
+        };
+        n_pos.push(chunk.n_positions());
+        described.push(cached);
+    }
+    (described, n_pos)
+}
+
+/// Validate the position budget against the context size. Free function (not a
+/// method) so it can be called while the context is borrowed out of `self` via
+/// the reuse guard, without also borrowing `&self`.
+fn check_token_length(tokens_list: &[LlamaToken], ctx: &LlamaContext, n_len: i32) -> Result<()> {
+    // n_len is an absolute position cap (same semantics as multimodal).
+    let n_ctx = ctx.n_ctx() as i32;
+    let prompt_tokens = tokens_list.len() as i32;
+
+    tracing::info!("sample_len = {n_len}, n_ctx = {n_ctx}, prompt_tokens = {prompt_tokens}");
+
+    if n_len > n_ctx {
+        bail!(
+            "sample_len > n_ctx ({n_len} > {n_ctx}). \
+             Increase ctx_size or reduce sample_len."
+        );
+    }
+    if prompt_tokens >= n_len {
+        bail!(
+            "prompt ({prompt_tokens} tokens) already meets or exceeds \
+             sample_len ({n_len}). Increase sample_len to allow generation."
+        );
+    }
+
+    Ok(())
+}
+
+/// Returns `true` when the streaming sink asked to stop generation. Used by
+/// both core loops so the "Break → cancel + suppress KV write-back" rule is
+/// expressed in one place.
+fn sink_requests_stop(sink: &mut dyn FnMut(&str) -> ControlFlow<()>, chunk: &str) -> bool {
+    matches!(sink(chunk), ControlFlow::Break(()))
+}
+
 /// Convert a token to bytes, retrying with a larger buffer if the first
 /// attempt reports `InsufficientBufferSpace`. Mirrors the internal retry
 /// logic of `LlamaModel::token_to_piece`, but returns raw bytes so the
@@ -1483,6 +1951,135 @@ mod tests {
         println!("chunked-prefill output: {output}");
     }
 
+    /// Context reuse across requests must be transparent: the reused context is
+    /// KV-cleared at each request top, so consecutive requests are independent
+    /// and deterministic, and a failed request does not poison the next one.
+    ///
+    /// ```bash
+    /// cargo test -p jobworkerp-llama-cpp-plugin test_context_reuse_is_isolated \
+    ///     --release -- --ignored --test-threads=1 --nocapture
+    /// ```
+    #[test]
+    #[ignore]
+    fn test_context_reuse_is_isolated() {
+        // Greedy (no temperature) for determinism.
+        fn args(prompt: &str) -> InferenceArgs {
+            InferenceArgs {
+                prompt: prompt.to_string(),
+                sample_len: Some(48),
+                max_new_tokens: None,
+                temperature: None,
+                top_p: None,
+                repeat_penalty: None,
+                repeat_last_n: None,
+                seed: Some(1234),
+                json_schema: None,
+                medias: vec![],
+            }
+        }
+        let prompt_a = "The capital of France is";
+        let prompt_b = "Two plus two equals";
+
+        // Baseline: each prompt run once on its own fresh wrapper (fresh context).
+        let baseline_b = LlamaModelWrapper::new(LlamaModelConfig::default())
+            .expect("load")
+            .run(args(prompt_b))
+            .expect("baseline b");
+
+        // Reuse: run A then B on the SAME wrapper (B reuses A's context).
+        let mut wrapper = LlamaModelWrapper::new(LlamaModelConfig::default()).expect("load");
+        let reuse_a1 = wrapper.run(args(prompt_a)).expect("reuse a1");
+        let reuse_b = wrapper.run(args(prompt_b)).expect("reuse b");
+        // (a) KV isolation: B after A equals B on a fresh context.
+        assert_eq!(
+            reuse_b, baseline_b,
+            "reused context must not leak prompt A's KV into prompt B"
+        );
+        // (b) Determinism: A again equals A the first time.
+        let reuse_a2 = wrapper.run(args(prompt_a)).expect("reuse a2");
+        assert_eq!(reuse_a1, reuse_a2, "reused context must be deterministic");
+
+        // (c) Error recovery: an oversized sample_len bails (sample_len > n_ctx
+        // is rejected), then a valid request must still succeed and match.
+        let mut bad = args(prompt_a);
+        bad.sample_len = Some(i32::MAX);
+        assert!(wrapper.run(bad).is_err(), "oversized request should fail");
+        let after_err = wrapper.run(args(prompt_a)).expect("recovers after error");
+        assert_eq!(
+            after_err, reuse_a1,
+            "context must recover cleanly after a failed request"
+        );
+    }
+
+    /// With `reuse_kv_prefix` on, keeping the shared prompt prefix in the KV
+    /// cache must produce output identical to a full clear (the kept KV is the
+    /// same computation), and a failed request must still recover.
+    ///
+    /// ```bash
+    /// cargo test -p jobworkerp-llama-cpp-plugin test_reuse_kv_prefix_matches_full_clear \
+    ///     --release -- --ignored --test-threads=1 --nocapture
+    /// ```
+    #[test]
+    #[ignore]
+    fn test_reuse_kv_prefix_matches_full_clear() {
+        fn args(prompt: &str) -> InferenceArgs {
+            InferenceArgs {
+                prompt: prompt.to_string(),
+                sample_len: Some(48),
+                max_new_tokens: None,
+                temperature: None,
+                top_p: None,
+                repeat_penalty: None,
+                repeat_last_n: None,
+                seed: Some(1234),
+                json_schema: None,
+                medias: vec![],
+            }
+        }
+        // Shared prefix, differing tails — the case prefix reuse optimizes.
+        let shared = "You are a helpful assistant. The user asks: ";
+        let prompt_a = format!("{shared}what is the capital of France?");
+        let prompt_b = format!("{shared}what is two plus two?");
+
+        let reuse_cfg = || LlamaModelConfig {
+            reuse_kv_prefix: true,
+            ..LlamaModelConfig::default()
+        };
+
+        // Baselines on fresh wrappers (each request = full clear).
+        let baseline_a = LlamaModelWrapper::new(reuse_cfg())
+            .expect("load")
+            .run(args(&prompt_a))
+            .expect("baseline a");
+        let baseline_b = LlamaModelWrapper::new(reuse_cfg())
+            .expect("load")
+            .run(args(&prompt_b))
+            .expect("baseline b");
+
+        // Same wrapper: A then B reuses the shared prefix; outputs must match
+        // the full-clear baselines (correctness of partial KV removal).
+        let mut wrapper = LlamaModelWrapper::new(reuse_cfg()).expect("load");
+        let reuse_a = wrapper.run(args(&prompt_a)).expect("reuse a");
+        let reuse_b = wrapper.run(args(&prompt_b)).expect("reuse b");
+        assert_eq!(reuse_a, baseline_a, "prefix reuse changed prompt A output");
+        assert_eq!(
+            reuse_b, baseline_b,
+            "prefix reuse (A→B) changed prompt B output"
+        );
+
+        // Determinism: A again (reuses its own full prefix) equals the first A.
+        let reuse_a2 = wrapper.run(args(&prompt_a)).expect("reuse a2");
+        assert_eq!(reuse_a2, baseline_a, "prefix reuse must be deterministic");
+
+        // Error recovery: a failed request empties the cache record; the next
+        // request falls back to a full clear and still matches the baseline.
+        let mut bad = args(&prompt_a);
+        bad.sample_len = Some(i32::MAX);
+        assert!(wrapper.run(bad).is_err(), "oversized request should fail");
+        let after_err = wrapper.run(args(&prompt_b)).expect("recovers after error");
+        assert_eq!(after_err, baseline_b, "must recover after a failed request");
+    }
+
     #[test]
     fn test_runner_settings_maps_batch_fields_to_config() {
         use jobworkerp_llama_protobuf::protobuf::llama_cpp::KvCacheType as ProtoKv;
@@ -1498,6 +2095,7 @@ mod tests {
             n_ubatch: Some(512),
             type_k: Some(ProtoKv::Q80 as i32),
             type_v: Some(ProtoKv::Q80 as i32),
+            reuse_kv_prefix: Some(true),
             use_flash_attention: None,
             system_prompt: None,
             mtmd: None,
@@ -1507,6 +2105,9 @@ mod tests {
         assert_eq!(config.n_ubatch, Some(512));
         assert_eq!(config.type_k, Some(ProtoKv::Q80 as i32));
         assert_eq!(config.type_v, Some(ProtoKv::Q80 as i32));
+        assert!(config.reuse_kv_prefix);
+        // Default keeps reuse off so requests stay independent.
+        assert!(!LlamaModelConfig::default().reuse_kv_prefix);
     }
 
     #[test]
@@ -1589,6 +2190,136 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_restore_on_drop_returns_value_on_normal_scope_exit() {
+        let mut slot = Some(42);
+        {
+            let mut guard = RestoreOnDrop::new(&mut slot);
+            assert_eq!(*guard, Some(42), "value is moved into the guard");
+            *guard = Some(7); // mutate while held
+        }
+        assert_eq!(slot, Some(7), "guard writes its value back on drop");
+    }
+
+    #[test]
+    fn test_restore_on_drop_returns_value_on_early_return() {
+        // Simulate an early `?`-style return while the guard is held: the value
+        // must still be restored to the slot (this is why a failed decode does
+        // not lose the reusable context).
+        let mut slot = Some(String::from("ctx"));
+        fn body(slot: &mut Option<String>) -> Result<()> {
+            let _guard = RestoreOnDrop::new(slot);
+            bail!("simulated mid-request failure");
+        }
+        let err = body(&mut slot);
+        assert!(err.is_err());
+        assert_eq!(slot.as_deref(), Some("ctx"), "value survives early return");
+    }
+
+    #[test]
+    fn test_common_prefix_len() {
+        let t = |ids: &[i32]| ids.iter().map(|&i| LlamaToken(i)).collect::<Vec<_>>();
+        assert_eq!(common_prefix_len(&t(&[]), &t(&[])), 0);
+        assert_eq!(common_prefix_len(&t(&[1, 2, 3]), &t(&[4, 5])), 0);
+        assert_eq!(common_prefix_len(&t(&[1, 2, 3]), &t(&[1, 2, 3])), 3);
+        // One is a prefix of the other → length of the shorter.
+        assert_eq!(common_prefix_len(&t(&[1, 2, 3, 4]), &t(&[1, 2])), 2);
+        // Diverge mid-sequence → index of the first difference.
+        assert_eq!(common_prefix_len(&t(&[1, 2, 9, 4]), &t(&[1, 2, 3, 4])), 2);
+    }
+
+    #[test]
+    fn test_plan_kv_keep() {
+        let t = |ids: &[i32]| ids.iter().map(|&i| LlamaToken(i)).collect::<Vec<_>>();
+        // Reuse off → always full clear, regardless of overlap.
+        assert_eq!(plan_kv_keep(&t(&[0, 1, 2]), &t(&[0, 1, 2]), 3, false), 0);
+        // Empty cache → full clear.
+        assert_eq!(plan_kv_keep(&t(&[]), &t(&[0, 1, 2]), 3, true), 0);
+        // Partial overlap → keep the common prefix.
+        assert_eq!(plan_kv_keep(&t(&[0, 1, 9]), &t(&[0, 1, 2]), 3, true), 2);
+        // Full match is capped to prompt_tokens - 1 so the last token is always
+        // re-decoded (the first sample needs fresh logits).
+        assert_eq!(plan_kv_keep(&t(&[0, 1, 2]), &t(&[0, 1, 2]), 3, true), 2);
+    }
+
+    #[test]
+    fn test_plan_chunk_keep() {
+        let txt = |ids: &[i32]| CachedChunk::Text(ids.iter().map(|&i| LlamaToken(i)).collect());
+        let img = |key: u64, n_pos: i32| CachedChunk::Media {
+            key: Some(key),
+            n_pos,
+        };
+        // Media chunk with no paired bitmap (tiling overflow).
+        let img_unkeyed = |n_pos: i32| CachedChunk::Media { key: None, n_pos };
+
+        // Shared [image(256 pos), text(0,1)] prefix; the tail text chunk differs.
+        let cached = vec![img(7, 256), txt(&[0, 1]), txt(&[9])];
+        let new = vec![img(7, 256), txt(&[0, 1]), txt(&[5])];
+        let n_pos = vec![256, 2, 1];
+        // Keep the first 2 chunks (image + matching text) = 256 + 2 positions.
+        assert_eq!(
+            plan_chunk_keep(&cached, &new, &n_pos, true),
+            (2, 258),
+            "keep the matching image+text prefix, re-eval the differing tail"
+        );
+
+        // Reuse off → full clear.
+        assert_eq!(plan_chunk_keep(&cached, &new, &n_pos, false), (0, 0));
+        // Empty cache → full clear.
+        assert_eq!(plan_chunk_keep(&[], &new, &n_pos, true), (0, 0));
+        // Differing image at index 0 → nothing matches.
+        let other_img = vec![img(99, 256), txt(&[0, 1]), txt(&[5])];
+        assert_eq!(plan_chunk_keep(&other_img, &new, &n_pos, true), (0, 0));
+
+        // Full match drops the last chunk so the final position is re-decoded.
+        let same = vec![img(7, 256), txt(&[0, 1])];
+        let same_n_pos = vec![256, 2];
+        assert_eq!(
+            plan_chunk_keep(&same, &same, &same_n_pos, true),
+            (1, 256),
+            "full match keeps all but the last chunk"
+        );
+
+        // An unkeyed media chunk (tiling overflow) ends the prefix even when
+        // both sides are byte-identical: its image can't be proven unchanged, so
+        // reusing its KV could serve a stale image. Keep only the chunk before.
+        let unkeyed = vec![img(7, 256), img_unkeyed(256), txt(&[0, 1])];
+        let unkeyed_n_pos = vec![256, 256, 2];
+        assert_eq!(
+            plan_chunk_keep(&unkeyed, &unkeyed, &unkeyed_n_pos, true),
+            (1, 256),
+            "reuse stops at the first unkeyed media chunk"
+        );
+    }
+
+    #[test]
+    fn test_model_load_identity_distinguishes_load_settings() {
+        let paths = vec![PathBuf::from("model.gguf")];
+        let base = LlamaModelConfig::default();
+        let id_base = model_load_identity(&paths, &base);
+
+        // Same load-affecting settings → same identity (reload is allowed).
+        assert_eq!(id_base, model_load_identity(&paths, &base));
+
+        // A different model path → different identity (load is rejected).
+        let other_paths = vec![PathBuf::from("other.gguf")];
+        assert_ne!(id_base, model_load_identity(&other_paths, &base));
+
+        // disable_gpu changes how the model loads → different identity.
+        let gpu_off = LlamaModelConfig {
+            disable_gpu: true,
+            ..LlamaModelConfig::default()
+        };
+        assert_ne!(id_base, model_load_identity(&paths, &gpu_off));
+
+        // ctx_size does NOT affect model loading → identity unchanged.
+        let bigger_ctx = LlamaModelConfig {
+            ctx_size: std::num::NonZeroU32::new(8192),
+            ..LlamaModelConfig::default()
+        };
+        assert_eq!(id_base, model_load_identity(&paths, &bigger_ctx));
+    }
+
     /// Multimodal generation happy-path with a real model.
     ///
     /// Requires gemma-4-E4B-it (downloaded from HuggingFace on first run).
@@ -1620,6 +2351,7 @@ mod tests {
             n_ubatch: None,
             type_k: None,
             type_v: None,
+            reuse_kv_prefix: false,
             use_flash_attention: Some(true),
             system_prompt: Some("You are a helpful assistant.".to_string()),
             mtmd: Some(jobworkerp_llama_protobuf::MtmdSettings {
@@ -1659,6 +2391,242 @@ mod tests {
         println!("Multimodal output: {output}");
     }
 
+    /// Regression: with `reuse_kv_prefix=true`, a multimodal request between two
+    /// text requests must not corrupt the second text request. The multimodal
+    /// path fully clears the KV cache; if it left `cached_tokens` stale, the
+    /// following text request would skip prefilling a prefix that is no longer in
+    /// the KV cache and generate garbage. The final text output must match a
+    /// fresh-context baseline.
+    ///
+    /// ```bash
+    /// cargo test -p jobworkerp-llama-cpp-plugin test_multimodal_between_text_clears_prefix_cache \
+    ///     --release -- --ignored --test-threads=1 --nocapture
+    /// ```
+    #[test]
+    #[ignore]
+    fn test_multimodal_between_text_clears_prefix_cache() {
+        use jobworkerp_llama_protobuf::protobuf::llama_cpp::MediaKind;
+        use jobworkerp_llama_protobuf::protobuf::llama_cpp::media_input::Source;
+
+        let image_bytes =
+            std::fs::read(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../output.png"))
+                .expect("output.png should exist in repo root");
+        let mtmd_config = || LlamaModelConfig {
+            model: "gemma-4-E4B-it-Q4_K_M.gguf".to_string(),
+            hf_repo: Some("unsloth/gemma-4-E4B-it-GGUF".to_string()),
+            ctx_size: std::num::NonZeroU32::new(2048),
+            reuse_kv_prefix: true,
+            use_flash_attention: Some(true),
+            system_prompt: Some("You are a helpful assistant.".to_string()),
+            mtmd: Some(jobworkerp_llama_protobuf::MtmdSettings {
+                mmproj: "mmproj-F16.gguf".to_string(),
+                mmproj_hf_repo: Some("unsloth/gemma-4-E4B-it-GGUF".to_string()),
+                mmproj_use_gpu: None,
+                media_marker: None,
+                allow_url_fetch: false,
+                max_media_bytes: 10_000_000,
+                max_decoded_media_bytes: 100_000_000,
+                allowed_media_dirs: vec![],
+            }),
+            ..LlamaModelConfig::default()
+        };
+        let text_args = |prompt: &str| InferenceArgs {
+            prompt: prompt.to_string(),
+            sample_len: Some(48),
+            max_new_tokens: None,
+            temperature: None,
+            top_p: None,
+            repeat_penalty: None,
+            repeat_last_n: None,
+            seed: Some(1234),
+            json_schema: None,
+            medias: vec![],
+        };
+        let image_args = InferenceArgs {
+            medias: vec![MediaInput {
+                kind: MediaKind::Image as i32,
+                source: Some(Source::Encoded(image_bytes)),
+                id: None,
+            }],
+            ..text_args("What do you see in this image?")
+        };
+        let text_prompt = "The capital of France is";
+
+        // Baseline: the text prompt on a fresh context (full clear).
+        let baseline = LlamaModelWrapper::new(mtmd_config())
+            .expect("load")
+            .run(text_args(text_prompt))
+            .expect("baseline text");
+
+        // text → multimodal → text on one wrapper. The multimodal call wipes the
+        // KV and must also clear the prefix-reuse record.
+        let mut wrapper = LlamaModelWrapper::new(mtmd_config()).expect("load");
+        wrapper.run(text_args(text_prompt)).expect("first text");
+        wrapper.run(image_args).expect("multimodal");
+        let after = wrapper
+            .run(text_args(text_prompt))
+            .expect("text after image");
+        assert_eq!(
+            after, baseline,
+            "text output after a multimodal request must match a fresh context"
+        );
+    }
+
+    /// With `reuse_kv_prefix=true`, two requests sharing the same image but
+    /// asking different questions must reuse the image KV and produce output
+    /// identical to a full-clear baseline (correctness of partial KV removal at
+    /// a chunk boundary). A changed image must break the prefix and still match.
+    ///
+    /// ```bash
+    /// cargo test -p jobworkerp-llama-cpp-plugin test_multimodal_prefix_reuse_matches_full_clear \
+    ///     --release -- --ignored --test-threads=1 --nocapture
+    /// ```
+    #[test]
+    #[ignore]
+    fn test_multimodal_prefix_reuse_matches_full_clear() {
+        use jobworkerp_llama_protobuf::protobuf::llama_cpp::MediaKind;
+        use jobworkerp_llama_protobuf::protobuf::llama_cpp::media_input::Source;
+
+        let image_bytes =
+            std::fs::read(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../output.png"))
+                .expect("output.png should exist in repo root");
+        let cfg = || LlamaModelConfig {
+            model: "gemma-4-E4B-it-Q4_K_M.gguf".to_string(),
+            hf_repo: Some("unsloth/gemma-4-E4B-it-GGUF".to_string()),
+            ctx_size: std::num::NonZeroU32::new(2048),
+            reuse_kv_prefix: true,
+            use_flash_attention: Some(true),
+            system_prompt: Some("You are a helpful assistant.".to_string()),
+            mtmd: Some(jobworkerp_llama_protobuf::MtmdSettings {
+                mmproj: "mmproj-F16.gguf".to_string(),
+                mmproj_hf_repo: Some("unsloth/gemma-4-E4B-it-GGUF".to_string()),
+                mmproj_use_gpu: None,
+                media_marker: None,
+                allow_url_fetch: false,
+                max_media_bytes: 10_000_000,
+                max_decoded_media_bytes: 100_000_000,
+                allowed_media_dirs: vec![],
+            }),
+            ..LlamaModelConfig::default()
+        };
+        // Same image, two different questions.
+        let img_args = |prompt: &str| InferenceArgs {
+            prompt: prompt.to_string(),
+            sample_len: Some(48),
+            max_new_tokens: None,
+            temperature: None,
+            top_p: None,
+            repeat_penalty: None,
+            repeat_last_n: None,
+            seed: Some(1234),
+            json_schema: None,
+            medias: vec![MediaInput {
+                kind: MediaKind::Image as i32,
+                source: Some(Source::Encoded(image_bytes.clone())),
+                id: None,
+            }],
+        };
+        let q_a = "What is in this image?";
+        let q_b = "What colors appear in this image?";
+
+        // Baseline: question B on a fresh context (full clear, full re-eval).
+        let baseline_b = LlamaModelWrapper::new(cfg())
+            .expect("load")
+            .run(img_args(q_b))
+            .expect("baseline b");
+
+        // Reuse: A then B on one wrapper. B reuses the image (and shared system
+        // prompt) KV; its output must equal the full-clear baseline.
+        let mut wrapper = LlamaModelWrapper::new(cfg()).expect("load");
+        wrapper.run(img_args(q_a)).expect("reuse a");
+        let reuse_b = wrapper.run(img_args(q_b)).expect("reuse b");
+        assert_eq!(
+            reuse_b, baseline_b,
+            "multimodal prefix reuse changed the output for question B"
+        );
+    }
+
+    /// Regression: a text request between two multimodal requests must invalidate
+    /// the multimodal prefix record. The text request fully clears the KV cache;
+    /// if it left `cached_chunks` stale, the second multimodal request would reuse
+    /// an image prefix no longer in the KV and corrupt its output. This is the
+    /// mirror of `test_multimodal_between_text_clears_prefix_cache`.
+    ///
+    /// ```bash
+    /// cargo test -p jobworkerp-llama-cpp-plugin test_text_between_multimodal_clears_chunk_cache \
+    ///     --release -- --ignored --test-threads=1 --nocapture
+    /// ```
+    #[test]
+    #[ignore]
+    fn test_text_between_multimodal_clears_chunk_cache() {
+        use jobworkerp_llama_protobuf::protobuf::llama_cpp::MediaKind;
+        use jobworkerp_llama_protobuf::protobuf::llama_cpp::media_input::Source;
+
+        let image_bytes =
+            std::fs::read(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../output.png"))
+                .expect("output.png should exist in repo root");
+        let cfg = || LlamaModelConfig {
+            model: "gemma-4-E4B-it-Q4_K_M.gguf".to_string(),
+            hf_repo: Some("unsloth/gemma-4-E4B-it-GGUF".to_string()),
+            ctx_size: std::num::NonZeroU32::new(2048),
+            reuse_kv_prefix: true,
+            use_flash_attention: Some(true),
+            system_prompt: Some("You are a helpful assistant.".to_string()),
+            mtmd: Some(jobworkerp_llama_protobuf::MtmdSettings {
+                mmproj: "mmproj-F16.gguf".to_string(),
+                mmproj_hf_repo: Some("unsloth/gemma-4-E4B-it-GGUF".to_string()),
+                mmproj_use_gpu: None,
+                media_marker: None,
+                allow_url_fetch: false,
+                max_media_bytes: 10_000_000,
+                max_decoded_media_bytes: 100_000_000,
+                allowed_media_dirs: vec![],
+            }),
+            ..LlamaModelConfig::default()
+        };
+        let args = |prompt: &str, medias: Vec<MediaInput>| InferenceArgs {
+            prompt: prompt.to_string(),
+            sample_len: Some(48),
+            max_new_tokens: None,
+            temperature: None,
+            top_p: None,
+            repeat_penalty: None,
+            repeat_last_n: None,
+            seed: Some(1234),
+            json_schema: None,
+            medias,
+        };
+        let img_args = || {
+            args(
+                "What is in this image?",
+                vec![MediaInput {
+                    kind: MediaKind::Image as i32,
+                    source: Some(Source::Encoded(image_bytes.clone())),
+                    id: None,
+                }],
+            )
+        };
+        let text_args = || args("The capital of France is", vec![]);
+
+        // Baseline: the image request on a fresh context (full clear).
+        let baseline = LlamaModelWrapper::new(cfg())
+            .expect("load")
+            .run(img_args())
+            .expect("baseline image");
+
+        // image -> text -> image on one wrapper. The text request wipes the KV
+        // and must clear the multimodal record so the second image request does
+        // not reuse a stale image prefix.
+        let mut wrapper = LlamaModelWrapper::new(cfg()).expect("load");
+        wrapper.run(img_args()).expect("first image");
+        wrapper.run(text_args()).expect("text between");
+        let after = wrapper.run(img_args()).expect("image after text");
+        assert_eq!(
+            after, baseline,
+            "image output after an intervening text request must match a fresh context"
+        );
+    }
+
     /// Multimodal audio generation happy-path with a real model.
     ///
     /// Requires Qwen2.5-Omni-7B (audio-capable mmproj).
@@ -1690,6 +2658,7 @@ mod tests {
             n_ubatch: None,
             type_k: None,
             type_v: None,
+            reuse_kv_prefix: false,
             use_flash_attention: Some(true),
             system_prompt: Some("You are a helpful assistant.".to_string()),
             mtmd: Some(jobworkerp_llama_protobuf::MtmdSettings {
@@ -2140,11 +3109,17 @@ mod tests {
         );
         // The required `outcome` enum must appear with a legal value, confirming
         // the grammar is shaping keys/values (not just the opening brace).
-        assert!(text.contains("\"outcome\""), "missing required `outcome` key: {text}");
+        assert!(
+            text.contains("\"outcome\""),
+            "missing required `outcome` key: {text}"
+        );
         let outcome_ok = ["SUCCESS", "PARTIAL", "FAILURE", "ABORTED", "UNKNOWN"]
             .iter()
             .any(|v| text.contains(v));
-        assert!(outcome_ok, "expected a constrained `outcome` enum value: {text}");
+        assert!(
+            outcome_ok,
+            "expected a constrained `outcome` enum value: {text}"
+        );
     }
 
     // Test-only helper exposing the env-driven config builder so reproduction

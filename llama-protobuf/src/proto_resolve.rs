@@ -270,6 +270,7 @@ mod binary_compat_tests {
             n_ubatch: Some(256),
             type_k: Some(crate::protobuf::llama_cpp::KvCacheType::Q80 as i32),
             type_v: Some(crate::protobuf::llama_cpp::KvCacheType::Q80 as i32),
+            reuse_kv_prefix: Some(true),
             use_flash_attention: Some(false),
             system_prompt: Some("Be concise.".into()),
             mtmd: Some(crate::protobuf::llama_cpp::MtmdSettings {
@@ -296,6 +297,7 @@ mod binary_compat_tests {
         assert_eq!(json["nUbatch"], 256);
         assert_eq!(json["typeK"], "KV_CACHE_TYPE_Q8_0");
         assert_eq!(json["typeV"], "KV_CACHE_TYPE_Q8_0");
+        assert_eq!(json["reuseKvPrefix"], true);
         assert_eq!(json["mtmd"]["mmproj"], "proj.gguf");
         assert_eq!(json["mtmd"]["allowUrlFetch"], true);
         assert_eq!(json["mtmd"]["maxMediaBytes"], 5000);
