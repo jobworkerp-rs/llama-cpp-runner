@@ -11,8 +11,7 @@ name = "message_vectordb_reranker_runner"
 crate-type = ["cdylib", "lib"]            # Plugin dynamic library
 
 [features]
-default = ["c-api"]
-c-api = []
+default = []
 
 # Hardware acceleration (llama.cpp features)
 cuda = ["llama-cpp-2/cuda"]
@@ -25,7 +24,14 @@ openmp = ["llama-cpp-2/openmp"]
 command-utils = { workspace = true }
 
 # === JobworkerP Plugin Framework ===
-jobworkerp-client = { path = "../modules/jobworkerp-client" }
+jobworkerp-plugin-abi = { workspace = true }
+jobworkerp-plugin-abi-macros = { workspace = true }
+# Rename to `host_proto` to avoid clashing with the internal `pub mod proto`
+# in src/lib.rs (which carries this crate's own `RerankerArgs`,
+# `RerankerResult`, etc.). Inheriting from workspace.dependencies would
+# require matching the workspace key name, so we restate the git source
+# inline here.
+host-proto = { git = "https://github.com/jobworkerp-rs/jobworkerp-rs.git", branch = "main", package = "proto" }
 
 # === llama.cpp ===
 encoding_rs = { workspace = true }
@@ -41,7 +47,7 @@ anyhow = { workspace = true }
 async-trait = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync"] }
 tracing = { workspace = true }
 prost = { workspace = true }
 dotenvy = { workspace = true }
@@ -53,5 +59,7 @@ lru = { version = "0.16" }         # For cache.rs
 prost-build = { workspace = true }
 
 [dev-dependencies]
+host-proto = { git = "https://github.com/jobworkerp-rs/jobworkerp-rs.git", branch = "main", package = "proto" }
+jobworkerp-plugin-abi = { workspace = true }
 tempfile = "3.23"
 tokio-test = "0.4"

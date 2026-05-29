@@ -3,11 +3,13 @@
 // These tests verify the PluginRunner interface implementation
 // without requiring actual GGUF model files.
 
-use jobworkerp_client::plugins::PluginRunner;
-use message_vectordb_reranker_runner::RerankerRunnerPlugin;
+use host_proto::jobworkerp::data::{MethodJsonSchema, MethodSchema};
+use jobworkerp_plugin_abi::cancel::FfiCancellationToken;
+use jobworkerp_plugin_abi::v2::{CancelToken, PluginV2};
 use message_vectordb_reranker_runner::proto::{
     Candidate, RerankerArgs, RerankerOptions, RerankerResult, RerankerSettings,
 };
+use message_vectordb_reranker_runner::{CANCELLED, METHOD_RUN, RerankerRunnerPlugin};
 use prost::Message;
 use std::collections::HashMap;
 
@@ -76,64 +78,55 @@ fn test_plugin_metadata() {
 fn test_plugin_proto_schemas() {
     let plugin = RerankerRunnerPlugin::new();
 
-    // Test that proto schemas are available
     let settings_proto = plugin.runner_settings_proto();
-    let args_proto = plugin.job_args_proto();
-    let result_proto = plugin.result_output_proto();
+    let methods = plugin.method_proto_map();
+    let run_bytes = methods
+        .get(METHOD_RUN)
+        .expect("`run` method must be registered");
+    let run = MethodSchema::decode(run_bytes.as_slice()).expect("MethodSchema must decode");
 
     assert!(
         !settings_proto.is_empty(),
         "Settings proto should not be empty"
     );
-    assert!(!args_proto.is_empty(), "Args proto should not be empty");
-    assert!(result_proto.is_some(), "Result proto should be Some");
-
-    println!("Settings proto length: {}", settings_proto.len());
-    println!("Args proto length: {}", args_proto.len());
-    println!("Result proto length: {}", result_proto.unwrap().len());
+    assert!(!run.args_proto.is_empty(), "Args proto should not be empty");
+    assert!(
+        !run.result_proto.is_empty(),
+        "Result proto should not be empty"
+    );
 }
 
 #[test]
 fn test_plugin_json_schemas() {
     let plugin = RerankerRunnerPlugin::new();
 
-    // Test that JSON schemas are available (return String directly, not Result)
     let settings_schema = plugin.settings_schema();
-    let args_schema = plugin.arguments_schema();
-    let output_schema = plugin.output_json_schema();
+    let methods = plugin
+        .method_json_schema_map()
+        .expect("method_json_schema_map should be Some");
+    let run_bytes = methods
+        .get(METHOD_RUN)
+        .expect("`run` method must be registered");
+    let run = MethodJsonSchema::decode(run_bytes.as_slice()).expect("MethodJsonSchema must decode");
+    let args_schema = &run.args_schema;
+    let output_schema = run
+        .result_schema
+        .as_ref()
+        .expect("result_schema should be Some");
 
     assert!(
         !settings_schema.is_empty(),
         "Settings schema should not be empty"
     );
     assert!(!args_schema.is_empty(), "Args schema should not be empty");
-    assert!(output_schema.is_some(), "Output schema should be Some");
 
     // Parse as JSON to verify validity
-    let settings_json: serde_json::Value =
+    let _settings_json: serde_json::Value =
         serde_json::from_str(&settings_schema).expect("Settings schema should be valid JSON");
-    let args_json: serde_json::Value =
-        serde_json::from_str(&args_schema).expect("Args schema should be valid JSON");
-
-    // output_schema is Option<String>
-    let output_json: serde_json::Value = if let Some(schema) = output_schema {
-        serde_json::from_str(&schema).expect("Output schema should be valid JSON")
-    } else {
-        panic!("Output schema should not be None");
-    };
-
-    println!(
-        "Settings schema: {}",
-        serde_json::to_string_pretty(&settings_json).unwrap()
-    );
-    println!(
-        "Args schema keys: {:?}",
-        args_json.as_object().unwrap().keys()
-    );
-    println!(
-        "Output schema keys: {:?}",
-        output_json.as_object().unwrap().keys()
-    );
+    let _args_json: serde_json::Value =
+        serde_json::from_str(args_schema).expect("Args schema should be valid JSON");
+    let _output_json: serde_json::Value =
+        serde_json::from_str(output_schema).expect("Output schema should be valid JSON");
 }
 
 #[test]
@@ -238,8 +231,8 @@ fn test_result_protobuf_serialization() {
     assert!(decoded.success);
 }
 
-#[test]
-fn test_plugin_load_with_invalid_settings() {
+#[tokio::test]
+async fn test_plugin_load_with_invalid_settings() {
     let mut plugin = RerankerRunnerPlugin::new();
 
     // Create settings with invalid model path
@@ -256,15 +249,15 @@ fn test_plugin_load_with_invalid_settings() {
         .expect("Should serialize settings");
 
     // Try to load plugin with invalid model
-    let result = plugin.load(buf);
+    let result = plugin.load(buf).await;
 
     // Should return an error (model not found)
     assert!(result.is_err(), "Loading with invalid model should fail");
     println!("Expected error: {:?}", result.unwrap_err());
 }
 
-#[test]
-fn test_plugin_run_without_load() {
+#[tokio::test]
+async fn test_plugin_run_without_load() {
     let mut plugin = RerankerRunnerPlugin::new();
 
     // Try to run without loading
@@ -272,51 +265,49 @@ fn test_plugin_run_without_load() {
     let mut buf = Vec::new();
     args.encode(&mut buf).expect("Should serialize args");
 
-    let (result, _metadata) = plugin.run(buf, HashMap::new());
+    let (result, _metadata) = plugin.run(buf, HashMap::new(), None).await;
 
-    // Should return an error (plugin not loaded)
-    // Note: The current implementation may not check for plugin load state
-    // before attempting to run. If it doesn't return an error, that's also acceptable.
-    if let Err(e) = result {
-        println!("Expected error: {e:?}");
-    } else {
-        println!("Plugin ran without explicit load check - implementation accepts this");
-    }
+    assert!(result.is_err(), "Should fail before reranker is loaded");
 }
 
-#[test]
-fn test_plugin_cancel_operations() {
-    let plugin = RerankerRunnerPlugin::new();
+#[tokio::test]
+async fn test_plugin_cancel_operations() {
+    let mut plugin = RerankerRunnerPlugin::new();
 
-    // Test cancel operations (Phase 1: always returns false)
-    assert!(!plugin.is_canceled(), "Should not be canceled initially");
-    assert!(!plugin.cancel(), "Cancel should return false in Phase 1");
-    assert!(!plugin.is_canceled(), "Should still not be canceled");
+    // A precancelled token must short-circuit run() with Err(CANCELLED) before
+    // any model work is reached, even with no reranker loaded.
+    let (ffi, handle) = FfiCancellationToken::new_owned();
+    handle.cancel();
+    plugin.set_cancellation_token(CancelToken::from_ffi(ffi));
+
+    let args = create_test_args("test query", 3);
+    let mut buf = Vec::new();
+    args.encode(&mut buf).expect("Should serialize args");
+
+    let (result, _) = plugin.run(buf, HashMap::new(), None).await;
+    assert!(
+        matches!(result, Err(ref e) if e == CANCELLED),
+        "Precancelled token must surface as Err(\"cancelled\"), got {result:?}"
+    );
 }
 
-#[test]
-fn test_empty_query_handling() {
+#[tokio::test]
+async fn test_empty_query_handling() {
     let mut args = create_test_args("", 3); // Empty query
     args.query = "".to_string();
 
     let mut buf = Vec::new();
     args.encode(&mut buf).expect("Should serialize args");
 
-    // Since plugin is not loaded, we can't test the actual validation
-    // This test just verifies that empty query can be serialized
     let mut plugin = RerankerRunnerPlugin::new();
-    let (result, _) = plugin.run(buf, HashMap::new());
+    let (result, _) = plugin.run(buf, HashMap::new(), None).await;
 
     // The error could be from not being loaded or from empty query validation
-    if let Err(e) = result {
-        println!("Error as expected: {e:?}");
-    } else {
-        println!("Implementation allows empty query or doesn't enforce load state");
-    }
+    assert!(result.is_err(), "Empty query / not-loaded must fail");
 }
 
-#[test]
-fn test_empty_candidates_handling() {
+#[tokio::test]
+async fn test_empty_candidates_handling() {
     let args = RerankerArgs {
         query: "test query".to_string(),
         candidates: vec![], // Empty candidates
@@ -330,14 +321,9 @@ fn test_empty_candidates_handling() {
     args.encode(&mut buf).expect("Should serialize args");
 
     let mut plugin = RerankerRunnerPlugin::new();
-    let (result, _) = plugin.run(buf, HashMap::new());
+    let (result, _) = plugin.run(buf, HashMap::new(), None).await;
 
-    // The error could be from not being loaded or from empty candidates validation
-    if let Err(e) = result {
-        println!("Error as expected: {e:?}");
-    } else {
-        println!("Implementation allows empty candidates or doesn't enforce load state");
-    }
+    assert!(result.is_err(), "Empty candidates / not-loaded must fail");
 }
 
 #[test]

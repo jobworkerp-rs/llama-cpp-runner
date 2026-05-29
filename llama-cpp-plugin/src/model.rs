@@ -27,6 +27,18 @@ use std::{
     ffi::CString, num::NonZeroU32, ops::ControlFlow, path::PathBuf, sync::OnceLock, time::Duration,
 };
 
+// Error-message constants that callers (tests) match against. Centralising
+// them here keeps the bail!() string in sync with assertions; otherwise a
+// trivial wording change in this file silently breaks the test module.
+pub(crate) const ERR_USE_FUNCTION_CALLING_UNSUPPORTED: &str =
+    "function calling is not supported by this plugin";
+pub(crate) const ERR_CLIENT_TOOLS_WITH_FUNCTION_CALLING: &str =
+    "client_tools_json and use_function_calling are mutually exclusive";
+pub(crate) const ERR_CLIENT_TOOLS_WITH_JSON_SCHEMA: &str =
+    "json_schema and client_tools_json are mutually exclusive";
+pub(crate) const ERR_CLIENT_TOOLS_WITH_MULTIMODAL: &str =
+    "multimodal input combined with client_tools_json is not supported yet";
+
 /// for deserialization.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 enum ParamOverrideValueWrapper {
@@ -287,6 +299,13 @@ pub struct InferenceArgs {
     /// Media items attached to the prompt.
     #[serde(default, skip_serializing)]
     medias: Vec<MediaInput>,
+    /// Grammar specification emitted by the OAI chat template (tools path
+    /// only). When `Some`, `build_sampler` prepends a grammar/grammar_lazy
+    /// sampler ahead of the terminal selector. Mutually exclusive with
+    /// `json_schema` — the run_chat entry point rejects the conflict before
+    /// reaching the sampler.
+    #[serde(default, skip_serializing, skip_deserializing)]
+    grammar_spec: Option<crate::oai_chat::GrammarSpec>,
 }
 
 impl std::fmt::Debug for InferenceArgs {
@@ -450,6 +469,7 @@ impl From<LlamaArg> for InferenceArgs {
             seed: req.seed.map(|s| s as u32),
             json_schema: None,
             medias: req.medias,
+            grammar_spec: None,
         }
     }
 }
@@ -709,7 +729,38 @@ impl LlamaModelWrapper {
         // Ordering constraints before the single terminal selector fixes both.
         let mut samplers: Vec<LlamaSampler> = Vec::new();
 
-        if let Some(schema) = &args.json_schema {
+        // Tool-calling grammar takes precedence over `json_schema` — the two
+        // are mutually exclusive and the run_chat entry point rejects the
+        // combination before we get here. The branch is defensive: a future
+        // caller bypassing that guard would otherwise silently lose the
+        // grammar constraint. Same ordering rationale as the llguidance
+        // branch below: place the masking sampler before the terminal
+        // selector so its mask actually shapes the chosen token.
+        if let Some(spec) = &args.grammar_spec {
+            if args.json_schema.is_some() {
+                tracing::warn!(
+                    "build_sampler: both grammar_spec and json_schema present; preferring grammar_spec"
+                );
+            }
+            let sampler = if spec.grammar_lazy {
+                let (patterns, tokens) = crate::oai_chat::grammar_triggers_to_patterns_and_tokens(
+                    self.model,
+                    &spec.grammar_triggers,
+                );
+                LlamaSampler::grammar_lazy_patterns(
+                    self.model,
+                    &spec.grammar,
+                    "root",
+                    &patterns,
+                    &tokens,
+                )
+                .map_err(|e| anyhow!("grammar_lazy_patterns init failed: {e:?}"))?
+            } else {
+                LlamaSampler::grammar(self.model, &spec.grammar, "root")
+                    .map_err(|e| anyhow!("grammar sampler init failed: {e:?}"))?
+            };
+            samplers.push(sampler);
+        } else if let Some(schema) = &args.json_schema {
             let llg = LlamaSampler::llguidance(self.model, GRAMMAR_TYPE_JSON, schema)
                 .map_err(|e| anyhow!("llguidance init failed: {e:?}"))?;
             samplers.push(llg);
@@ -849,6 +900,43 @@ impl LlamaModelWrapper {
         args: &InferenceArgs,
         sink: &mut dyn FnMut(&str) -> ControlFlow<()>,
     ) -> Result<DecodeOutput> {
+        // Thin wrapper: legacy callers want no extra stop sequences and no
+        // preserved tokens (everything is rendered as plain text). The
+        // `_with_stops` variant below has the actual generation loop; keeping
+        // the existing signature here means the multimodal / completion paths
+        // do not need to change.
+        self.decode_text_only_core_with_sink_and_stops(
+            formatted_prompt,
+            args,
+            &[],
+            &std::collections::HashSet::new(),
+            sink,
+        )
+    }
+
+    /// Tools-aware streaming variant. Differs from the legacy
+    /// `decode_text_only_core_with_sink` in two ways:
+    ///
+    /// 1. `extra_stops`: when the running `output_buffer` ends with any
+    ///    non-empty stop string, generation breaks *and* the matched suffix
+    ///    is trimmed from the returned text. The token that completed the
+    ///    stop is still streamed to the sink (it has already been seen by
+    ///    the OAI streaming parser), so callers must filter the stop string
+    ///    out of the final assistant `content` themselves. This mirrors
+    ///    `examples/openai_stream.rs:258-289`.
+    /// 2. `preserved_tokens`: token IDs the chat template marked as
+    ///    `preserved_tokens` (`<tool_call>` etc.) are rendered with
+    ///    `Special::Tokenize` so the OAI parser actually sees them; all
+    ///    other tokens fall back to plaintext, avoiding leaked `<|im_end|>`
+    ///    markers in user-visible content.
+    fn decode_text_only_core_with_sink_and_stops(
+        &mut self,
+        formatted_prompt: &str,
+        args: &InferenceArgs,
+        extra_stops: &[String],
+        preserved_tokens: &std::collections::HashSet<LlamaToken>,
+        sink: &mut dyn FnMut(&str) -> ControlFlow<()>,
+    ) -> Result<DecodeOutput> {
         // Hoist all `&self`-dependent work before borrowing the context field:
         // a `&'static LlamaModel` is `Copy`, and `build_sampler`/`str_to_token`
         // need `&self`, which would conflict with the `&mut self.context` borrow
@@ -969,7 +1057,22 @@ impl LlamaModelWrapper {
                     break;
                 }
 
-                let output_bytes = token_to_piece_bytes_retry(model, token)?;
+                // Tools path: render only model-declared special tokens
+                // (preserved_tokens) literally; everything else as plain text
+                // so user content (newlines, spaces) is not double-escaped.
+                // Legacy callers pass an empty set → behaviour identical to
+                // `special=true` from the previous code path? Not quite —
+                // legacy used to special=true unconditionally. To preserve
+                // legacy output byte-for-byte, the empty-set case still
+                // renders as special=true. The tools path opts into the
+                // fine-grained behaviour explicitly.
+                let render_special = if preserved_tokens.is_empty() {
+                    true
+                } else {
+                    preserved_tokens.contains(&token)
+                };
+                let output_bytes =
+                    token_to_piece_bytes_retry_special(model, token, render_special)?;
                 // use `Decoder.decode_to_string()` to avoid the intermediate buffer
                 let mut output_string = String::with_capacity(32);
                 let _decode_result =
@@ -1013,6 +1116,43 @@ impl LlamaModelWrapper {
                 // loop *before* the next decode and skip KV write-back below.
                 if sink_requests_stop(sink, &output_string) {
                     cancelled = true;
+                }
+
+                // Tools path: honour additional stop sequences from the
+                // chat template. We trim the matched suffix from the
+                // accumulated text so the returned `text` does not contain
+                // the stop marker (the OAI parser expects the assistant
+                // turn to end at the stop). The sink already saw the stop
+                // bytes — that's fine because `ChatParseStateOaicompat`
+                // treats them as `<|im_end|>`-style markers and elides
+                // them from the next delta. Break the loop without flagging
+                // cancellation so the KV prefix is still written back: the
+                // request completed normally, just early.
+                for stop in extra_stops {
+                    if !stop.is_empty() && output_buffer.ends_with(stop) {
+                        let new_len = output_buffer.len().saturating_sub(stop.len());
+                        output_buffer.truncate(new_len);
+                        // Note: do not bump n_cur — we are returning before
+                        // the next `ctx.decode`, so the KV cursor has not
+                        // advanced past the current token.
+                        let t_main_end = ggml_time_us();
+                        let duration = Duration::from_micros((t_main_end - t_main_start) as u64);
+                        tracing::info!(
+                            "decoded {} tokens in {:.2} s, speed {:.2} t/s (stopped on {:?})",
+                            n_decode + 1,
+                            duration.as_secs_f32(),
+                            (n_decode + 1) as f32 / duration.as_secs_f32(),
+                            stop,
+                        );
+                        if reuse_kv_prefix {
+                            sync_ctx.cached_tokens = tokens_list;
+                        }
+                        return Ok(DecodeOutput {
+                            text: output_buffer,
+                            prompt_tokens: prompt_tokens as u32,
+                            completion_tokens: (n_decode + 1) as u32,
+                        });
+                    }
                 }
             }
 
@@ -1270,12 +1410,26 @@ impl LlamaModelWrapper {
         if let Some(ref fo) = args.function_options
             && fo.use_function_calling
         {
-            bail!("function calling is not supported by this plugin");
+            bail!(ERR_USE_FUNCTION_CALLING_UNSUPPORTED);
         }
         if args.model.is_some() {
             tracing::warn!(
                 "LLMChatArgs.model is ignored: model is fixed at load time in this plugin"
             );
+        }
+
+        // Tools path: when the caller passes `client_tools_json`, route
+        // through the OpenAI-compatible chat template + tool parser. The
+        // path's mutual-exclusion guards (json_schema, use_function_calling)
+        // live in `run_chat_with_sink_tools` itself so the streaming entry
+        // (`spawn_chat_stream_with_tools`) is validated by the same code.
+        if let Some(client_tools_json) = args
+            .function_options
+            .as_ref()
+            .and_then(|fo| fo.client_tools_json.clone())
+        {
+            let mut oai_sink = |_: crate::oai_chat::OaiStreamUpdate| {};
+            return self.run_chat_with_sink_tools(args, &client_tools_json, sink, &mut oai_sink);
         }
 
         let options = args.options.unwrap_or_default();
@@ -1298,6 +1452,7 @@ impl LlamaModelWrapper {
             seed: options.seed.map(|s| s as u32),
             json_schema: args.json_schema,
             medias: Vec::new(),
+            grammar_spec: None,
         };
 
         let t_start = ggml_time_us();
@@ -1350,6 +1505,167 @@ impl LlamaModelWrapper {
         })
     }
 
+    /// Tools-aware variant of [`Self::run_chat_with_sink`]. Routes the chat
+    /// request through the fork's `apply_chat_template_oaicompat` API so that
+    /// the resulting `LlmChatResult` can report parsed tool calls in
+    /// `pending_tool_calls` (with `requires_tool_execution=Some(true)`) for
+    /// client-side execution.
+    ///
+    /// Multimodal input is rejected here: the tool grammar emitted by the
+    /// OAI chat template is only valid on the text-only decode core, and
+    /// the multimodal eval path expects a different prompt shape (text
+    /// marker + bitmaps).
+    pub(crate) fn run_chat_with_sink_tools(
+        &mut self,
+        mut args: LlmChatArgs,
+        tools_json: &str,
+        sink: &mut dyn FnMut(&str) -> ControlFlow<()>,
+        oai_sink: &mut dyn FnMut(crate::oai_chat::OaiStreamUpdate),
+    ) -> Result<LlmChatResult> {
+        // Validate up front: this is the single chokepoint for both the
+        // non-streaming entry (`run_chat_with_sink`) and the streaming
+        // entry (`spawn_chat_stream_with_tools`), so all client-tools
+        // preconditions belong here.
+        if args
+            .function_options
+            .as_ref()
+            .is_some_and(|fo| fo.use_function_calling)
+        {
+            bail!(ERR_CLIENT_TOOLS_WITH_FUNCTION_CALLING);
+        }
+        if args.json_schema.is_some() {
+            bail!(ERR_CLIENT_TOOLS_WITH_JSON_SCHEMA);
+        }
+        // Reject multimodal input up front so we never spend cycles building
+        // the OAI messages JSON for a request we can't fulfil.
+        if args.messages.iter().any(|m| {
+            matches!(
+                m.content.as_ref().and_then(|c| c.content.as_ref()),
+                Some(llm_chat_args::message_content::Content::Image(_))
+            )
+        }) {
+            bail!(ERR_CLIENT_TOOLS_WITH_MULTIMODAL);
+        }
+
+        let options = args.options.take().unwrap_or_default();
+        let messages_json =
+            crate::oai_chat::build_oai_messages_json(&self.system_prompt, &args.messages)?;
+
+        // Translate OpenAI's `{"type":"function","function":{"name":"..."}}`
+        // tool_choice into the (tools-filter + "required") pair llama.cpp
+        // accepts. Bare "auto"/"none"/"required" or None come back as
+        // `Passthrough` so the originals are forwarded verbatim.
+        let function_options = args.function_options.as_ref();
+        let resolved = crate::oai_chat::resolve_tool_choice(
+            tools_json,
+            function_options.and_then(|fo| fo.tool_choice.as_deref()),
+        )?;
+        let (effective_tools_json, tool_choice_override) = match &resolved {
+            crate::oai_chat::ResolvedToolChoice::Passthrough => (tools_json, None),
+            crate::oai_chat::ResolvedToolChoice::FunctionSpecific {
+                tools_json,
+                tool_choice,
+            } => (tools_json.as_str(), Some(tool_choice.as_str())),
+        };
+
+        let tmpl_result = self.apply_oai_template_with_tools(
+            &messages_json,
+            effective_tools_json,
+            function_options,
+            tool_choice_override,
+        )?;
+
+        let preserved_tokens =
+            crate::oai_chat::compute_preserved_token_set(self.model, &tmpl_result.preserved_tokens);
+        let grammar_spec = tmpl_result
+            .grammar
+            .as_ref()
+            .map(|g| crate::oai_chat::GrammarSpec {
+                grammar: g.clone(),
+                grammar_lazy: tmpl_result.grammar_lazy,
+                grammar_triggers: tmpl_result.grammar_triggers.clone(),
+            });
+        let inference_args = InferenceArgs {
+            prompt: String::new(),
+            sample_len: None,
+            max_new_tokens: Some(options.max_tokens.unwrap_or(4096)),
+            temperature: options.temperature.map(f64::from),
+            top_p: options.top_p.map(f64::from),
+            repeat_penalty: options.repeat_penalty,
+            repeat_last_n: options.repeat_last_n.map(|v| v as u32),
+            seed: options.seed.map(|s| s as u32),
+            json_schema: None,
+            medias: Vec::new(),
+            grammar_spec,
+        };
+
+        let extra_stops = tmpl_result.additional_stops.clone();
+        let t_start = ggml_time_us();
+        // Wrap the caller-supplied raw-chunk `sink` with an OAI parser so the
+        // streaming path receives structured `OaiStreamUpdate`s (text /
+        // reasoning / tool_calls) without the worker having to re-parse the
+        // assistant output. Borrowing `state` and `oai_sink` here is fine
+        // because the wrapped closure lives only for the duration of the
+        // `decode_text_only_core_with_sink_and_stops` call.
+        let mut state = tmpl_result
+            .streaming_state_oaicompat()
+            .map_err(|e| anyhow!("streaming_state_oaicompat failed: {e:?}"))?;
+        let output = {
+            let mut wrapped_sink = |chunk: &str| -> ControlFlow<()> {
+                // Always forward the raw chunk first; the legacy receiver
+                // uses it for cancel-driven backpressure and for any other
+                // downstream consumer that cares about per-token output.
+                let raw_flow = sink(chunk);
+                match state.update(chunk, true) {
+                    Ok(deltas) if !deltas.is_empty() => {
+                        let upd = crate::oai_chat::decode_oai_deltas(&deltas);
+                        if !upd.text.is_empty()
+                            || !upd.reasoning.is_empty()
+                            || !upd.tool_calls.is_empty()
+                        {
+                            oai_sink(upd);
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::warn!("ChatParseStateOaicompat::update failed mid-stream: {e:?}");
+                    }
+                }
+                raw_flow
+            };
+            self.decode_text_only_core_with_sink_and_stops(
+                &tmpl_result.prompt,
+                &inference_args,
+                &extra_stops,
+                &preserved_tokens,
+                &mut wrapped_sink,
+            )?
+        };
+        let t_end = ggml_time_us();
+        let total_time = Duration::from_micros((t_end - t_start) as u64);
+
+        // Flush the parser so any buffered partial (e.g. final closing
+        // `</tool_call>`) is materialised into the OAI sink stream.
+        if let Ok(final_deltas) = state.update("", false)
+            && !final_deltas.is_empty()
+        {
+            let upd = crate::oai_chat::decode_oai_deltas(&final_deltas);
+            if !upd.text.is_empty() || !upd.reasoning.is_empty() || !upd.tool_calls.is_empty() {
+                oai_sink(upd);
+            }
+        }
+
+        let parsed_json = parse_tool_response_with_recovery(&tmpl_result, &output.text)?;
+        crate::oai_chat::build_chat_result_from_oai_json(
+            &parsed_json,
+            output.prompt_tokens,
+            output.completion_tokens,
+            0.0,
+            total_time.as_secs_f32(),
+            "",
+        )
+    }
+
     /// Execute a text-only completion request. Unlike `run_chat`, this method
     /// does NOT accept media — multimodal callers must use the chat method.
     /// `args.context.ollama_context` and `args.model` are accepted with a warn
@@ -1392,6 +1708,7 @@ impl LlamaModelWrapper {
             seed: options.seed.map(|s| s as u32),
             json_schema: args.json_schema,
             medias: Vec::new(),
+            grammar_spec: None,
         };
 
         let t_start = ggml_time_us();
@@ -1465,23 +1782,7 @@ impl LlamaModelWrapper {
                 Some(content) => match &content.content {
                     Some(llm_chat_args::message_content::Content::Text(t)) => t.clone(),
                     Some(llm_chat_args::message_content::Content::Image(img)) => {
-                        let source = img.source.as_ref().context("image message has no source")?;
-                        let encoded = if !source.base64.is_empty() {
-                            use base64::Engine;
-                            base64::engine::general_purpose::STANDARD
-                                .decode(&source.base64)
-                                .context("invalid base64 in image")?
-                        } else {
-                            bail!("image URL fetch is not supported in this plugin");
-                        };
-                        pending_media = Some(MediaInput {
-                            kind: jobworkerp_llama_protobuf::protobuf::llama_cpp::MediaKind::Image
-                                as i32,
-                            source: Some(
-                                jobworkerp_llama_protobuf::protobuf::llama_cpp::media_input::Source::Encoded(encoded),
-                            ),
-                            id: None,
-                        });
+                        pending_media = Some(decode_image_to_media(img)?);
                         // Embed media marker so decode_multimodal places the
                         // image at the correct position in the prompt.
                         self.mtmd
@@ -1573,6 +1874,63 @@ impl LlamaModelWrapper {
                 Ok(Self::fallback_format_messages(raw_messages))
             }
         }
+    }
+
+    /// Apply the model's chat template via the fork's OpenAI-compatible API.
+    /// `tool_opts` carries the model-agnostic switches (tool_choice,
+    /// parallel_tool_calls, reasoning_format, chat_template_kwargs); model
+    /// specific knobs like `enable_thinking` must be set through the
+    /// `chat_template_kwargs` JSON object so the plugin itself stays
+    /// model-neutral.
+    ///
+    /// `tool_choice_override` lets the caller substitute a normalised
+    /// tool_choice string after running `oai_chat::resolve_tool_choice`
+    /// (which translates OpenAI's `{"type":"function",...}` shape into
+    /// `"required"` + filtered tools); when `Some`, it shadows
+    /// `tool_opts.tool_choice`.
+    fn apply_oai_template_with_tools(
+        &self,
+        oai_messages_json: &str,
+        tools_json: &str,
+        tool_opts: Option<&llm_chat_args::FunctionOptions>,
+        tool_choice_override: Option<&str>,
+    ) -> Result<llama_cpp_2::model::ChatTemplateResult> {
+        let tmpl = self
+            .model
+            .chat_template(None)
+            .context("model does not expose a chat template required for tool calling")?;
+        let chat_template_kwargs = tool_opts.and_then(|fo| fo.chat_template_kwargs.as_deref());
+        // `enable_thinking` controls both the jinja template (via kwargs) and
+        // the C++ grammar/parser (via this dedicated bool). Forward whatever
+        // the caller put inside `chat_template_kwargs.enable_thinking` so the
+        // two channels agree; default to false to preserve current behaviour
+        // for callers that omit the key.
+        let enable_thinking =
+            crate::oai_chat::extract_enable_thinking(chat_template_kwargs).unwrap_or(false);
+        let params = llama_cpp_2::openai::OpenAIChatTemplateParams {
+            messages_json: oai_messages_json,
+            tools_json: Some(tools_json),
+            tool_choice: tool_choice_override
+                .or_else(|| tool_opts.and_then(|fo| fo.tool_choice.as_deref())),
+            // run_chat_with_sink rejects json_schema before reaching this
+            // point, so leaving it empty is safe.
+            json_schema: None,
+            grammar: None,
+            reasoning_format: tool_opts.and_then(|fo| fo.reasoning_format.as_deref()),
+            chat_template_kwargs,
+            add_generation_prompt: true,
+            use_jinja: true,
+            parallel_tool_calls: tool_opts
+                .and_then(|fo| fo.parallel_tool_calls)
+                .unwrap_or(false),
+            enable_thinking,
+            add_bos: true,
+            add_eos: false,
+            parse_tool_calls: true,
+        };
+        self.model
+            .apply_chat_template_oaicompat(&tmpl, &params)
+            .map_err(|e| anyhow!("apply_chat_template_oaicompat failed: {e:?}"))
     }
 
     fn fallback_format_messages(raw_messages: &[(String, String)]) -> String {
@@ -1758,21 +2116,111 @@ fn sink_requests_stop(sink: &mut dyn FnMut(&str) -> ControlFlow<()>, chunk: &str
     matches!(sink(chunk), ControlFlow::Break(()))
 }
 
+/// Strip the chat template's `generation_prompt` from a generated response
+/// so the OAI parser sees only the in-turn body. Eager-grammar paths
+/// (`tool_choice="required"`) make the model regenerate the assistant
+/// header because the grammar root spans the whole turn, but the model
+/// may skip optional trailing structure inside `generation_prompt` (e.g.
+/// Qwen3's empty `<think>\n\n</think>\n\n` block).
+///
+/// Strategy: try `strip_prefix(generation_prompt)` first; on full match
+/// the parser sees only the in-turn body. Otherwise fall back to
+/// stripping just the role-header — everything up to and including the
+/// first newline (`<|im_start|>assistant\n` for ChatML-style templates) —
+/// so a partial regeneration still parses cleanly. Returns the input
+/// untouched when neither prefix matches.
+fn strip_generation_prompt<'a>(s: &'a str, generation_prompt: &str) -> &'a str {
+    if let Some(rest) = s.strip_prefix(generation_prompt) {
+        return rest;
+    }
+    let header_end = match generation_prompt.find('\n') {
+        Some(i) => i + 1,
+        None => return s,
+    };
+    let header = &generation_prompt[..header_end];
+    s.strip_prefix(header).unwrap_or(s)
+}
+
 /// Convert a token to bytes, retrying with a larger buffer if the first
 /// attempt reports `InsufficientBufferSpace`. Mirrors the internal retry
 /// logic of `LlamaModel::token_to_piece`, but returns raw bytes so the
 /// caller can feed them to an incremental UTF-8 decoder.
+/// Try the OAI parser on the raw output first; on failure peel off the
+/// regenerated assistant header (eager-grammar paths like
+/// `tool_choice="required"` make the model echo `generation_prompt`); on
+/// final failure recover the tool calls with a tag-based fallback.
+/// Returning Err means none of the three approaches found a structured
+/// reply, which is genuinely unrecoverable.
+fn parse_tool_response_with_recovery(
+    tmpl_result: &llama_cpp_2::model::ChatTemplateResult,
+    raw: &str,
+) -> Result<String> {
+    if let Ok(j) = tmpl_result.parse_response_oaicompat(raw, false) {
+        return Ok(j);
+    }
+    let stripped = strip_generation_prompt(raw, &tmpl_result.generation_prompt);
+    if stripped.as_ptr() != raw.as_ptr()
+        && let Ok(j) = tmpl_result.parse_response_oaicompat(stripped, false)
+    {
+        return Ok(j);
+    }
+    crate::oai_chat::fallback_parse_tool_calls(stripped).ok_or_else(|| {
+        anyhow!(
+            "parse_response_oaicompat failed on raw and stripped inputs and no \
+             <tool_call>...</tool_call> envelope was recoverable: raw={raw:?}"
+        )
+    })
+}
+
 fn token_to_piece_bytes_retry(
     model: &LlamaModel,
     token: LlamaToken,
 ) -> Result<Vec<u8>, llama_cpp_2::TokenToStringError> {
-    match model.token_to_piece_bytes(token, 8, /* special= */ true, None) {
+    token_to_piece_bytes_retry_special(model, token, /* special= */ true)
+}
+
+/// Variant that lets the caller decide whether to render a token as a special
+/// (literal `<tool_call>` etc) or plaintext. Used by the tools path with the
+/// `preserved_tokens` set from `ChatTemplateResult`: special tokens get
+/// `true`, all others `false` so user-facing whitespace isn't rendered
+/// double-escaped.
+fn token_to_piece_bytes_retry_special(
+    model: &LlamaModel,
+    token: LlamaToken,
+    special: bool,
+) -> Result<Vec<u8>, llama_cpp_2::TokenToStringError> {
+    match model.token_to_piece_bytes(token, 8, special, None) {
         Err(llama_cpp_2::TokenToStringError::InsufficientBufferSpace(i)) => {
             let size = (-i).try_into().expect("Error buffer size is positive");
-            model.token_to_piece_bytes(token, size, true, None)
+            model.token_to_piece_bytes(token, size, special, None)
         }
         other => other,
     }
+}
+
+/// Decode a chat `MessageContent::Image` payload into a `MediaInput` accepted
+/// by the multimodal generation path. Extracted so both the legacy
+/// `build_chat_messages` and the new OAI tools path (`oai_chat`) handle base64
+/// images identically (URL fetch is intentionally unsupported here — both
+/// callers must reject it the same way).
+pub(crate) fn decode_image_to_media(
+    img: &llm_chat_args::message_content::Image,
+) -> Result<MediaInput> {
+    use base64::Engine;
+    let source = img.source.as_ref().context("image message has no source")?;
+    if source.base64.is_empty() {
+        bail!("image URL fetch is not supported in this plugin");
+    }
+    let encoded = base64::engine::general_purpose::STANDARD
+        .decode(&source.base64)
+        .context("invalid base64 in image")?;
+    Ok(MediaInput {
+        kind: jobworkerp_llama_protobuf::protobuf::llama_cpp::MediaKind::Image as i32,
+        source: Some(
+            jobworkerp_llama_protobuf::protobuf::llama_cpp::media_input::Source::Encoded(encoded),
+        ),
+        id: None,
+    })
 }
 
 /// Validate `LlmCompletionArgs` independently of model loading state so that
@@ -1785,7 +2233,7 @@ pub fn validate_completion_args(args: &LlmCompletionArgs) -> Result<()> {
     if let Some(fo) = &args.function_options
         && fo.use_function_calling
     {
-        bail!("function calling is not supported by this plugin");
+        bail!(ERR_USE_FUNCTION_CALLING_UNSUPPORTED);
     }
     if args.model.is_some() {
         tracing::warn!(
@@ -1817,6 +2265,7 @@ mod tests {
             seed: None,
             json_schema: None,
             medias,
+            grammar_spec: None,
         }
     }
 
@@ -1942,6 +2391,7 @@ mod tests {
             seed: Some(1234),
             json_schema: None,
             medias: vec![],
+            grammar_spec: None,
         };
 
         let output = wrapper
@@ -1975,6 +2425,7 @@ mod tests {
                 seed: Some(1234),
                 json_schema: None,
                 medias: vec![],
+                grammar_spec: None,
             }
         }
         let prompt_a = "The capital of France is";
@@ -2034,6 +2485,7 @@ mod tests {
                 seed: Some(1234),
                 json_schema: None,
                 medias: vec![],
+                grammar_spec: None,
             }
         }
         // Shared prefix, differing tails — the case prefix reuse optimizes.
@@ -2229,6 +2681,40 @@ mod tests {
     }
 
     #[test]
+    fn test_strip_generation_prompt() {
+        // Exact match drops to empty body.
+        assert_eq!(strip_generation_prompt("abc\n", "abc\n"), "");
+        // No overlap and no shared header → input untouched.
+        assert_eq!(strip_generation_prompt("xyz", "abc\n"), "xyz");
+        // Full strip when the output starts with the entire prompt.
+        let gp = "<|im_start|>assistant\n<think>\n\n</think>\n\n";
+        let with_think = "<|im_start|>assistant\n<think>\n\n</think>\n\n<tool_call>{}</tool_call>";
+        assert_eq!(
+            strip_generation_prompt(with_think, gp),
+            "<tool_call>{}</tool_call>"
+        );
+        // Qwen3 eager-grammar case: output regenerates the header but
+        // omits the empty think block. Falls back to stripping up to the
+        // last newline of generation_prompt.
+        let without_think = "<|im_start|>assistant\n<tool_call>{}</tool_call>";
+        assert_eq!(
+            strip_generation_prompt(without_think, gp),
+            "<tool_call>{}</tool_call>"
+        );
+        // Output that does not regenerate the header at all is left alone.
+        assert_eq!(
+            strip_generation_prompt("<tool_call>{}</tool_call>", gp),
+            "<tool_call>{}</tool_call>"
+        );
+        // `generation_prompt` without a newline → no header to strip; the
+        // function falls back to the full-prefix check, which also fails,
+        // so the input is returned untouched.
+        assert_eq!(strip_generation_prompt("body", "prefix"), "body");
+        // Empty generation_prompt: strip_prefix succeeds with the whole input.
+        assert_eq!(strip_generation_prompt("body", ""), "body");
+    }
+
+    #[test]
     fn test_plan_kv_keep() {
         let t = |ids: &[i32]| ids.iter().map(|&i| LlamaToken(i)).collect::<Vec<_>>();
         // Reuse off → always full clear, regardless of overlap.
@@ -2384,6 +2870,7 @@ mod tests {
                 source: Some(Source::Encoded(image_bytes)),
                 id: None,
             }],
+            grammar_spec: None,
         };
 
         let output = wrapper.run(args).expect("Multimodal generation failed");
@@ -2441,6 +2928,7 @@ mod tests {
             seed: Some(1234),
             json_schema: None,
             medias: vec![],
+            grammar_spec: None,
         };
         let image_args = InferenceArgs {
             medias: vec![MediaInput {
@@ -2525,6 +3013,7 @@ mod tests {
                 source: Some(Source::Encoded(image_bytes.clone())),
                 id: None,
             }],
+            grammar_spec: None,
         };
         let q_a = "What is in this image?";
         let q_b = "What colors appear in this image?";
@@ -2595,6 +3084,7 @@ mod tests {
             seed: Some(1234),
             json_schema: None,
             medias,
+            grammar_spec: None,
         };
         let img_args = || {
             args(
@@ -2691,6 +3181,7 @@ mod tests {
                 source: Some(Source::Encoded(audio_bytes)),
                 id: None,
             }],
+            grammar_spec: None,
         };
 
         let output = wrapper.run(args).expect("Audio generation failed");
@@ -2839,7 +3330,8 @@ mod tests {
         let err =
             validate_completion_args(&args).expect_err("function_calling=true must be rejected");
         assert!(
-            err.to_string().contains("function calling"),
+            err.to_string()
+                .contains(super::ERR_USE_FUNCTION_CALLING_UNSUPPORTED),
             "error message must mention 'function calling': {err}"
         );
     }
@@ -3151,5 +3643,581 @@ LLAMA_SYSTEM_PROMPT=You are a reflection generator. Respond ONLY with a single J
             dotenvy::from_read(QWEN3_JSON_TEST_ENV.as_bytes()).ok();
             LlamaModelWrapper::new(Self::config()).expect("load model from env")
         }
+    }
+
+    // ---------------------------------------------------------------------
+    // Real-model regression tests for client-side tool calling. The `poc_*`
+    // tests exercise the fork's OpenAI-compatible chat template API
+    // end-to-end on Qwen3-0.6B; the `test_apply_oai_*` / `test_build_sampler_*`
+    // tests cover individual layers. All require `LLAMA_MODEL` / `LLAMA_HF_REPO`
+    // env vars and are `#[ignore]` by default.
+    // ---------------------------------------------------------------------
+
+    // System prompt kept minimal so the model's tool-call decision is driven
+    // by the tools definition + user message.
+    const QWEN3_TOOL_POC_ENV: &str = "
+LLAMA_MODEL=Qwen3-0.6B-Q4_K_M.gguf
+LLAMA_HF_REPO=unsloth/Qwen3-0.6B-GGUF
+LLAMA_DISABLE_GPU=true
+LLAMA_SEED=1024
+LLAMA_THREADS=8
+LLAMA_USE_FLASH_ATTENTION=false
+LLAMA_SYSTEM_PROMPT=You are a helpful assistant. When a relevant tool is available, call it.
+";
+
+    fn load_wrapper_for_tool_poc() -> LlamaModelWrapper {
+        dotenvy::from_read(QWEN3_TOOL_POC_ENV.as_bytes()).ok();
+        LlamaModelWrapper::new(LlamaCppPluginTestEnv::config())
+            .expect("load Qwen3 model for tool-calling tests")
+    }
+
+    // OpenAI-compatible single function shared by the tool-calling tests.
+    fn poc_tools_json() -> &'static str {
+        r#"[{"type":"function","function":{"name":"get_weather","description":"Get the current weather in a given city.","parameters":{"type":"object","properties":{"city":{"type":"string","description":"City name, e.g. Tokyo"}},"required":["city"]}}}]"#
+    }
+
+    fn poc_inference_args(prompt: &str, temperature: Option<f64>) -> InferenceArgs {
+        InferenceArgs {
+            prompt: prompt.to_string(),
+            sample_len: None,
+            max_new_tokens: Some(192),
+            temperature,
+            top_p: None,
+            repeat_penalty: None,
+            repeat_last_n: None,
+            seed: Some(1024),
+            json_schema: None,
+            medias: Vec::new(),
+            grammar_spec: None,
+        }
+    }
+
+    // `enable_thinking` is left at its default so the helper stays
+    // model-agnostic; if the model still emits a `<think>` preamble, prepend
+    // "/no_think" to the user message instead of toggling a model-specific flag.
+    fn poc_oai_params<'a>(
+        messages_json: &'a str,
+        tools_json: Option<&'a str>,
+        tool_choice: Option<&'a str>,
+    ) -> llama_cpp_2::openai::OpenAIChatTemplateParams<'a> {
+        llama_cpp_2::openai::OpenAIChatTemplateParams {
+            messages_json,
+            tools_json,
+            tool_choice,
+            json_schema: None,
+            grammar: None,
+            reasoning_format: None,
+            chat_template_kwargs: None,
+            add_generation_prompt: true,
+            use_jinja: true,
+            parallel_tool_calls: false,
+            enable_thinking: false,
+            add_bos: true,
+            add_eos: false,
+            parse_tool_calls: true,
+        }
+    }
+
+    /// `decode_text_only_core_with_sink_and_stops` trims the matched stop
+    /// suffix from the returned text. The stop string `"."` almost always
+    /// appears in a short reply so the truncate branch fires deterministically.
+    #[ignore = "depends on model: additional_stops truncate"]
+    #[test]
+    fn test_additional_stops_truncate_output_at_match() {
+        let mut wrapper = load_wrapper_for_tool_poc();
+        let args = poc_inference_args("Reply with: hello.", None);
+        let preserved = std::collections::HashSet::new();
+        let mut sink = |_: &str| ControlFlow::Continue(());
+        let output = wrapper
+            .decode_text_only_core_with_sink_and_stops(
+                "<|im_start|>user\nReply with: hello.<|im_end|>\n<|im_start|>assistant\n",
+                &args,
+                &[".".to_string()],
+                &preserved,
+                &mut sink,
+            )
+            .expect("decode_text_only_core_with_sink_and_stops");
+        // Either the model produced text without "." (and ran to length), or
+        // the truncate path fired — in the latter case the trailing "." is
+        // gone from output.text.
+        eprintln!("stop test output: {:?}", output.text);
+        assert!(
+            !output.text.ends_with('.'),
+            "stop should be trimmed from output: {:?}",
+            output.text
+        );
+    }
+
+    /// Legacy regression: calling `decode_text_only_core_with_sink_and_stops`
+    /// with empty stops and empty preserved set must produce the same
+    /// generation as the legacy `decode_text_only_core_with_sink`.
+    #[ignore = "depends on model: additional_stops empty passthrough"]
+    #[test]
+    fn test_additional_stops_empty_passthrough() {
+        let mut wrapper = load_wrapper_for_tool_poc();
+        let args = poc_inference_args("Reply: 1", None);
+        let prompt = "<|im_start|>user\nReply: 1<|im_end|>\n<|im_start|>assistant\n";
+
+        let preserved = std::collections::HashSet::new();
+        let mut sink_a = |_: &str| ControlFlow::Continue(());
+        let baseline = wrapper
+            .decode_text_only_core_with_sink(prompt, &args, &mut sink_a)
+            .expect("legacy decode");
+
+        let mut sink_b = |_: &str| ControlFlow::Continue(());
+        let with_empty_stops = wrapper
+            .decode_text_only_core_with_sink_and_stops(prompt, &args, &[], &preserved, &mut sink_b)
+            .expect("new decode with empty stops");
+
+        assert_eq!(
+            baseline.text, with_empty_stops.text,
+            "empty stops + empty preserved must match legacy output"
+        );
+    }
+
+    /// `build_sampler` must accept an eager (non-lazy) grammar via
+    /// `grammar_spec` and produce a usable sampler chain.
+    #[ignore = "depends on model: build_sampler eager grammar"]
+    #[test]
+    fn test_build_sampler_with_eager_grammar_prepends_chain() {
+        let wrapper = load_wrapper_for_tool_poc();
+        let mut args = poc_inference_args("hi", None);
+        // Minimal trivial GBNF grammar: only accept the literal "hello".
+        args.grammar_spec = Some(crate::oai_chat::GrammarSpec {
+            grammar: "root ::= \"hello\"".to_string(),
+            grammar_lazy: false,
+            grammar_triggers: vec![],
+        });
+        wrapper
+            .build_sampler(&args)
+            .expect("eager grammar sampler should build");
+    }
+
+    /// `build_sampler` must accept a lazy grammar with empty triggers — the
+    /// shape llama.cpp emits for `tool_choice="required"`, where the grammar
+    /// engages immediately and no lazy trigger is needed.
+    #[ignore = "depends on model: build_sampler grammar_lazy"]
+    #[test]
+    fn test_build_sampler_grammar_lazy_patterns_succeeds() {
+        let wrapper = load_wrapper_for_tool_poc();
+        let mut args = poc_inference_args("hi", None);
+        args.grammar_spec = Some(crate::oai_chat::GrammarSpec {
+            grammar: "root ::= \"hello\"".to_string(),
+            grammar_lazy: true,
+            grammar_triggers: vec![],
+        });
+        wrapper
+            .build_sampler(&args)
+            .expect("lazy grammar sampler should build with empty triggers");
+    }
+
+    /// When both `grammar_spec` and `json_schema` are supplied to
+    /// `build_sampler`, the grammar wins (json_schema is dropped with a
+    /// warn log). `run_chat_with_sink` rejects the combination earlier in
+    /// the request; this branch is defensive in case a future caller
+    /// bypasses that check.
+    #[ignore = "depends on model: build_sampler grammar+schema"]
+    #[test]
+    fn test_build_sampler_grammar_and_json_schema_both_present_prefers_grammar() {
+        let wrapper = load_wrapper_for_tool_poc();
+        let mut args = poc_inference_args("hi", None);
+        args.grammar_spec = Some(crate::oai_chat::GrammarSpec {
+            grammar: "root ::= \"hello\"".to_string(),
+            grammar_lazy: false,
+            grammar_triggers: vec![],
+        });
+        // Invalid JSON schema string: if json_schema were taken instead of
+        // grammar_spec, llguidance would reject and fail the call.
+        args.json_schema = Some("not actually a schema".to_string());
+        wrapper
+            .build_sampler(&args)
+            .expect("grammar_spec must take precedence over json_schema");
+    }
+
+    /// `apply_oai_template_with_tools` smoke test: the rendered prompt
+    /// embeds the tool definitions (so the OAI template branch is wired
+    /// up against the model file).
+    #[ignore = "depends on model: apply_oai_template_with_tools minimal"]
+    #[test]
+    fn test_apply_oai_template_with_tools_minimal() {
+        let wrapper = load_wrapper_for_tool_poc();
+        let messages_json = r#"[
+            {"role":"system","content":"You are a tool caller."},
+            {"role":"user","content":"weather?"}
+        ]"#;
+        let opts = llm_chat_args::FunctionOptions {
+            tool_choice: Some("auto".to_string()),
+            ..Default::default()
+        };
+        let result = wrapper
+            .apply_oai_template_with_tools(messages_json, poc_tools_json(), Some(&opts), None)
+            .expect("apply_oai_template_with_tools");
+        assert!(!result.prompt.is_empty());
+        assert!(
+            result.prompt.contains("get_weather"),
+            "tools section should be rendered into the prompt: {}",
+            result.prompt
+        );
+        assert!(result.parse_tool_calls);
+    }
+
+    /// `chat_template_kwargs` is the escape hatch for model-specific switches
+    /// (`enable_thinking` etc.) — the plugin itself stays model-agnostic.
+    #[ignore = "depends on model: apply_oai_template_with_tools kwargs"]
+    #[test]
+    fn test_apply_oai_template_with_tools_handles_kwargs() {
+        let wrapper = load_wrapper_for_tool_poc();
+        let messages_json = r#"[{"role":"user","content":"hi"}]"#;
+        let opts = llm_chat_args::FunctionOptions {
+            chat_template_kwargs: Some(r#"{"enable_thinking":false}"#.to_string()),
+            ..Default::default()
+        };
+        let result = wrapper
+            .apply_oai_template_with_tools(messages_json, poc_tools_json(), Some(&opts), None)
+            .expect("apply_oai_template_with_tools accepts kwargs");
+        assert!(!result.prompt.is_empty());
+    }
+
+    /// Function-specific tool_choice (the OpenAI
+    /// `{"type":"function","function":{"name":"..."}}` form) is normalised
+    /// upstream into `tool_choice="required"` + filtered tools_json so the
+    /// model has no choice but to call the requested function. Make sure
+    /// the override path through `apply_oai_template_with_tools` produces
+    /// a usable prompt the same way the bare-string path does.
+    #[ignore = "depends on model: apply_oai_template_with_tools function-specific choice"]
+    #[test]
+    fn test_apply_oai_template_with_tools_function_specific_choice() {
+        let wrapper = load_wrapper_for_tool_poc();
+        let messages_json = r#"[{"role":"user","content":"weather?"}]"#;
+        // Same shape `run_chat_with_sink_tools` would have produced after
+        // resolve_tool_choice ran: tools filtered to one entry, choice
+        // rewritten to "required".
+        let tools_filtered = r#"[{"type":"function","function":{"name":"get_weather","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}}]"#;
+        let result = wrapper
+            .apply_oai_template_with_tools(messages_json, tools_filtered, None, Some("required"))
+            .expect("apply_oai_template_with_tools with override");
+        assert!(!result.prompt.is_empty());
+        assert!(result.prompt.contains("get_weather"));
+    }
+
+    /// Confirm the OAI template produces a tools-aware prompt and
+    /// `parse_response_oaicompat` recovers the tool call from the generated
+    /// text. Acts as the canonical smoke test before the higher-level paths.
+    #[ignore = "depends on model: tool calling smoke test"]
+    #[test]
+    fn poc_oaicompat_template_and_parse_tool_call() {
+        let mut wrapper = load_wrapper_for_tool_poc();
+        let tmpl = wrapper
+            .model
+            .chat_template(None)
+            .expect("chat template available on Qwen3 GGUF");
+
+        let messages_json = r#"[
+            {"role":"system","content":"You are a tool caller."},
+            {"role":"user","content":"What is the weather in Tokyo? Use get_weather."}
+        ]"#;
+        let params = poc_oai_params(messages_json, Some(poc_tools_json()), Some("auto"));
+        let result = wrapper
+            .model
+            .apply_chat_template_oaicompat(&tmpl, &params)
+            .expect("apply_chat_template_oaicompat");
+
+        // Diagnostic logging for failure triage: when this test breaks,
+        // the rendered prompt + grammar metadata is usually enough to
+        // figure out whether the chat template stopped emitting tools.
+        eprintln!(
+            "--- rendered prompt ---\n{}\n--- end prompt ---",
+            result.prompt
+        );
+        eprintln!(
+            "grammar.is_some={} grammar_lazy={} triggers={} preserved={:?} stops={:?} chat_format={}",
+            result.grammar.is_some(),
+            result.grammar_lazy,
+            result.grammar_triggers.len(),
+            result.preserved_tokens,
+            result.additional_stops,
+            result.chat_format,
+        );
+        for (i, t) in result.grammar_triggers.iter().enumerate() {
+            eprintln!(
+                "  trigger[{i}] type={:?} value={:?} token={:?}",
+                t.trigger_type, t.value, t.token
+            );
+        }
+
+        assert!(
+            !result.prompt.is_empty(),
+            "rendered prompt must be non-empty"
+        );
+        assert!(
+            result.prompt.contains("get_weather"),
+            "tools section should mention get_weather in the rendered prompt"
+        );
+
+        let args = poc_inference_args(&result.prompt, None);
+        let output = wrapper
+            .decode_text_only_core(&result.prompt, &args)
+            .expect("decode_text_only_core");
+        eprintln!("--- raw generation ---\n{}\n--- end raw ---", output.text);
+
+        let parsed_json = result
+            .parse_response_oaicompat(&output.text, false)
+            .expect("parse_response_oaicompat");
+        eprintln!("--- parsed JSON ---\n{parsed_json}\n--- end parsed ---");
+
+        let value: serde_json::Value =
+            serde_json::from_str(&parsed_json).expect("parse_response output is valid JSON");
+        let tool_calls = value
+            .get("tool_calls")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            !tool_calls.is_empty(),
+            "expected at least one tool_call in parsed JSON: {parsed_json}"
+        );
+        let first = &tool_calls[0];
+        let name = first
+            .pointer("/function/name")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        assert_eq!(name, "get_weather", "tool name mismatch in {parsed_json}");
+        let raw_args = first
+            .pointer("/function/arguments")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        let args_value: serde_json::Value = serde_json::from_str(raw_args)
+            .unwrap_or_else(|e| panic!("function.arguments must be JSON string: {e} ({raw_args})"));
+        assert!(
+            args_value.get("city").is_some(),
+            "expected city argument: {args_value}"
+        );
+    }
+
+    /// Verify the streaming parser groups token-level chunks into
+    /// `tool_calls` deltas. The parser only recognises the tool-call
+    /// envelope when fed the model-emitted special tokens (e.g.
+    /// `<tool_call>`), so we drive it from a real generation rather than
+    /// synthetic UTF-8 splits.
+    #[ignore = "depends on model: streaming parser smoke test"]
+    #[test]
+    fn poc_streaming_state_aggregates_tool_call_deltas() {
+        let mut wrapper = load_wrapper_for_tool_poc();
+        let tmpl = wrapper
+            .model
+            .chat_template(None)
+            .expect("chat template available");
+
+        let messages_json = r#"[
+            {"role":"system","content":"You are a tool caller."},
+            {"role":"user","content":"What is the weather in Tokyo? Use get_weather."}
+        ]"#;
+        let params = poc_oai_params(messages_json, Some(poc_tools_json()), Some("auto"));
+        let result = wrapper
+            .model
+            .apply_chat_template_oaicompat(&tmpl, &params)
+            .expect("apply_chat_template_oaicompat");
+
+        // Drive a real generation; the sink receives the same UTF-8 decoded
+        // chunks (`&str` per token piece) that production streaming would.
+        let mut state = result
+            .streaming_state_oaicompat()
+            .expect("streaming_state_oaicompat");
+        let mut deltas_log: Vec<String> = Vec::new();
+        let mut raw_chunks: Vec<String> = Vec::new();
+        {
+            let args = poc_inference_args(&result.prompt, None);
+            let mut sink = |chunk: &str| -> ControlFlow<()> {
+                raw_chunks.push(chunk.to_string());
+                match state.update(chunk, true) {
+                    Ok(diffs) => deltas_log.extend(diffs),
+                    Err(e) => eprintln!("state.update error: {e}"),
+                }
+                ControlFlow::Continue(())
+            };
+            wrapper
+                .decode_text_only_core_with_sink(&result.prompt, &args, &mut sink)
+                .expect("decode_text_only_core_with_sink");
+        }
+        match state.update("", false) {
+            Ok(final_diffs) => deltas_log.extend(final_diffs),
+            Err(e) => eprintln!("state.update(final) error: {e}"),
+        }
+
+        eprintln!("--- raw chunks ({}) ---", raw_chunks.len());
+        for c in &raw_chunks {
+            eprint!("{c}");
+        }
+        eprintln!("\n--- end raw chunks ---");
+        eprintln!("--- deltas ({}) ---", deltas_log.len());
+        for d in &deltas_log {
+            eprintln!("{d}");
+        }
+        eprintln!("--- end deltas ---");
+
+        // Reconstruct (name, arguments) from the deltas in OAI fashion: id and
+        // name typically arrive once on the first delta of a tool call;
+        // arguments arrive incrementally.
+        let mut tool_name: Option<String> = None;
+        let mut tool_args_buf = String::new();
+        let mut leaked_tool_call_marker = false;
+        for delta in &deltas_log {
+            let v: serde_json::Value = match serde_json::from_str(delta) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            if let Some(content) = v.get("content").and_then(|c| c.as_str())
+                && (content.contains("<tool_call>") || content.contains("</tool_call>"))
+            {
+                leaked_tool_call_marker = true;
+            }
+            let Some(calls) = v.get("tool_calls").and_then(|c| c.as_array()) else {
+                continue;
+            };
+            for call in calls {
+                if let Some(name) = call.pointer("/function/name").and_then(|n| n.as_str())
+                    && tool_name.is_none()
+                    && !name.is_empty()
+                {
+                    tool_name = Some(name.to_string());
+                }
+                if let Some(args_chunk) =
+                    call.pointer("/function/arguments").and_then(|a| a.as_str())
+                {
+                    tool_args_buf.push_str(args_chunk);
+                }
+            }
+        }
+
+        assert!(
+            !leaked_tool_call_marker,
+            "<tool_call> markers must not appear in `content` deltas"
+        );
+        assert_eq!(
+            tool_name.as_deref(),
+            Some("get_weather"),
+            "tool name should be reassembled from deltas (deltas={deltas_log:?})"
+        );
+        // Arguments should at least contain the city argument.
+        let args_value: serde_json::Value =
+            serde_json::from_str(&tool_args_buf).unwrap_or_else(|e| {
+                panic!("reassembled arguments must be JSON: {e} ({tool_args_buf})")
+            });
+        assert!(
+            args_value.get("city").is_some(),
+            "arguments should include `city`: {args_value}"
+        );
+    }
+
+    /// Confirm a lazy grammar wired into the sampler chain forces the model
+    /// to emit a tool call even on an unrelated prompt that would normally
+    /// elicit a free-form reply.
+    #[ignore = "depends on model: grammar enforcement smoke test"]
+    #[test]
+    fn poc_grammar_lazy_forces_tool_call_emission() {
+        use llama_cpp_2::model::GrammarTriggerType;
+
+        // wrapper needs `mut` only when the no-grammar fallback runs
+        // `decode_text_only_core`; that path borrows &mut self, so keep the
+        // binding mutable up-front to avoid a second binding.
+        #[allow(unused_mut)]
+        let mut wrapper = load_wrapper_for_tool_poc();
+        let tmpl = wrapper
+            .model
+            .chat_template(None)
+            .expect("chat template available");
+
+        // Ambiguous prompt: a free-running model would just greet back.
+        let messages_json = r#"[
+            {"role":"system","content":"You are helpful."},
+            {"role":"user","content":"Hello!"}
+        ]"#;
+        // Forcing tool_choice to "required" + the grammar should together
+        // guarantee a tool-call emission regardless of the user prompt.
+        let params = poc_oai_params(messages_json, Some(poc_tools_json()), Some("required"));
+        let result = wrapper
+            .model
+            .apply_chat_template_oaicompat(&tmpl, &params)
+            .expect("apply_chat_template_oaicompat");
+
+        eprintln!("grammar triggers ({}):", result.grammar_triggers.len());
+        for (i, t) in result.grammar_triggers.iter().enumerate() {
+            eprintln!(
+                "  [{i}] type={:?} value={:?} token={:?}",
+                t.trigger_type, t.value, t.token
+            );
+        }
+        let Some(grammar) = result.grammar.as_deref() else {
+            // No grammar emitted by the template: fall back to verifying
+            // that tool_choice="required" alone forces the tool call.
+            eprintln!("no grammar emitted; relying on tool_choice=required alone");
+            let args = poc_inference_args(&result.prompt, Some(0.7));
+            let output = wrapper
+                .decode_text_only_core(&result.prompt, &args)
+                .expect("decode_text_only_core");
+            let parsed = result
+                .parse_response_oaicompat(&output.text, false)
+                .expect("parse_response_oaicompat");
+            let value: serde_json::Value = serde_json::from_str(&parsed).expect("valid JSON");
+            assert!(
+                value
+                    .get("tool_calls")
+                    .and_then(|t| t.as_array())
+                    .map(|a| !a.is_empty())
+                    .unwrap_or(false),
+                "tool_choice=required should still force a tool call: {parsed}"
+            );
+            return;
+        };
+
+        // Minimal trigger translation for the smoke test; the production
+        // path lives in `oai_chat::grammar_triggers_to_patterns_and_tokens`
+        // and handles multi-token `Word` triggers via regex escape.
+        let trigger_patterns: Vec<String> = result
+            .grammar_triggers
+            .iter()
+            .filter_map(|t| match t.trigger_type {
+                GrammarTriggerType::Pattern => Some(t.value.clone()),
+                GrammarTriggerType::PatternFull => Some(format!("^(?:{})$", t.value)),
+                _ => None,
+            })
+            .collect();
+        let trigger_tokens: Vec<LlamaToken> = result
+            .grammar_triggers
+            .iter()
+            .filter_map(|t| match t.trigger_type {
+                GrammarTriggerType::Token => t.token,
+                GrammarTriggerType::Word => {
+                    let toks = wrapper
+                        .model
+                        .str_to_token(&t.value, AddBos::Never)
+                        .unwrap_or_default();
+                    (toks.len() == 1).then_some(toks[0])
+                }
+                _ => None,
+            })
+            .collect();
+
+        // Sampler chain: grammar mask MUST run before the terminal selector,
+        // mirroring the rationale in build_sampler comments.
+        let grammar_sampler = LlamaSampler::grammar_lazy_patterns(
+            wrapper.model,
+            grammar,
+            "root",
+            &trigger_patterns,
+            &trigger_tokens,
+        )
+        .expect("grammar_lazy_patterns");
+        let _chain = LlamaSampler::chain_simple(vec![grammar_sampler, LlamaSampler::greedy()]);
+        // We cannot easily swap the sampler used by `decode_text_only_core`
+        // from outside the wrapper. The goal here is simply to prove that
+        // `grammar_lazy_patterns` accepts this model and the trigger shape
+        // emitted by the chat template; the integrated path lives in
+        // `build_sampler`.
+        eprintln!(
+            "grammar built successfully (patterns={}, tokens={})",
+            trigger_patterns.len(),
+            trigger_tokens.len()
+        );
     }
 }

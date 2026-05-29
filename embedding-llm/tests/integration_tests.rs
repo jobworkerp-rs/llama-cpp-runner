@@ -1101,10 +1101,10 @@ async fn integration_test_gpu_device_specification() {
 #[ignore]
 async fn integration_test_multimodal_embedding() {
     use embedding_llm::protobuf::embedding_llm::{EmbeddingLlmResult, PoolingType};
-    use jobworkerp_client::plugins::PluginRunner;
     use jobworkerp_llama_protobuf::protobuf::llama_cpp::{
         MediaInput, MediaKind, media_input::Source,
     };
+    use jobworkerp_plugin_abi::v2::PluginV2;
     use prost::Message;
     use std::collections::HashMap;
 
@@ -1149,6 +1149,7 @@ async fn integration_test_multimodal_embedding() {
     let settings_bytes = prost::Message::encode_to_vec(&settings);
     plugin
         .load(settings_bytes)
+        .await
         .expect("Failed to load multimodal model");
     println!("   ✓ Model loaded");
 
@@ -1165,7 +1166,7 @@ async fn integration_test_multimodal_embedding() {
         pooling_type: PoolingType::Last as i32,
     };
     let args_bytes = prost::Message::encode_to_vec(&args);
-    let (result, _metadata) = plugin.run(args_bytes, HashMap::new());
+    let (result, _metadata) = plugin.run(args_bytes, HashMap::new(), None).await;
     let result_bytes = result.expect("Multimodal embedding should succeed");
 
     let parsed = EmbeddingLlmResult::decode(result_bytes.as_slice()).expect("Should decode result");
@@ -1221,7 +1222,7 @@ async fn integration_test_multimodal_embedding() {
             pooling_type: bad,
         };
         let bad_bytes = prost::Message::encode_to_vec(&bad_args);
-        let (bad_result, _) = plugin.run(bad_bytes, HashMap::new());
+        let (bad_result, _) = plugin.run(bad_bytes, HashMap::new(), None).await;
         assert!(
             bad_result.is_err(),
             "pooling_type={bad} must be rejected, got Ok"

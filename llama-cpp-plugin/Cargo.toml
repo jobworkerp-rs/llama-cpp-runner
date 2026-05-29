@@ -12,9 +12,11 @@ crate-type = ["dylib", "rlib"]
 
 
 [dependencies]
-jobworkerp-client = { path = "../modules/jobworkerp-client" }
+jobworkerp-plugin-abi = { workspace = true }
+jobworkerp-plugin-abi-macros = { workspace = true }
 jobworkerp-llama-protobuf = { path = "../llama-protobuf" }
 mtmd-support = { path = "../mtmd-support" }
+proto = { workspace = true }
 
 anyhow = { workspace = true }
 async-trait = { workspace = true }
@@ -33,10 +35,11 @@ openssl = { workspace = true }
 llama-cpp-sys-2 = { workspace = true }
 once_cell = { workspace = true }
 prost = { workspace = true }
+regex = { workspace = true }
 schemars = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 url = { workspace = true }

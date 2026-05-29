@@ -7,6 +7,7 @@ use crate::{
     utils,
 };
 use async_trait::async_trait;
+use jobworkerp_plugin_abi::v2::CancelToken;
 use std::time::Instant;
 
 /// Prompt template overhead in tokens
@@ -240,12 +241,20 @@ impl LlamaReranker {
         query: &str,
         documents: &[String],
         options: &RerankerOptions,
+        token: Option<&CancelToken>,
     ) -> Result<Vec<f32>, RerankerError> {
         let instruction = options.instruction.as_deref();
         let mut scores = Vec::with_capacity(documents.len());
 
         for (idx, doc) in documents.iter().enumerate() {
-            // Compute score for single document
+            // Check cancellation between documents — natural granularity for
+            // cooperative abort. Each compute_score is sync llama.cpp work
+            // and cannot itself be interrupted.
+            if let Some(t) = token
+                && t.is_cancelled()
+            {
+                return Err(RerankerError::Cancelled);
+            }
             match self.model.compute_score(query, doc, instruction) {
                 Ok(score) => {
                     scores.push(score);
@@ -289,13 +298,14 @@ impl LlamaReranker {
         query: &str,
         documents: &[String],
         options: &RerankerOptions,
+        token: Option<&CancelToken>,
     ) -> Result<(Vec<f32>, ScoringStats), RerankerError> {
         let cache = match &self.cache {
             Some(c) => c,
             None => {
                 // No cache available, fall back to sequential
                 let scores = self
-                    .compute_scores_sequential(query, documents, options)
+                    .compute_scores_sequential(query, documents, options, token)
                     .await?;
                 let stats = ScoringStats {
                     cache_hits: 0,
@@ -346,7 +356,7 @@ impl LlamaReranker {
                 .map(|&idx| documents[idx].clone())
                 .collect();
 
-            self.compute_scores_sequential(query, &uncached_docs, options)
+            self.compute_scores_sequential(query, &uncached_docs, options, token)
                 .await?
         } else {
             Vec::new()
@@ -396,10 +406,11 @@ impl LlamaReranker {
     /// # Returns
     /// ScoringResult with scores and statistics
     pub async fn compute_scores_with_stats(
-        &mut self,
+        &self,
         query: &str,
         documents: &[String],
         options: RerankerOptions,
+        token: Option<&CancelToken>,
     ) -> Result<ScoringResult, RerankerError> {
         // 1. Document preprocessing (truncation)
         let max_len = self.get_max_document_length(&options);
@@ -407,6 +418,11 @@ impl LlamaReranker {
         let mut truncated_count = 0;
 
         for doc in documents {
+            if let Some(t) = token
+                && t.is_cancelled()
+            {
+                return Err(RerankerError::Cancelled);
+            }
             match self.truncate_document(doc, max_len) {
                 Ok(truncated) => {
                     if truncated.len() < doc.len() {
@@ -424,11 +440,11 @@ impl LlamaReranker {
 
         // 2. Compute scores (with or without cache)
         let (scores, mut stats) = if options.use_cache && self.cache.is_some() {
-            self.compute_scores_with_cache(query, &preprocessed, &options)
+            self.compute_scores_with_cache(query, &preprocessed, &options, token)
                 .await?
         } else {
             let scores = self
-                .compute_scores_sequential(query, &preprocessed, &options)
+                .compute_scores_sequential(query, &preprocessed, &options, token)
                 .await?;
             let stats = ScoringStats {
                 cache_hits: 0,
@@ -473,7 +489,7 @@ impl DocumentReranker for LlamaReranker {
 
         // Use compute_scores_with_stats internally
         let scoring_result = self
-            .compute_scores_with_stats(query, documents, options)
+            .compute_scores_with_stats(query, documents, options, None)
             .await
             .map_err(|e| anyhow::anyhow!("Scoring failed: {}", e))?;
 

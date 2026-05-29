@@ -20,7 +20,7 @@
 - サンプリング設定付きのテキスト生成
 - 複数ターンの chat 形式リクエスト
 - jobworkerp Ollama / GenAI completion API 互換の単一プロンプト completion
-- chat メソッドでの tool calling
+- chat メソッドでの OpenAI 互換 client-side tool calling (詳細: [docs/client-tool-calling.ja.md](docs/client-tool-calling.ja.md))
 - JSON Schema 制約による structured output
 - `MtmdSettings` と media input を使ったマルチモーダル入力
 - JobworkerP 連携のためのメタデータおよび JSON Schema 公開
@@ -186,12 +186,14 @@ cargo run -p jobworkerp-llama-cpp-plugin --bin sample -- \
 - 2 つのメソッドはいずれも現在は non-streaming API として公開されています。
 - media input は `llama_cpp.MediaInput` で渡され、prompt 中の marker と添付 media の並びが一致している必要があります。
 - manual mode の tool calling では、最終的な assistant 応答の代わりに pending tool calls が chat result に入る場合があります。
+- OpenAI 互換 `tools: []` を渡して client-side でツール実行する詳細フロー (proto スキーマ、tool_choice / parallel_tool_calls / reasoning_format / chat_template_kwargs、streaming partial 規約、エラーケース) は [docs/client-tool-calling.ja.md](docs/client-tool-calling.ja.md) を参照してください。
 
 ## 関連ファイル
 
 - プラグインエントリポイント: `llama-cpp-plugin/src/lib.rs`
 - モデル実行本体: `llama-cpp-plugin/src/model.rs`
 - 共有 protobuf: `llama-protobuf/`
+- ドキュメント: `llama-cpp-plugin/docs/`
 
 ## ライセンス
 

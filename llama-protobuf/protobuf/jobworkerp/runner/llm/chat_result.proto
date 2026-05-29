@@ -36,6 +36,11 @@ message LLMChatResult {
       string call_id = 1;
       string fn_name = 2;
       string fn_arguments = 3;
+      // OpenAI-compatible streaming index. Set on streaming partial deltas
+      // so receivers can route argument fragments to the right call even
+      // when `parallel_tool_calls=true` interleaves multiple calls.
+      // Absent on non-streaming responses (call_id is canonical there).
+      optional uint32 delta_index = 4;
     }
 
     // Tool calls

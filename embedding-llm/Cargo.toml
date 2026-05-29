@@ -11,9 +11,11 @@ license = { workspace = true }
 crate-type = ["cdylib", "lib"]
 
 [dependencies]
-jobworkerp-client = { path = "../modules/jobworkerp-client" }
+jobworkerp-plugin-abi = { workspace = true }
+jobworkerp-plugin-abi-macros = { workspace = true }
 jobworkerp-llama-protobuf = { path = "../llama-protobuf" }
 mtmd-support = { path = "../mtmd-support" }
+proto = { workspace = true }
 
 anyhow = { workspace = true }
 async-trait = { workspace = true }
@@ -35,7 +37,7 @@ schemars = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["rt-multi-thread"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync"] }
 tokenizers = { workspace = true }
 tracing = { workspace = true }
 
@@ -54,7 +56,7 @@ dynamic-link = ["llama-cpp-2/dynamic-link"]
 openmp = ["llama-cpp-2/openmp"]
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync"] }
 tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
 chrono = { version = "0.4", features = ["serde"] }

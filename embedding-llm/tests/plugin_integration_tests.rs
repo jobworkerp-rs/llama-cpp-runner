@@ -1,12 +1,14 @@
 use embedding_llm::{
-    EmbeddingLlmRunnerPlugin,
+    CANCELLED, EmbeddingLlmRunnerPlugin, METHOD_RUN,
     protobuf::embedding_llm::{
         DType, EmbeddingArgs, EmbeddingLlmResult, EmbeddingLlmRunnerSettings,
         HierarchicalChunkingConfig, ModelType,
     },
 };
-use jobworkerp_client::plugins::PluginRunner;
+use jobworkerp_plugin_abi::cancel::FfiCancellationToken;
+use jobworkerp_plugin_abi::v2::{CancelToken, PluginV2};
 use prost::Message;
+use proto::jobworkerp::data::MethodSchema;
 use std::collections::HashMap;
 
 /// EmbeddingLlmRunnerPluginの結合テスト
@@ -57,7 +59,7 @@ async fn test_plugin_full_lifecycle_with_embedding_generation() {
         .expect("Failed to encode settings");
 
     println!("Loading plugin with model: {}", settings.model_id);
-    let load_result = plugin.load(settings_buf);
+    let load_result = plugin.load(settings_buf).await;
 
     match load_result {
         Ok(()) => {
@@ -150,7 +152,7 @@ async fn test_plugin_full_lifecycle_with_embedding_generation() {
         ]);
 
         // Execute plugin run
-        let (result, result_metadata) = plugin.run(args_buf, metadata);
+        let (result, result_metadata) = plugin.run(args_buf, metadata, None).await;
 
         match result {
             Ok(result_buf) => {
@@ -375,7 +377,7 @@ async fn test_plugin_error_handling() {
         .encode(&mut settings_buf)
         .expect("Failed to encode settings");
 
-    let load_result = plugin.load(settings_buf);
+    let load_result = plugin.load(settings_buf).await;
     assert!(load_result.is_err(), "Should reject invalid model type");
     println!("  ✓ Correctly rejected invalid model type");
 
@@ -400,7 +402,7 @@ async fn test_plugin_error_handling() {
         .encode(&mut settings_buf)
         .expect("Failed to encode settings");
 
-    let load_result = plugin.load(settings_buf);
+    let load_result = plugin.load(settings_buf).await;
     assert!(load_result.is_err(), "Should reject empty model files");
     println!("  ✓ Correctly rejected empty model files");
 
@@ -417,7 +419,7 @@ async fn test_plugin_error_handling() {
     let mut args_buf = Vec::new();
     args.encode(&mut args_buf).expect("Failed to encode args");
 
-    let (result, _) = plugin.run(args_buf, HashMap::new());
+    let (result, _) = plugin.run(args_buf, HashMap::new(), None).await;
     assert!(result.is_err(), "Should fail when embedder not initialized");
     println!("  ✓ Correctly failed when not initialized");
 
@@ -430,9 +432,14 @@ async fn test_plugin_protobuf_schemas() {
 
     let plugin = EmbeddingLlmRunnerPlugin::new().expect("Failed to create plugin");
 
-    // Test protobuf schema access
+    // Schemas are surfaced through `method_proto_map` / `method_json_schema_map`.
     let settings_proto = plugin.runner_settings_proto();
-    let args_proto = plugin.job_args_proto();
+    let methods = plugin.method_proto_map();
+    let run_bytes = methods
+        .get(METHOD_RUN)
+        .expect("`run` method must be registered");
+    let run_method = MethodSchema::decode(run_bytes.as_slice()).expect("MethodSchema must decode");
+    let args_proto = &run_method.args_proto;
 
     println!("Settings proto length: {} characters", settings_proto.len());
     println!("Args proto length: {} characters", args_proto.len());
@@ -500,7 +507,7 @@ async fn test_plugin_multimodal_error_paths() {
         };
         let mut buf = Vec::new();
         args.encode(&mut buf).expect("encode");
-        let (result, _) = plugin.run(buf, HashMap::new());
+        let (result, _) = plugin.run(buf, HashMap::new(), None).await;
         assert!(result.is_err(), "Should reject empty text + empty medias");
         let err_msg = result.unwrap_err().to_string();
         assert!(
@@ -526,7 +533,7 @@ async fn test_plugin_multimodal_error_paths() {
         };
         let mut buf = Vec::new();
         args.encode(&mut buf).expect("encode");
-        let (result, _) = plugin.run(buf, HashMap::new());
+        let (result, _) = plugin.run(buf, HashMap::new(), None).await;
         assert!(
             result.is_err(),
             "Should fail on uninitialized plugin, not on empty text"
@@ -558,7 +565,7 @@ async fn test_plugin_multimodal_error_paths() {
         };
         let mut buf = Vec::new();
         args.encode(&mut buf).expect("encode");
-        let (result, _) = plugin.run(buf, HashMap::new());
+        let (result, _) = plugin.run(buf, HashMap::new(), None).await;
         assert!(result.is_err(), "Should fail on uninitialized plugin");
         let err_msg = result.unwrap_err().to_string();
         assert!(
@@ -595,7 +602,7 @@ async fn test_plugin_multimodal_error_paths() {
         settings.encode(&mut settings_buf).expect("encode");
 
         // Try to load - may fail if model not available
-        let load_result = plugin.load(settings_buf);
+        let load_result = plugin.load(settings_buf).await;
         if load_result.is_err() {
             println!("  ⚠ Skipping: model not available");
         } else {
@@ -612,7 +619,7 @@ async fn test_plugin_multimodal_error_paths() {
             };
             let mut buf = Vec::new();
             args.encode(&mut buf).expect("encode");
-            let (result, _) = plugin.run(buf, HashMap::new());
+            let (result, _) = plugin.run(buf, HashMap::new(), None).await;
             assert!(result.is_err(), "Should fail with mmproj not configured");
             let err_msg = result.unwrap_err().to_string();
             assert!(
@@ -630,16 +637,18 @@ async fn test_plugin_multimodal_error_paths() {
 async fn test_plugin_cancellation_interface() {
     println!("=== Plugin Cancellation Interface Test ===");
 
-    let plugin = EmbeddingLlmRunnerPlugin::new().expect("Failed to create plugin");
+    let mut plugin = EmbeddingLlmRunnerPlugin::new().expect("Failed to create plugin");
 
-    // Test cancellation interface (currently not implemented)
+    // A precancelled token must short-circuit run() with Err(CANCELLED) before
+    // the spawn_blocking work resolves; no model load is required.
+    let (ffi, handle) = FfiCancellationToken::new_owned();
+    handle.cancel();
+    plugin.set_cancellation_token(CancelToken::from_ffi(ffi));
+
+    let (result, _) = plugin.run(vec![], HashMap::new(), None).await;
     assert!(
-        !plugin.cancel(),
-        "Cancel should return false (not implemented)"
-    );
-    assert!(
-        !plugin.is_canceled(),
-        "is_canceled should return false (not implemented)"
+        matches!(result, Err(ref e) if e == CANCELLED),
+        "Precancelled token must surface as Err(\"cancelled\"), got {result:?}"
     );
 
     println!("✓ Cancellation interface behaves as expected");

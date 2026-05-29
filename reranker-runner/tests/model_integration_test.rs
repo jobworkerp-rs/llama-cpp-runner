@@ -559,7 +559,7 @@ async fn test_document_truncation_warning() {
     println!("Testing truncation warnings for documents exceeding max_document_length");
 
     let config = create_reranker_config(create_gpu_config());
-    let mut reranker = LlamaReranker::new(config).expect("Failed to create reranker");
+    let reranker = LlamaReranker::new(config).expect("Failed to create reranker");
 
     let query = "Explain Rust ownership";
 
@@ -591,7 +591,7 @@ async fn test_document_truncation_warning() {
 
     let start = Instant::now();
     let result = reranker
-        .compute_scores_with_stats(query, &documents, options)
+        .compute_scores_with_stats(query, &documents, options, None)
         .await
         .expect("compute_scores_with_stats should not fail");
 
@@ -713,7 +713,7 @@ async fn test_gpu_document_length_boundaries() {
     println!("Testing document length handling with various sizes");
 
     let config = create_reranker_config(create_gpu_config());
-    let mut reranker = LlamaReranker::new(config).expect("Failed to create reranker");
+    let reranker = LlamaReranker::new(config).expect("Failed to create reranker");
 
     let query = "Explain the concept of ownership in programming";
 
@@ -732,7 +732,7 @@ async fn test_gpu_document_length_boundaries() {
         The borrow checker ensures that references are always valid and that there are no data races.";
 
     let result1 = reranker
-        .compute_scores_with_stats(query, &[short_doc.to_string()], options.clone())
+        .compute_scores_with_stats(query, &[short_doc.to_string()], options.clone(), None)
         .await
         .expect("Should succeed");
 
@@ -749,7 +749,7 @@ async fn test_gpu_document_length_boundaries() {
     let medium_doc = short_doc.repeat(5);
 
     let result2 = reranker
-        .compute_scores_with_stats(query, &[medium_doc], options.clone())
+        .compute_scores_with_stats(query, &[medium_doc], options.clone(), None)
         .await
         .expect("Should succeed");
 
@@ -767,7 +767,7 @@ async fn test_gpu_document_length_boundaries() {
     let long_doc = short_doc.repeat(200); // ~20,000 words
 
     let result3 = reranker
-        .compute_scores_with_stats(query, &[long_doc], options.clone())
+        .compute_scores_with_stats(query, &[long_doc], options.clone(), None)
         .await
         .expect("Should succeed with truncation");
 
@@ -799,7 +799,7 @@ async fn test_cpu_document_length_boundaries() {
     println!("Testing CPU document length handling (max: 5,000 tokens)");
 
     let config = create_reranker_config(create_cpu_config());
-    let mut reranker = LlamaReranker::new(config).expect("Failed to create reranker");
+    let reranker = LlamaReranker::new(config).expect("Failed to create reranker");
 
     let query = "Explain Rust memory management";
 
@@ -815,7 +815,7 @@ async fn test_cpu_document_length_boundaries() {
         This ensures memory safety and prevents common bugs like use-after-free and double-free errors.";
 
     let result1 = reranker
-        .compute_scores_with_stats(query, &[short_doc.to_string()], options.clone())
+        .compute_scores_with_stats(query, &[short_doc.to_string()], options.clone(), None)
         .await
         .expect("Should succeed");
 
@@ -832,7 +832,7 @@ async fn test_cpu_document_length_boundaries() {
     let medium_doc = short_doc.repeat(10);
 
     let result2 = reranker
-        .compute_scores_with_stats(query, &[medium_doc], options.clone())
+        .compute_scores_with_stats(query, &[medium_doc], options.clone(), None)
         .await
         .expect("Should succeed");
 
@@ -850,7 +850,7 @@ async fn test_cpu_document_length_boundaries() {
     let long_doc = short_doc.repeat(100);
 
     let result3 = reranker
-        .compute_scores_with_stats(query, &[long_doc], options.clone())
+        .compute_scores_with_stats(query, &[long_doc], options.clone(), None)
         .await
         .expect("Should succeed with truncation");
 
@@ -884,7 +884,7 @@ async fn test_max_document_length_option_override() {
     println!("Testing that max_document_length option overrides default settings");
 
     let config = create_reranker_config(create_gpu_config());
-    let mut reranker = LlamaReranker::new(config).expect("Failed to create reranker");
+    let reranker = LlamaReranker::new(config).expect("Failed to create reranker");
 
     let query = "Test query";
 
@@ -906,7 +906,7 @@ async fn test_max_document_length_option_override() {
     };
 
     let result1 = reranker
-        .compute_scores_with_stats(query, &[doc_15k.clone()], options_default)
+        .compute_scores_with_stats(query, &[doc_15k.clone()], options_default, None)
         .await
         .expect("Should succeed");
 
@@ -926,7 +926,7 @@ async fn test_max_document_length_option_override() {
     };
 
     let result2 = reranker
-        .compute_scores_with_stats(query, &[doc_15k.clone()], options_override)
+        .compute_scores_with_stats(query, &[doc_15k.clone()], options_override, None)
         .await
         .expect("Should succeed");
 
@@ -947,7 +947,7 @@ async fn test_max_document_length_option_override() {
     };
 
     let result3 = reranker
-        .compute_scores_with_stats(query, &[doc_15k], options_small)
+        .compute_scores_with_stats(query, &[doc_15k], options_small, None)
         .await
         .expect("Should succeed");
 

@@ -9,12 +9,11 @@ pub mod token_position;
 pub mod tokenization;
 
 use anyhow::{Result, anyhow};
-use async_trait::async_trait;
 use command_utils::trace::Tracing;
-use jobworkerp_client::{
-    plugins::PluginRunner, schema_to_json_string, schema_to_json_string_option,
-};
+use jobworkerp_plugin_abi::v2::{CancelToken, HighLevelSink, PluginV2};
+use jobworkerp_plugin_abi_macros::register_plugin_v2;
 use prost::Message;
+use proto::jobworkerp::data::{MethodJsonSchema, MethodSchema, StreamingOutputType};
 use std::collections::HashMap;
 
 use crate::embedding::LlamaCppEmbedder;
@@ -31,10 +30,40 @@ pub mod protobuf {
 /// グローバルバックエンドのシングルトン
 static GLOBAL_BACKEND: OnceLock<Arc<Mutex<LlamaBackend>>> = OnceLock::new();
 
+pub const METHOD_RUN: &str = "run";
+
+/// Error-string surface for cooperative cancellation, shared with the host's
+/// cancellation contract. Callers may match against this exact string.
+pub const CANCELLED: &str = "cancelled";
+
+/// Serialize a `schemars::JsonSchema` type into a JSON string for the
+/// `MethodJsonSchema` / settings_schema slots.
+fn json_schema_string<T: schemars::JsonSchema>(label: &str) -> String {
+    let schema = schemars::schema_for!(T);
+    match serde_json::to_string(&schema) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!("error in {label}: {e:?}");
+            String::new()
+        }
+    }
+}
+
 /// Main plugin structure for embedding-llm
 pub struct EmbeddingLlmRunnerPlugin {
     backend: Option<Arc<Mutex<LlamaBackend>>>,
-    embedder: Option<LlamaCppEmbedder>,
+    // Shared so it can be cloned into the `spawn_blocking` closure backing
+    // V2's `run`. `LlamaCppEmbedder` exposes `&self` methods for the embedding
+    // path; the inner `model` Mutex serializes the actual llama.cpp call.
+    embedder: Option<Arc<LlamaCppEmbedder>>,
+    /// Plugin-owned tokio runtime. The dylib's `tokio` has its own
+    /// `thread_local!` reactor that the host cannot share — long-running work
+    /// is spawned here. Held in an `Option` so `Drop` can `shutdown_background`
+    /// the runtime instead of blocking the current thread (which would panic
+    /// when dropped from inside an async context like `tokio::test`).
+    rt: Option<tokio::runtime::Runtime>,
+    /// Refreshed before each job via `set_cancellation_token`.
+    token: Option<CancelToken>,
 }
 
 impl EmbeddingLlmRunnerPlugin {
@@ -42,12 +71,38 @@ impl EmbeddingLlmRunnerPlugin {
 
     pub fn new() -> Result<Self> {
         tracing::info!("Creating EmbeddingLlmRunner plugin (backend will be initialized on load)");
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .thread_name("embedding-llm-plugin")
+            .build()
+            .map_err(|e| anyhow!("failed to build plugin tokio runtime: {e}"))?;
         Ok(Self {
             backend: None,
             embedder: None,
+            rt: Some(rt),
+            token: None,
         })
     }
 
+    fn rt_handle(&self) -> tokio::runtime::Handle {
+        self.rt
+            .as_ref()
+            .expect("plugin runtime accessed after Drop")
+            .handle()
+            .clone()
+    }
+}
+
+impl Drop for EmbeddingLlmRunnerPlugin {
+    fn drop(&mut self) {
+        if let Some(rt) = self.rt.take() {
+            rt.shutdown_background();
+        }
+    }
+}
+
+impl EmbeddingLlmRunnerPlugin {
     /// Ensure backend is initialized (lazy initialization)
     fn ensure_backend(&mut self) -> Result<Arc<Mutex<LlamaBackend>>> {
         if let Some(backend) = &self.backend {
@@ -78,19 +133,8 @@ impl Default for EmbeddingLlmRunnerPlugin {
 
 impl Tracing for EmbeddingLlmRunnerPlugin {}
 
-#[async_trait]
-impl PluginRunner for EmbeddingLlmRunnerPlugin {
-    fn name(&self) -> String {
-        String::from(Self::RUNNER_NAME)
-    }
-
-    fn description(&self) -> String {
-        String::from(
-            "Generate text embeddings with positional information and optional instruction prefixes",
-        )
-    }
-
-    fn load(&mut self, settings: Vec<u8>) -> Result<()> {
+impl EmbeddingLlmRunnerPlugin {
+    fn load_sync(&mut self, settings: Vec<u8>) -> Result<()> {
         // command_utils::util::tracing::tracing_init_test(tracing::Level::DEBUG);
         let settings = protobuf::embedding_llm::EmbeddingLlmRunnerSettings::decode(&settings[..])?;
 
@@ -109,7 +153,7 @@ impl PluginRunner for EmbeddingLlmRunnerPlugin {
         // llama.cpp embedderの初期化（バックエンドを渡す）
         let embedder = LlamaCppEmbedder::new_from_settings_with_backend(&settings, backend)?;
 
-        self.embedder = Some(embedder);
+        self.embedder = Some(Arc::new(embedder));
 
         tracing::info!(
             "{} loaded: model_id={}, files={:?}",
@@ -121,20 +165,17 @@ impl PluginRunner for EmbeddingLlmRunnerPlugin {
         Ok(())
     }
 
-    fn run(
-        &mut self,
+    fn run_sync(
+        embedder: Option<Arc<LlamaCppEmbedder>>,
         arg: Vec<u8>,
-        metadata: HashMap<String, String>,
-    ) -> (Result<Vec<u8>>, HashMap<String, String>) {
+        metadata: &HashMap<String, String>,
+    ) -> Result<Vec<u8>> {
         // OpenTelemetryスパンの作成（metadataから親コンテキストを抽出）
         let mut span = EmbeddingLlmRunnerPlugin::otel_span_from_metadata(
-            &metadata,
+            metadata,
             "embedding-llm",
             "embedding.run",
         );
-
-        // metadataをそのまま通すため、変更しない
-        let result_metadata = metadata;
 
         let result: Result<Vec<u8>> = (|| -> Result<Vec<u8>> {
             let args = protobuf::embedding_llm::EmbeddingArgs::decode(&arg[..])?;
@@ -159,10 +200,13 @@ impl PluginRunner for EmbeddingLlmRunnerPlugin {
                 )
             })?;
 
-            let embedder = self
-                .embedder
+            // Args validation runs before the "not initialized" check so
+            // syntactically-bad requests surface their contract error
+            // ("InvalidArgument: ...") instead of a load-time message.
+            let embedder_arc = embedder
                 .as_ref()
-                .ok_or(anyhow!("Embedder not initialized"))?;
+                .ok_or_else(|| anyhow!("Embedder not initialized"))?;
+            let embedder: &LlamaCppEmbedder = embedder_arc.as_ref();
 
             let model_info = embedder.model_info();
 
@@ -314,91 +358,226 @@ impl PluginRunner for EmbeddingLlmRunnerPlugin {
             }
         }
 
-        (result, result_metadata)
+        result
+    }
+}
+
+/// Resolved EmbeddingArgs proto with media-input imports inlined.
+fn args_proto_resolved() -> String {
+    static RESOLVED: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    RESOLVED
+        .get_or_init(|| {
+            jobworkerp_llama_protobuf::proto_resolve::resolve_proto_imports(
+                include_str!("../protobuf/embedding_args.proto"),
+                &[jobworkerp_llama_protobuf::proto_resolve::MEDIA_INPUT_IMPORT],
+            )
+            .expect("EmbeddingLlmRunner: args proto resolution failed")
+        })
+        .clone()
+}
+
+fn settings_proto_resolved() -> String {
+    static RESOLVED: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    RESOLVED
+        .get_or_init(|| {
+            jobworkerp_llama_protobuf::proto_resolve::resolve_proto_imports(
+                include_str!("../protobuf/llm_runner_settings.proto"),
+                &[jobworkerp_llama_protobuf::proto_resolve::MEDIA_INPUT_IMPORT],
+            )
+            .expect("EmbeddingLlmRunner: settings proto resolution failed")
+        })
+        .clone()
+}
+
+#[async_trait::async_trait]
+impl PluginV2 for EmbeddingLlmRunnerPlugin {
+    fn name(&self) -> String {
+        String::from(Self::RUNNER_NAME)
     }
 
-    fn cancel(&self) -> bool {
-        false
-    }
-    fn is_canceled(&self) -> bool {
-        false
+    fn description(&self) -> String {
+        String::from(
+            "Generate text embeddings with positional information and optional instruction prefixes",
+        )
     }
 
     fn runner_settings_proto(&self) -> String {
-        static RESOLVED: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-        RESOLVED
+        settings_proto_resolved()
+    }
+
+    fn method_proto_map(&self) -> HashMap<String, Vec<u8>> {
+        static CACHED: std::sync::OnceLock<HashMap<String, Vec<u8>>> = std::sync::OnceLock::new();
+        CACHED
             .get_or_init(|| {
-                jobworkerp_llama_protobuf::proto_resolve::resolve_proto_imports(
-                    include_str!("../protobuf/llm_runner_settings.proto"),
-                    &[jobworkerp_llama_protobuf::proto_resolve::MEDIA_INPUT_IMPORT],
-                )
-                .expect("EmbeddingLlmRunner: runner_settings_proto resolution failed")
+                let mut schemas = HashMap::new();
+                schemas.insert(
+                    METHOD_RUN.to_string(),
+                    MethodSchema {
+                        args_proto: args_proto_resolved(),
+                        result_proto: include_str!("../protobuf/llm_result.proto").to_string(),
+                        description: Some(
+                            "Generate text/multimodal embeddings with positional information"
+                                .to_string(),
+                        ),
+                        output_type: StreamingOutputType::NonStreaming as i32,
+                        ..Default::default()
+                    }
+                    .encode_to_vec(),
+                );
+                schemas
             })
             .clone()
     }
 
-    fn job_args_proto(&self) -> String {
-        static RESOLVED: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-        RESOLVED
-            .get_or_init(|| {
-                jobworkerp_llama_protobuf::proto_resolve::resolve_proto_imports(
-                    include_str!("../protobuf/embedding_args.proto"),
-                    &[jobworkerp_llama_protobuf::proto_resolve::MEDIA_INPUT_IMPORT],
-                )
-                .expect("EmbeddingLlmRunner: job_args_proto resolution failed")
-            })
-            .clone()
-    }
-
-    fn result_output_proto(&self) -> Option<String> {
-        Some(include_str!("../protobuf/llm_result.proto").to_string())
-    }
-    fn settings_schema(&self) -> String {
-        schema_to_json_string!(
-            protobuf::embedding_llm::EmbeddingLlmRunnerSettings,
-            "settings_schema"
+    fn method_json_schema_map(&self) -> Option<HashMap<String, Vec<u8>>> {
+        static CACHED: std::sync::OnceLock<HashMap<String, Vec<u8>>> = std::sync::OnceLock::new();
+        Some(
+            CACHED
+                .get_or_init(|| {
+                    let mut schemas = HashMap::new();
+                    schemas.insert(
+                        METHOD_RUN.to_string(),
+                        MethodJsonSchema {
+                            args_schema: json_schema_string::<
+                                protobuf::embedding_llm::EmbeddingArgs,
+                            >("run_args_schema"),
+                            result_schema: Some(json_schema_string::<
+                                protobuf::embedding_llm::EmbeddingLlmResult,
+                            >(
+                                "run_result_schema"
+                            )),
+                            ..Default::default()
+                        }
+                        .encode_to_vec(),
+                    );
+                    schemas
+                })
+                .clone(),
         )
     }
-    fn arguments_schema(&self) -> String {
-        schema_to_json_string!(protobuf::embedding_llm::EmbeddingArgs, "arguments_schema")
+
+    fn settings_schema(&self) -> String {
+        json_schema_string::<protobuf::embedding_llm::EmbeddingLlmRunnerSettings>("settings_schema")
     }
-    fn output_json_schema(&self) -> Option<String> {
-        schema_to_json_string_option!(protobuf::embedding_llm::EmbeddingLlmResult, "output_schema")
+
+    fn set_cancellation_token(&mut self, token: CancelToken) {
+        self.token = Some(token);
+    }
+
+    async fn load(&mut self, settings: Vec<u8>) -> std::result::Result<(), String> {
+        ensure_tracing_initialized().await;
+        self.load_sync(settings).map_err(|e| e.to_string())
+    }
+
+    async fn run(
+        &mut self,
+        args: Vec<u8>,
+        metadata: HashMap<String, String>,
+        _using: Option<String>,
+    ) -> (
+        std::result::Result<Vec<u8>, String>,
+        HashMap<String, String>,
+    ) {
+        let token = self.token.clone();
+        let handle = self.rt_handle();
+        let embedder = self.embedder.clone();
+        // Clone metadata into the blocking task for the tracing helper, which
+        // reads OTEL parent context from the metadata map. The outer future
+        // keeps its own copy to echo back to the host.
+        let meta_for_work = metadata.clone();
+
+        // Short-circuit on a pre-cancelled token so callers see a consistent
+        // "cancelled" error regardless of whether the embedder has been
+        // initialised yet.
+        if token.as_ref().is_some_and(|t| t.is_cancelled()) {
+            return (Err(CANCELLED.to_string()), metadata);
+        }
+        let work = handle.spawn_blocking(move || -> std::result::Result<Vec<u8>, String> {
+            Self::run_sync(embedder, args, &meta_for_work).map_err(|e| e.to_string())
+        });
+
+        // Two-stage wait: select on cancel vs completion. If cancel wins
+        // we still await the blocking task. `LlamaCppEmbedder` has no
+        // sink/cancel hook today, so embedding inference runs to completion
+        // regardless. Joining here ensures the inner model lock is released
+        // BEFORE the host moves on to the next job.
+        tokio::pin!(work);
+        let result = match token.as_ref() {
+            Some(t) => {
+                let cancel_branch = async {
+                    t.cancelled().await;
+                };
+                tokio::pin!(cancel_branch);
+                let joined: std::result::Result<
+                    std::result::Result<Vec<u8>, String>,
+                    tokio::task::JoinError,
+                > = tokio::select! {
+                    biased;
+                    _ = &mut cancel_branch => (&mut work).await,
+                    j = &mut work => j,
+                };
+                let cancel_observed = t.is_cancelled();
+                match joined {
+                    Ok(Ok(_)) if cancel_observed => Err(CANCELLED.to_string()),
+                    Ok(Ok(bytes)) => Ok(bytes),
+                    Ok(Err(_)) if cancel_observed => Err(CANCELLED.to_string()),
+                    Ok(Err(e)) => Err(e),
+                    Err(e) => Err(format!("join error: {e}")),
+                }
+            }
+            None => match work.await {
+                Ok(inner) => inner,
+                Err(e) => Err(format!("join error: {e}")),
+            },
+        };
+        (result, metadata)
+    }
+
+    async fn run_stream(
+        &mut self,
+        _args: Vec<u8>,
+        _metadata: HashMap<String, String>,
+        _using: Option<String>,
+        _output: HighLevelSink,
+    ) -> std::result::Result<HashMap<String, String>, String> {
+        // Embedding generation is a single-shot, non-streaming operation.
+        Err("streaming is not supported by embedding-llm".to_string())
     }
 }
 
-// Plugin entry points
-#[unsafe(no_mangle)]
-pub extern "C" fn load_plugin() -> Box<dyn PluginRunner + Send + Sync> {
-    std::panic::catch_unwind(|| {
-        dotenvy::dotenv().ok();
-        tokio::runtime::Runtime::new()
-            .unwrap()
-            .block_on(async move {
-                command_utils::util::tracing::tracing_init_from_env()
-                    .await
-                    .unwrap_or_default();
-            });
-        let plugin = EmbeddingLlmRunnerPlugin::new().expect("Failed to load plugin");
-        Box::new(plugin)
-    })
-    .unwrap_or_else(|e| {
-        eprintln!("load_plugin panic: {:?}", e);
-        Box::new(EmbeddingLlmRunnerPlugin {
-            backend: None,
-            embedder: None,
+/// One-time process bootstrap shared by every plugin instance. The macro's
+/// init expression runs once per `load_multi_method_plugin_v2` invocation,
+/// so only synchronous setup belongs here — async tracing initialisation
+/// runs lazily inside `PluginV2::load`. Spinning a throwaway tokio runtime
+/// here would panic if the host loads the plugin from a Tokio worker.
+fn build_plugin_instance() -> EmbeddingLlmRunnerPlugin {
+    dotenvy::dotenv().ok();
+    EmbeddingLlmRunnerPlugin::new().expect("Failed to construct EmbeddingLlmRunnerPlugin")
+}
+
+/// Idempotent guard for tracing initialisation: the first `load()` call wins,
+/// every subsequent call short-circuits. We use `tokio::sync::OnceCell` so the
+/// guard cooperates with the surrounding async runtime.
+async fn ensure_tracing_initialized() {
+    static TRACING_INIT: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
+    TRACING_INIT
+        .get_or_init(|| async {
+            // Surface init failures on stderr — tracing itself is the channel
+            // we'd normally log through, so we can't rely on it to report its
+            // own setup error.
+            if let Err(e) = command_utils::util::tracing::tracing_init_from_env().await {
+                eprintln!("embedding-llm: tracing init failed: {e:?}");
+            }
         })
-    })
+        .await;
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn free_plugin(ptr: Box<dyn PluginRunner + Send + Sync>) {
-    drop(ptr);
-}
+register_plugin_v2!(EmbeddingLlmRunnerPlugin, build_plugin_instance());
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use jobworkerp_plugin_abi::cancel::FfiCancellationToken;
 
     #[test]
     fn test_plugin_creation() {
@@ -424,18 +603,19 @@ mod tests {
             "runner_settings_proto must not contain import statements"
         );
 
-        let args_proto = plugin.job_args_proto();
-        assert!(!args_proto.is_empty());
-        assert!(args_proto.contains("EmbeddingArgs"));
+        let methods = plugin.method_proto_map();
+        let run_bytes = methods
+            .get(METHOD_RUN)
+            .expect("`run` method must be registered");
+        let run = MethodSchema::decode(run_bytes.as_slice()).expect("MethodSchema must decode");
+        assert!(run.args_proto.contains("EmbeddingArgs"));
         assert!(
-            !args_proto.lines().any(|l| l.trim().starts_with("import ")),
-            "job_args_proto must not contain import statements"
+            !run.args_proto
+                .lines()
+                .any(|l| l.trim().starts_with("import ")),
+            "method args_proto must not contain import statements"
         );
-
-        let result_proto = plugin.result_output_proto();
-        assert!(result_proto.is_some());
-        let result_proto = result_proto.unwrap();
-        assert!(result_proto.contains("EmbeddingLlmResult"));
+        assert!(run.result_proto.contains("EmbeddingLlmResult"));
     }
 
     #[test]
@@ -448,26 +628,33 @@ mod tests {
         assert_eq!(plugin1.name(), "EmbeddingLlmRunner");
         assert_eq!(plugin2.name(), "EmbeddingLlmRunner");
         assert_eq!(plugin3.name(), "EmbeddingLlmRunner");
-
-        println!("✓ Successfully created multiple plugin instances sharing the same backend");
     }
 
-    #[test]
-    fn test_load_plugin_multiple_times() {
-        // Test that load_plugin() can be called multiple times without errors
-        let plugin1 = load_plugin();
-        let plugin2 = load_plugin();
-        let plugin3 = load_plugin();
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_run_with_precancelled_token_returns_err() {
+        // Cancellation must be observed even when no embedder is loaded: the
+        // future short-circuits on the cancelled token before the inner
+        // spawn_blocking can report "Embedder not initialized".
+        //
+        // Note: flavor = "multi_thread" is required so the plugin's owned
+        // Runtime can be dropped inside the test's async context — under the
+        // default current-thread flavor, dropping a Runtime panics with
+        // "Cannot drop a runtime in a context where blocking is not allowed".
+        let mut plugin = EmbeddingLlmRunnerPlugin::new().unwrap();
+        let (ffi, handle) = FfiCancellationToken::new_owned();
+        handle.cancel();
+        plugin.set_cancellation_token(CancelToken::from_ffi(ffi));
 
-        assert_eq!(plugin1.name(), "EmbeddingLlmRunner");
-        assert_eq!(plugin2.name(), "EmbeddingLlmRunner");
-        assert_eq!(plugin3.name(), "EmbeddingLlmRunner");
+        let (result, _) = plugin.run(vec![], HashMap::new(), None).await;
+        assert!(
+            matches!(result, Err(ref e) if e == CANCELLED),
+            "precancelled token must surface as Err(CANCELLED), got {result:?}"
+        );
 
-        // Clean up
-        free_plugin(plugin1);
-        free_plugin(plugin2);
-        free_plugin(plugin3);
-
-        println!("✓ Successfully loaded and freed multiple plugin instances via C API");
+        // Move the plugin off-runtime so its inner Runtime drops on a blocking
+        // thread rather than inside the test future.
+        tokio::task::spawn_blocking(move || drop(plugin))
+            .await
+            .expect("plugin drop must not panic");
     }
 }
