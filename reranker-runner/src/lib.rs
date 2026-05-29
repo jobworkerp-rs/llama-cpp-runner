@@ -518,7 +518,12 @@ async fn ensure_tracing_initialized() {
     static TRACING_INIT: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
     TRACING_INIT
         .get_or_init(|| async {
-            let _ = command_utils::util::tracing::tracing_init_from_env().await;
+            // Surface init failures on stderr — tracing itself is the channel
+            // we'd normally log through, so we can't rely on it to report its
+            // own setup error.
+            if let Err(e) = command_utils::util::tracing::tracing_init_from_env().await {
+                eprintln!("reranker-runner: tracing init failed: {e:?}");
+            }
         })
         .await;
 }
