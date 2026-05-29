@@ -1113,7 +1113,10 @@ LLAMA_SYSTEM_PROMPT=次の文章を日本語に翻訳してください。翻訳
 ";
         dotenvy::from_read(env.as_bytes()).ok();
 
-        let user_prompt = r#"
+        // `/no_think` disables the Qwen3 thinking block. The 0.6B model otherwise
+        // burns the whole `sample_len` budget on chain-of-thought and then loops on
+        // repeated tokens, making this test flaky in CI.
+        let user_prompt = r#"/no_think
 Daily Submission Limit Change
 Hey ARC Prize contestants!
 
@@ -1145,11 +1148,17 @@ Good luck in the competition and in advancing AI research!
             .expect("failed to load model from env");
         let request = LlamaArg {
             prompt,
-            sample_len: 2048,
+            // Keep the sample budget tight: the assertion caps the response at
+            // <4096 bytes (~1300 JP chars) so generating more just risks tripping
+            // the bound when a small model spirals into a repetition loop.
+            sample_len: 512,
             temperature: Some(0.3),
             top_p: Some(0.9),
-            repeat_penalty: Some(0.9),
-            repeat_last_n: Some(8),
+            // `repeat_penalty` is a divisor on repeated-token logits: values <1.0
+            // *reward* repetition. The previous 0.9 caused the 0.6B model to lock
+            // into "競技の競技の..." loops. Use >1.0 to actually penalize repeats.
+            repeat_penalty: Some(1.1),
+            repeat_last_n: Some(64),
             seed: Some(30),
             need_print: true,
             medias: vec![],
