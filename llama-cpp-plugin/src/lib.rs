@@ -729,7 +729,17 @@ impl PluginV2 for LlamaCppPlugin {
     }
 
     async fn load(&mut self, settings: Vec<u8>) -> std::result::Result<(), String> {
-        ensure_tracing_initialized().await;
+        // Tracing init wires up the OTLP exporter, which internally uses
+        // `hyper-util` and therefore requires a tokio reactor handle. The
+        // *host* runtime driving this future is a different `tokio` symbol
+        // copy from this dylib's, so `tokio::runtime::Handle::current()`
+        // resolved from inside hyper-util sees "no reactor" and panics
+        // (hyper-util-0.1.20/src/rt/tokio.rs:115). Drive the init on the
+        // plugin-owned runtime so the reactor lookup hits *this* dylib's
+        // tokio handle, then `await` the join so the rest of `load` is
+        // sequenced after it.
+        let handle = self.rt_handle();
+        let _ = handle.spawn(ensure_tracing_initialized()).await;
         (|| -> Result<()> {
             let settings = LlamaRunnerSettings::decode(&mut Cursor::new(settings))
                 .map_err(|e| anyhow!("decode error: {e}"))?;
