@@ -465,6 +465,7 @@ impl PluginV2 for EmbeddingLlmRunnerPlugin {
     }
 
     async fn load(&mut self, settings: Vec<u8>) -> std::result::Result<(), String> {
+        ensure_tracing_initialized().await;
         self.load_sync(settings).map_err(|e| e.to_string())
     }
 
@@ -546,18 +547,24 @@ impl PluginV2 for EmbeddingLlmRunnerPlugin {
 
 /// One-time process bootstrap shared by every plugin instance. The macro's
 /// init expression runs once per `load_multi_method_plugin_v2` invocation,
-/// so doing tracing/dotenv setup here mirrors the behaviour of the old
-/// hand-written FFI loader.
+/// so only synchronous setup belongs here — async tracing initialisation
+/// runs lazily inside `PluginV2::load`. Spinning a throwaway tokio runtime
+/// here would panic if the host loads the plugin from a Tokio worker.
 fn build_plugin_instance() -> EmbeddingLlmRunnerPlugin {
     dotenvy::dotenv().ok();
-    if let Ok(rt) = tokio::runtime::Runtime::new() {
-        rt.block_on(async move {
-            command_utils::util::tracing::tracing_init_from_env()
-                .await
-                .unwrap_or_default();
-        });
-    }
     EmbeddingLlmRunnerPlugin::new().expect("Failed to construct EmbeddingLlmRunnerPlugin")
+}
+
+/// Idempotent guard for tracing initialisation: the first `load()` call wins,
+/// every subsequent call short-circuits. We use `tokio::sync::OnceCell` so the
+/// guard cooperates with the surrounding async runtime.
+async fn ensure_tracing_initialized() {
+    static TRACING_INIT: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
+    TRACING_INIT
+        .get_or_init(|| async {
+            let _ = command_utils::util::tracing::tracing_init_from_env().await;
+        })
+        .await;
 }
 
 register_plugin_v2!(EmbeddingLlmRunnerPlugin, build_plugin_instance());

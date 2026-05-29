@@ -431,6 +431,7 @@ impl PluginV2 for RerankerRunnerPlugin {
     }
 
     async fn load(&mut self, settings: Vec<u8>) -> std::result::Result<(), String> {
+        ensure_tracing_initialized().await;
         self.load_sync(settings).map_err(|e| e.to_string())
     }
 
@@ -504,15 +505,22 @@ impl PluginV2 for RerankerRunnerPlugin {
 }
 
 fn build_plugin_instance() -> RerankerRunnerPlugin {
+    // Sync-only bootstrap. Async tracing init runs lazily inside
+    // `PluginV2::load` so we never try to spin up a throwaway tokio runtime
+    // from inside the host runtime — that would panic on Tokio workers.
     dotenvy::dotenv().ok();
-    if let Ok(rt) = tokio::runtime::Runtime::new() {
-        rt.block_on(async {
-            command_utils::util::tracing::tracing_init_from_env()
-                .await
-                .unwrap_or_default();
-        });
-    }
     RerankerRunnerPlugin::new()
+}
+
+/// Idempotent guard for tracing initialisation: the first `load()` call wins,
+/// every subsequent call short-circuits.
+async fn ensure_tracing_initialized() {
+    static TRACING_INIT: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
+    TRACING_INIT
+        .get_or_init(|| async {
+            let _ = command_utils::util::tracing::tracing_init_from_env().await;
+        })
+        .await;
 }
 
 register_plugin_v2!(RerankerRunnerPlugin, build_plugin_instance());

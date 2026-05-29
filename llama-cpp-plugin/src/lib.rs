@@ -590,6 +590,7 @@ impl PluginV2 for LlamaCppPlugin {
     }
 
     async fn load(&mut self, settings: Vec<u8>) -> std::result::Result<(), String> {
+        ensure_tracing_initialized().await;
         (|| -> Result<()> {
             let settings = LlamaRunnerSettings::decode(&mut Cursor::new(settings))
                 .map_err(|e| anyhow!("decode error: {e}"))?;
@@ -817,15 +818,26 @@ impl PluginV2 for LlamaCppPlugin {
 }
 
 fn build_plugin_instance() -> LlamaCppPlugin {
+    // Only run sync bootstrap here. Tracing initialisation is async (OTLP
+    // exporter wiring inside command_utils::tracing) and must NOT spin up a
+    // throwaway `tokio::runtime::Runtime` from inside the host runtime, as
+    // that would panic if the host happens to call `load_multi_method_plugin_v2`
+    // from a Tokio worker. The async init runs inside `PluginV2::load` instead.
     dotenvy::dotenv().ok();
-    if let Ok(rt) = tokio::runtime::Runtime::new() {
-        rt.block_on(async move {
-            command_utils::util::tracing::tracing_init_from_env()
-                .await
-                .unwrap_or_default();
-        });
-    }
     LlamaCppPlugin::new()
+}
+
+/// Idempotent guard for tracing initialisation: the first `load()` call wins,
+/// every subsequent call short-circuits. We use `tokio::sync::OnceCell` so the
+/// guard cooperates with the surrounding async runtime (no blocking on a
+/// `std::sync::Once` from an async task).
+async fn ensure_tracing_initialized() {
+    static TRACING_INIT: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
+    TRACING_INIT
+        .get_or_init(|| async {
+            let _ = command_utils::util::tracing::tracing_init_from_env().await;
+        })
+        .await;
 }
 
 register_plugin_v2!(LlamaCppPlugin, build_plugin_instance());
