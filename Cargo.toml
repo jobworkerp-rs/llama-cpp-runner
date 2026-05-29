@@ -40,8 +40,8 @@ itertools = { version = "0.14" }
 # New V2 ABI: shared between jobworkerp-rs host and every plugin. The ABI
 # is `#[repr(C)]` except for FfiFuture, so host/plugin can resolve their
 # own tokio / tokio-util / rustc independently.
-jobworkerp-plugin-abi = { git = "https://gitea.sutr.app/jobworkerp-rs/jobworkerp-rs.git", branch = "plugin-compat", package = "jobworkerp-plugin-abi" }
-jobworkerp-plugin-abi-macros = { git = "https://gitea.sutr.app/jobworkerp-rs/jobworkerp-rs.git", branch = "plugin-compat", package = "jobworkerp-plugin-abi-macros" }
+jobworkerp-plugin-abi = { git = "https://github.com/jobworkerp-rs/jobworkerp-rs.git", branch = "main", package = "jobworkerp-plugin-abi" }
+jobworkerp-plugin-abi-macros = { git = "https://github.com/jobworkerp-rs/jobworkerp-rs.git", branch = "main", package = "jobworkerp-plugin-abi-macros" }
 # `mtmd` feature enables the multimodal projector module used by image/audio inputs.
 # Fork adds `MtmdInputChunks::eval_chunk` (single-chunk partial prefill) for
 # multimodal KV-cache prefix reuse, not available upstream.
@@ -57,7 +57,7 @@ openssl = { version = "0.10", features = ["vendored"] }
 opentelemetry = "0.31"
 prost = { version = "0.14" }
 prost-build = { version = "0.14" }
-proto = { git = "https://gitea.sutr.app/jobworkerp-rs/jobworkerp-rs.git", branch = "plugin-compat", package = "proto" }
+proto = { git = "https://github.com/jobworkerp-rs/jobworkerp-rs.git", branch = "main", package = "proto" }
 rand = { version = "0.9" }
 regex = { version = "1" }
 schemars = { version = "1.0.4", features = ["chrono04"] }

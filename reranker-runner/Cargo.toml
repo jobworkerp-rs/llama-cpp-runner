@@ -31,7 +31,7 @@ jobworkerp-plugin-abi-macros = { workspace = true }
 # `RerankerResult`, etc.). Inheriting from workspace.dependencies would
 # require matching the workspace key name, so we restate the git source
 # inline here.
-host-proto = { git = "https://gitea.sutr.app/jobworkerp-rs/jobworkerp-rs.git", branch = "plugin-compat", package = "proto" }
+host-proto = { git = "https://github.com/jobworkerp-rs/jobworkerp-rs.git", branch = "main", package = "proto" }
 
 # === llama.cpp ===
 encoding_rs = { workspace = true }
@@ -59,7 +59,7 @@ lru = { version = "0.16" }         # For cache.rs
 prost-build = { workspace = true }
 
 [dev-dependencies]
-host-proto = { git = "https://gitea.sutr.app/jobworkerp-rs/jobworkerp-rs.git", branch = "plugin-compat", package = "proto" }
+host-proto = { git = "https://github.com/jobworkerp-rs/jobworkerp-rs.git", branch = "main", package = "proto" }
 jobworkerp-plugin-abi = { workspace = true }
 tempfile = "3.23"
 tokio-test = "0.4"
