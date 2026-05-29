@@ -27,6 +27,18 @@ use std::{
     ffi::CString, num::NonZeroU32, ops::ControlFlow, path::PathBuf, sync::OnceLock, time::Duration,
 };
 
+// Error-message constants that callers (tests) match against. Centralising
+// them here keeps the bail!() string in sync with assertions; otherwise a
+// trivial wording change in this file silently breaks the test module.
+pub(crate) const ERR_USE_FUNCTION_CALLING_UNSUPPORTED: &str =
+    "function calling is not supported by this plugin";
+pub(crate) const ERR_CLIENT_TOOLS_WITH_FUNCTION_CALLING: &str =
+    "client_tools_json and use_function_calling are mutually exclusive";
+pub(crate) const ERR_CLIENT_TOOLS_WITH_JSON_SCHEMA: &str =
+    "json_schema and client_tools_json are mutually exclusive";
+pub(crate) const ERR_CLIENT_TOOLS_WITH_MULTIMODAL: &str =
+    "multimodal input combined with client_tools_json is not supported yet";
+
 /// for deserialization.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 enum ParamOverrideValueWrapper {
@@ -1398,7 +1410,7 @@ impl LlamaModelWrapper {
         if let Some(ref fo) = args.function_options
             && fo.use_function_calling
         {
-            bail!("function calling is not supported by this plugin");
+            bail!(ERR_USE_FUNCTION_CALLING_UNSUPPORTED);
         }
         if args.model.is_some() {
             tracing::warn!(
@@ -1519,10 +1531,10 @@ impl LlamaModelWrapper {
             .as_ref()
             .is_some_and(|fo| fo.use_function_calling)
         {
-            bail!("client_tools_json and use_function_calling are mutually exclusive");
+            bail!(ERR_CLIENT_TOOLS_WITH_FUNCTION_CALLING);
         }
         if args.json_schema.is_some() {
-            bail!("json_schema and client_tools_json are mutually exclusive");
+            bail!(ERR_CLIENT_TOOLS_WITH_JSON_SCHEMA);
         }
         // Reject multimodal input up front so we never spend cycles building
         // the OAI messages JSON for a request we can't fulfil.
@@ -1532,7 +1544,7 @@ impl LlamaModelWrapper {
                 Some(llm_chat_args::message_content::Content::Image(_))
             )
         }) {
-            bail!("multimodal input combined with client_tools_json is not supported yet");
+            bail!(ERR_CLIENT_TOOLS_WITH_MULTIMODAL);
         }
 
         let options = args.options.take().unwrap_or_default();
@@ -2213,7 +2225,7 @@ pub fn validate_completion_args(args: &LlmCompletionArgs) -> Result<()> {
     if let Some(fo) = &args.function_options
         && fo.use_function_calling
     {
-        bail!("function calling is not supported by this plugin");
+        bail!(ERR_USE_FUNCTION_CALLING_UNSUPPORTED);
     }
     if args.model.is_some() {
         tracing::warn!(
@@ -3310,7 +3322,8 @@ mod tests {
         let err =
             validate_completion_args(&args).expect_err("function_calling=true must be rejected");
         assert!(
-            err.to_string().contains("function calling"),
+            err.to_string()
+                .contains(super::ERR_USE_FUNCTION_CALLING_UNSUPPORTED),
             "error message must mention 'function calling': {err}"
         );
     }

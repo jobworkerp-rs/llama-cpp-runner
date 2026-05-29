@@ -431,6 +431,15 @@ fn run_stream_blocking_with_tools<F>(
             // update (preface text followed by a tool call in the same
             // batch), split into two `Delta`s so neither is dropped. Send
             // the textual portion first to preserve emission order.
+            //
+            // `blocking_send` parks the OS thread on a full channel. Cancel
+            // observation here is load-then-send (not atomic): if cancel
+            // flips after the load but before the send completes, the send
+            // wakes only when a slot opens OR the receiver drops. The outer
+            // `run_stream` drives the receiver, so an outer cancel closes
+            // `inner_tx` → the send returns Err → we trip `cancel_for_oai`
+            // and the next sink call (or the next chunk's `raw_sink` check)
+            // bails out.
             let has_text = !upd.text.is_empty() || !upd.reasoning.is_empty();
             let has_tool_calls = !upd.tool_calls.is_empty();
             if has_text {
@@ -871,13 +880,19 @@ impl PluginV2 for LlamaCppPlugin {
                 }
             };
             match decoded {
-                DecodedStream::Chat(chat_args) => {
+                DecodedStream::Chat(mut chat_args) => {
                     // The OAI parser owns text/tool splitting, so divert to
                     // the tools-aware worker when `client_tools_json` is set.
+                    // `take()` moves the (potentially multi-KB) tool-defs
+                    // JSON out of `function_options` instead of cloning it;
+                    // `chat_args` is then passed by value to the worker
+                    // with `client_tools_json=None` on its inner options,
+                    // which is harmless because the worker treats the
+                    // string we hand it as the canonical source.
                     let client_tools_json = chat_args
                         .function_options
-                        .as_ref()
-                        .and_then(|fo| fo.client_tools_json.clone());
+                        .as_mut()
+                        .and_then(|fo| fo.client_tools_json.take());
                     if let Some(json) = client_tools_json {
                         run_stream_blocking_with_tools(
                             wrapper,
@@ -1026,6 +1041,10 @@ mod test {
 
     // create a test that loads the plugin model from environment variables and runs it internal model (llama_model)
     use super::*;
+    use crate::model::{
+        ERR_CLIENT_TOOLS_WITH_FUNCTION_CALLING, ERR_CLIENT_TOOLS_WITH_JSON_SCHEMA,
+        ERR_USE_FUNCTION_CALLING_UNSUPPORTED,
+    };
 
     /// Build a `HighLevelSink` backed by a host-side mpsc receiver for use
     /// in tests. The returned receiver consumes the bytes that the plugin
@@ -1052,6 +1071,28 @@ mod test {
     ) {
         let (ffi, handle) = FfiCancellationToken::new_owned();
         (CancelToken::from_ffi(ffi), handle)
+    }
+
+    /// Standard model bootstrap shared by every CI-skipping test. The env
+    /// block is identical across cases (Qwen3-0.6B, CPU); centralising it
+    /// makes the test bodies focused on what they actually verify and lets
+    /// us change the test model in one place. Returns `None` (and prints a
+    /// skip message) when the model is unavailable.
+    fn setup_plugin_or_skip() -> Option<LlamaCppPlugin> {
+        const ENV: &str = "
+LLAMA_MODEL=Qwen3-0.6B-Q4_K_M.gguf
+LLAMA_HF_REPO=unsloth/Qwen3-0.6B-GGUF
+LLAMA_DISABLE_GPU=true
+LLAMA_THREADS=8
+LLAMA_USE_FLASH_ATTENTION=false
+";
+        dotenvy::from_read(ENV.as_bytes()).ok();
+        let mut plugin = LlamaCppPlugin::new();
+        if plugin.load_model_from_env().is_err() {
+            eprintln!("skipping: model not available");
+            return None;
+        }
+        Some(plugin)
     }
     #[tokio::test]
     async fn test_plugin_runner() {
@@ -1526,7 +1567,8 @@ LLAMA_USE_FLASH_ATTENTION=false
             .await;
         let err = res.expect_err("function_calling should be rejected");
         assert!(
-            err.to_string().contains("function calling"),
+            err.to_string()
+                .contains(ERR_USE_FUNCTION_CALLING_UNSUPPORTED),
             "error should mention function calling: {err}"
         );
     }
@@ -1615,7 +1657,8 @@ LLAMA_USE_FLASH_ATTENTION=false
             .await;
         let err = res.expect_err("function_calling should be rejected");
         assert!(
-            err.to_string().contains("function calling"),
+            err.to_string()
+                .contains(ERR_USE_FUNCTION_CALLING_UNSUPPORTED),
             "error should mention function calling: {err}"
         );
     }
@@ -2450,19 +2493,9 @@ LLAMA_SYSTEM_PROMPT=You are a helpful assistant.
     async fn test_chat_rejects_json_schema_with_client_tools() {
         use jobworkerp_llama_protobuf::protobuf::llm::llm_chat_args;
 
-        let env = "
-LLAMA_MODEL=Qwen3-0.6B-Q4_K_M.gguf
-LLAMA_HF_REPO=unsloth/Qwen3-0.6B-GGUF
-LLAMA_DISABLE_GPU=true
-LLAMA_THREADS=8
-LLAMA_USE_FLASH_ATTENTION=false
-";
-        dotenvy::from_read(env.as_bytes()).ok();
-        let mut plugin = LlamaCppPlugin::new();
-        if plugin.load_model_from_env().is_err() {
-            eprintln!("skipping: model not available");
+        let Some(mut plugin) = setup_plugin_or_skip() else {
             return;
-        }
+        };
 
         let request = LlmChatArgs {
             options: None,
@@ -2491,8 +2524,8 @@ LLAMA_USE_FLASH_ATTENTION=false
             .await;
         let err = res.expect_err("json_schema + client_tools must be rejected");
         assert!(
-            err.to_string().contains("json_schema") && err.to_string().contains("client_tools"),
-            "error should mention both: {err}"
+            err.to_string().contains(ERR_CLIENT_TOOLS_WITH_JSON_SCHEMA),
+            "error should mention the json_schema/client_tools conflict: {err}"
         );
     }
 
@@ -2500,19 +2533,9 @@ LLAMA_USE_FLASH_ATTENTION=false
     async fn test_chat_rejects_client_tools_with_use_function_calling() {
         use jobworkerp_llama_protobuf::protobuf::llm::llm_chat_args;
 
-        let env = "
-LLAMA_MODEL=Qwen3-0.6B-Q4_K_M.gguf
-LLAMA_HF_REPO=unsloth/Qwen3-0.6B-GGUF
-LLAMA_DISABLE_GPU=true
-LLAMA_THREADS=8
-LLAMA_USE_FLASH_ATTENTION=false
-";
-        dotenvy::from_read(env.as_bytes()).ok();
-        let mut plugin = LlamaCppPlugin::new();
-        if plugin.load_model_from_env().is_err() {
-            eprintln!("skipping: model not available");
+        let Some(mut plugin) = setup_plugin_or_skip() else {
             return;
-        }
+        };
 
         let request = LlmChatArgs {
             options: None,
@@ -2540,10 +2563,13 @@ LLAMA_USE_FLASH_ATTENTION=false
             .run(buf, HashMap::new(), Some(METHOD_CHAT.into()))
             .await;
         let err = res.expect_err("use_function_calling + client_tools must be rejected");
-        // The server-side function-calling guard fires first.
+        // The server-side function-calling guard at `run_chat_with_sink`
+        // entry fires first, but the dedicated mutual-exclusion guard is
+        // also valid coverage.
+        let err_s = err.to_string();
         assert!(
-            err.to_string().contains("function calling")
-                || err.to_string().contains("mutually exclusive"),
+            err_s.contains(ERR_USE_FUNCTION_CALLING_UNSUPPORTED)
+                || err_s.contains(ERR_CLIENT_TOOLS_WITH_FUNCTION_CALLING),
             "error should mention the conflict: {err}"
         );
     }
@@ -2552,19 +2578,9 @@ LLAMA_USE_FLASH_ATTENTION=false
     async fn test_chat_rejects_tool_choice_naming_unknown_function() {
         use jobworkerp_llama_protobuf::protobuf::llm::llm_chat_args;
 
-        let env = "
-LLAMA_MODEL=Qwen3-0.6B-Q4_K_M.gguf
-LLAMA_HF_REPO=unsloth/Qwen3-0.6B-GGUF
-LLAMA_DISABLE_GPU=true
-LLAMA_THREADS=8
-LLAMA_USE_FLASH_ATTENTION=false
-";
-        dotenvy::from_read(env.as_bytes()).ok();
-        let mut plugin = LlamaCppPlugin::new();
-        if plugin.load_model_from_env().is_err() {
-            eprintln!("skipping: model not available");
+        let Some(mut plugin) = setup_plugin_or_skip() else {
             return;
-        }
+        };
 
         let request = LlmChatArgs {
             options: None,
@@ -2606,19 +2622,9 @@ LLAMA_USE_FLASH_ATTENTION=false
     async fn test_run_stream_rejects_json_schema_with_client_tools() {
         use jobworkerp_llama_protobuf::protobuf::llm::llm_chat_args;
 
-        let env = "
-LLAMA_MODEL=Qwen3-0.6B-Q4_K_M.gguf
-LLAMA_HF_REPO=unsloth/Qwen3-0.6B-GGUF
-LLAMA_DISABLE_GPU=true
-LLAMA_THREADS=8
-LLAMA_USE_FLASH_ATTENTION=false
-";
-        dotenvy::from_read(env.as_bytes()).ok();
-        let mut plugin = LlamaCppPlugin::new();
-        if plugin.load_model_from_env().is_err() {
-            eprintln!("skipping: model not available");
+        let Some(mut plugin) = setup_plugin_or_skip() else {
             return;
-        }
+        };
 
         let request = LlmChatArgs {
             options: None,
@@ -2648,8 +2654,8 @@ LLAMA_USE_FLASH_ATTENTION=false
             .await;
         let err = res.expect_err("json_schema + client_tools must be rejected mid-stream");
         assert!(
-            err.contains("json_schema") && err.contains("client_tools"),
-            "stream error should mention both: {err}"
+            err.contains(ERR_CLIENT_TOOLS_WITH_JSON_SCHEMA),
+            "stream error should mention the json_schema/client_tools conflict: {err}"
         );
         // The worker bails before pushing any chunk.
         assert!(rx.try_recv().is_err(), "no chunk should have been emitted");
@@ -2659,19 +2665,9 @@ LLAMA_USE_FLASH_ATTENTION=false
     async fn test_run_stream_rejects_client_tools_with_use_function_calling() {
         use jobworkerp_llama_protobuf::protobuf::llm::llm_chat_args;
 
-        let env = "
-LLAMA_MODEL=Qwen3-0.6B-Q4_K_M.gguf
-LLAMA_HF_REPO=unsloth/Qwen3-0.6B-GGUF
-LLAMA_DISABLE_GPU=true
-LLAMA_THREADS=8
-LLAMA_USE_FLASH_ATTENTION=false
-";
-        dotenvy::from_read(env.as_bytes()).ok();
-        let mut plugin = LlamaCppPlugin::new();
-        if plugin.load_model_from_env().is_err() {
-            eprintln!("skipping: model not available");
+        let Some(mut plugin) = setup_plugin_or_skip() else {
             return;
-        }
+        };
 
         let request = LlmChatArgs {
             options: None,
@@ -2701,7 +2697,8 @@ LLAMA_USE_FLASH_ATTENTION=false
             .await;
         let err = res.expect_err("use_function_calling + client_tools must be rejected mid-stream");
         assert!(
-            err.contains("function calling") || err.contains("mutually exclusive"),
+            err.contains(ERR_USE_FUNCTION_CALLING_UNSUPPORTED)
+                || err.contains(ERR_CLIENT_TOOLS_WITH_FUNCTION_CALLING),
             "stream error should mention the conflict: {err}"
         );
         assert!(rx.try_recv().is_err(), "no chunk should have been emitted");
