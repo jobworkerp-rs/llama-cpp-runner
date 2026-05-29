@@ -82,7 +82,7 @@ OpenAI 互換。`true` のとき、モデルは 1 回の応答内に複数のツ
 
 ### `function_options.chat_template_kwargs` (tag 11, optional string)
 
-任意の JSON object 文字列。chat template (jinja) に渡される追加の `kwargs`。モデル固有のスイッチ (例: Qwen の `{"enable_thinking":false}`) を渡すための入口です。プラグインはこのフィールドの中身を解釈せず素通しします。
+任意の JSON object 文字列。chat template (jinja) に渡される追加の `kwargs`。モデル固有のスイッチ (例: Qwen の `{"enable_thinking":false}`) を渡すための入口です。基本的にはそのまま llama.cpp 側に素通しされますが、`enable_thinking` キーは特別扱いで、同名の C++ パラメータ (grammar/parser の think モード制御) にも反映されます。これは jinja テンプレートと grammar/parser が同じ前提で動くようにするためで、二者が食い違うと Qwen 系のような think モードを持つモデルで tool call の生成・解析が不整合になります。値が bool でないか JSON object でない場合は無視され、デフォルト (`false`) が使われます。
 
 ### 既存フィールドとの排他
 

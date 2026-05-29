@@ -226,6 +226,23 @@ pub(crate) fn compute_preserved_token_set(
     set
 }
 
+/// Extract the `enable_thinking` boolean from a `chat_template_kwargs`
+/// JSON object string. The kwargs payload is still forwarded verbatim to
+/// `apply_chat_template_oaicompat` (so the jinja template sees the same
+/// value), but the C++ side ALSO has a dedicated `enable_thinking`
+/// parameter that controls grammar/parser behaviour. Without this
+/// extraction the two channels can disagree (Qwen3 think mode is a
+/// notable example).
+///
+/// Returns `None` when the kwargs is absent, not a JSON object, or the
+/// `enable_thinking` key is missing / not a boolean. Callers should fall
+/// back to a sensible default (typically `false`) in that case.
+pub(crate) fn extract_enable_thinking(chat_template_kwargs: Option<&str>) -> Option<bool> {
+    let raw = chat_template_kwargs?;
+    let value: Value = serde_json::from_str(raw).ok()?;
+    value.get("enable_thinking")?.as_bool()
+}
+
 /// Convert the wire-level `ChatMessage` list into an OpenAI-compatible
 /// messages JSON array string.
 ///
@@ -1042,5 +1059,59 @@ mod tests {
     fn test_decode_oai_deltas_skips_malformed_entries() {
         let u = decode_oai_deltas(&["not json".to_string(), r#"{"content":"ok"}"#.to_string()]);
         assert_eq!(u.text, "ok");
+    }
+
+    // ----------------- extract_enable_thinking -----------------
+
+    #[test]
+    fn test_extract_enable_thinking_returns_none_when_kwargs_absent() {
+        assert!(extract_enable_thinking(None).is_none());
+    }
+
+    #[test]
+    fn test_extract_enable_thinking_extracts_true_value() {
+        let v = extract_enable_thinking(Some(r#"{"enable_thinking":true}"#));
+        assert_eq!(v, Some(true));
+    }
+
+    #[test]
+    fn test_extract_enable_thinking_extracts_false_value() {
+        let v = extract_enable_thinking(Some(r#"{"enable_thinking":false}"#));
+        assert_eq!(v, Some(false));
+    }
+
+    #[test]
+    fn test_extract_enable_thinking_returns_none_when_key_missing() {
+        let v = extract_enable_thinking(Some(r#"{"other_flag":true}"#));
+        assert!(v.is_none());
+    }
+
+    #[test]
+    fn test_extract_enable_thinking_returns_none_when_value_not_bool() {
+        // String value: rejected (we don't coerce "true" to true).
+        let v = extract_enable_thinking(Some(r#"{"enable_thinking":"true"}"#));
+        assert!(v.is_none());
+    }
+
+    #[test]
+    fn test_extract_enable_thinking_returns_none_on_invalid_json() {
+        let v = extract_enable_thinking(Some("not json"));
+        assert!(v.is_none());
+    }
+
+    #[test]
+    fn test_extract_enable_thinking_returns_none_for_non_object_root() {
+        // A bare boolean is not the documented kwargs shape (must be a
+        // JSON object). Reject so the call falls back to the default.
+        let v = extract_enable_thinking(Some("true"));
+        assert!(v.is_none());
+    }
+
+    #[test]
+    fn test_extract_enable_thinking_coexists_with_other_keys() {
+        let v = extract_enable_thinking(Some(
+            r#"{"some_other":42,"enable_thinking":true,"more":"x"}"#,
+        ));
+        assert_eq!(v, Some(true));
     }
 }

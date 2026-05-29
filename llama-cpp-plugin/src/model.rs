@@ -1899,6 +1899,14 @@ impl LlamaModelWrapper {
             .model
             .chat_template(None)
             .context("model does not expose a chat template required for tool calling")?;
+        let chat_template_kwargs = tool_opts.and_then(|fo| fo.chat_template_kwargs.as_deref());
+        // `enable_thinking` controls both the jinja template (via kwargs) and
+        // the C++ grammar/parser (via this dedicated bool). Forward whatever
+        // the caller put inside `chat_template_kwargs.enable_thinking` so the
+        // two channels agree; default to false to preserve current behaviour
+        // for callers that omit the key.
+        let enable_thinking =
+            crate::oai_chat::extract_enable_thinking(chat_template_kwargs).unwrap_or(false);
         let params = llama_cpp_2::openai::OpenAIChatTemplateParams {
             messages_json: oai_messages_json,
             tools_json: Some(tools_json),
@@ -1909,13 +1917,13 @@ impl LlamaModelWrapper {
             json_schema: None,
             grammar: None,
             reasoning_format: tool_opts.and_then(|fo| fo.reasoning_format.as_deref()),
-            chat_template_kwargs: tool_opts.and_then(|fo| fo.chat_template_kwargs.as_deref()),
+            chat_template_kwargs,
             add_generation_prompt: true,
             use_jinja: true,
             parallel_tool_calls: tool_opts
                 .and_then(|fo| fo.parallel_tool_calls)
                 .unwrap_or(false),
-            enable_thinking: false,
+            enable_thinking,
             add_bos: true,
             add_eos: false,
             parse_tool_calls: true,
