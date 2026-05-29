@@ -1,6 +1,3 @@
-[submodule "modules/jobworkerp-client"]
-	path = modules/jobworkerp-client
-	url = https://github.com/jobworkerp-rs/jobworkerp-client-rs.git
 [submodule "modules/command-utils"]
 	path = modules/command-utils
 	url = https://github.com/sutr-app/command-utils

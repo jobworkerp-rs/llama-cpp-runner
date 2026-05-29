@@ -11,9 +11,11 @@ license = { workspace = true }
 crate-type = ["cdylib", "lib"]
 
 [dependencies]
-jobworkerp-client = { path = "../modules/jobworkerp-client" }
+jobworkerp-plugin-abi = { workspace = true }
+jobworkerp-plugin-abi-macros = { workspace = true }
 jobworkerp-llama-protobuf = { path = "../llama-protobuf" }
 mtmd-support = { path = "../mtmd-support" }
+proto = { workspace = true }
 
 anyhow = { workspace = true }
 async-trait = { workspace = true }
@@ -35,7 +37,7 @@ schemars = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["rt-multi-thread"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 tokenizers = { workspace = true }
 tracing = { workspace = true }
 

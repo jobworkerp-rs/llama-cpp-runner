@@ -84,6 +84,12 @@ pub enum RerankerError {
     /// Other errors
     #[error("Other error: {0}")]
     Other(String),
+
+    /// Job cancelled cooperatively via the V2 CancellationToken.
+    /// Distinct from generic InferenceFailed so callers can surface it as a
+    /// non-error termination instead of a true failure.
+    #[error("cancelled")]
+    Cancelled,
 }
 
 impl RerankerError {

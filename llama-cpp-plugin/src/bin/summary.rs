@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, anyhow};
-use jobworkerp_client::plugins::MultiMethodPluginRunner;
 use jobworkerp_llama_cpp_plugin::LlamaCppPlugin;
 use jobworkerp_llama_protobuf::protobuf::llama_cpp::LlamaArg;
+use jobworkerp_plugin_abi::v2::PluginV2;
 use prost::Message;
 use std::collections::HashMap;
 use std::fs;
@@ -51,10 +51,12 @@ fn main() -> Result<()> {
     };
     let mut buf = Vec::with_capacity(request.encoded_len());
     request.encode(&mut buf).unwrap();
-    let res = plugin
-        .run(buf, HashMap::new(), None)
-        .0
-        .expect("failed to run plugin");
+    // The binary is not async-main; this transient runtime only drives the
+    // FFI future returned by plugin.run(). The plugin owns its own runtime
+    // internally for the spawn_blocking work.
+    let driver = tokio::runtime::Runtime::new().expect("failed to build driver runtime");
+    let (res, _meta) = driver.block_on(plugin.run(buf, HashMap::new(), None));
+    let res = res.expect("failed to run plugin");
     let res = LlamaArg::decode(&mut Cursor::new(res.clone()))
         .map_err(|e| anyhow!("decode error: {e}"))
         .unwrap();

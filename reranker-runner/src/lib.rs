@@ -5,11 +5,24 @@
 // the existing Candle-based implementation.
 
 use anyhow::{Result, anyhow};
-use jobworkerp_client::{
-    plugins::PluginRunner, schema_to_json_string, schema_to_json_string_option,
-};
+use host_proto::jobworkerp::data::{MethodJsonSchema, MethodSchema, StreamingOutputType};
+use jobworkerp_plugin_abi::v2::{CancelToken, HighLevelSink, PluginV2};
+use jobworkerp_plugin_abi_macros::register_plugin_v2;
 use prost::Message;
 use std::{collections::HashMap, io::Cursor, sync::Arc, time::Instant};
+
+/// Serialize a `schemars::JsonSchema` type into a JSON string for the
+/// `MethodJsonSchema` / settings_schema slots.
+fn json_schema_string<T: schemars::JsonSchema>(label: &str) -> String {
+    let schema = schemars::schema_for!(T);
+    match serde_json::to_string(&schema) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!("error in {label}: {e:?}");
+            String::new()
+        }
+    }
+}
 
 // Shared components (copied from search-runner)
 pub mod cache;
@@ -38,31 +51,71 @@ pub use utils::{blend_scores, generate_cache_key};
 
 use proto::{RerankerArgs, RerankerResult, RerankerSettings};
 
+pub const METHOD_RUN: &str = "run";
+
+/// Error-string surface for cooperative cancellation, shared with the host's
+/// cancellation contract. Callers may match against this exact string.
+pub const CANCELLED: &str = "cancelled";
+
 /// RerankerRunner Plugin for JobworkerP
 ///
 /// This plugin provides document reranking functionality using llama.cpp
 /// and Qwen3-Reranker-4B-GGUF model.
 pub struct RerankerRunnerPlugin {
-    /// Tokio runtime for async operations
-    rt: Arc<tokio::runtime::Runtime>,
-    /// Reranker instance (initialized in load())
-    reranker: Option<LlamaReranker>,
+    /// Plugin-owned multi-thread tokio runtime. Held in `Option` so `Drop`
+    /// can `shutdown_background()` instead of blocking the calling thread —
+    /// the latter panics when invoked from inside another async context
+    /// (e.g. when the host drops the plugin from a `tokio::test`).
+    rt: Option<tokio::runtime::Runtime>,
+    /// Shared so it can be cloned into the spawn closure.
+    /// `compute_scores_with_stats` is `&self`, and all interior state lives
+    /// behind its own synchronization (cache LRU, llama.cpp model lock), so a
+    /// plain `Arc` is enough.
+    reranker: Option<Arc<LlamaReranker>>,
     /// Configuration
     config: Option<RerankerConfig>,
+    /// Refreshed before each job via `set_cancellation_token`. Threaded into
+    /// `compute_scores_with_stats` so the inner per-document loop aborts
+    /// promptly.
+    token: Option<CancelToken>,
 }
 
 impl RerankerRunnerPlugin {
     pub const RUNNER_NAME: &str = "RerankerRunner";
 
     pub fn new() -> Self {
-        let rt = Arc::new(tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime"));
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .thread_name("reranker-runner-plugin")
+            .build()
+            .expect("Failed to build plugin tokio runtime");
         Self {
-            rt,
+            rt: Some(rt),
             reranker: None,
             config: None,
+            token: None,
         }
     }
 
+    fn rt_handle(&self) -> tokio::runtime::Handle {
+        self.rt
+            .as_ref()
+            .expect("plugin runtime accessed after Drop")
+            .handle()
+            .clone()
+    }
+}
+
+impl Drop for RerankerRunnerPlugin {
+    fn drop(&mut self) {
+        if let Some(rt) = self.rt.take() {
+            rt.shutdown_background();
+        }
+    }
+}
+
+impl RerankerRunnerPlugin {
     /// Parse Protobuf RerankerSettings into RerankerConfig
     fn parse_settings(settings: RerankerSettings) -> Result<RerankerConfig> {
         let model = RerankerModelConfig {
@@ -237,16 +290,8 @@ impl Default for RerankerRunnerPlugin {
     }
 }
 
-impl PluginRunner for RerankerRunnerPlugin {
-    fn name(&self) -> String {
-        Self::RUNNER_NAME.to_string()
-    }
-
-    fn description(&self) -> String {
-        "Rerank text candidates using llama.cpp-based Qwen3-Reranker-4B-GGUF model".to_string()
-    }
-
-    fn load(&mut self, settings: Vec<u8>) -> Result<()> {
+impl RerankerRunnerPlugin {
+    fn load_sync(&mut self, settings: Vec<u8>) -> Result<()> {
         tracing::info!("Loading RerankerRunner plugin");
 
         let settings = RerankerSettings::decode(&mut Cursor::new(settings))?;
@@ -263,186 +308,211 @@ impl PluginRunner for RerankerRunnerPlugin {
         let reranker = LlamaReranker::new(config.clone())?;
 
         self.config = Some(config);
-        self.reranker = Some(reranker);
+        self.reranker = Some(Arc::new(reranker));
 
         tracing::info!("RerankerRunner loaded successfully");
         Ok(())
     }
+}
 
-    fn run(
-        &mut self,
-        arg: Vec<u8>,
-        _metadata: HashMap<String, String>,
-    ) -> (Result<Vec<u8>>, HashMap<String, String>) {
-        let start = Instant::now();
+/// Execute reranking for a single request. Pulled out of the trait method so
+/// the returned future is `'static`. `token` is `None` when the host did not
+/// register a cancellation token; the inner per-document loop simply skips
+/// the cooperative-cancel check in that case.
+async fn run_reranker(
+    reranker: Arc<LlamaReranker>,
+    arg: Vec<u8>,
+    token: Option<CancelToken>,
+) -> std::result::Result<Vec<u8>, String> {
+    let start = Instant::now();
 
-        // Decode args
-        let args = match RerankerArgs::decode(&mut Cursor::new(arg)) {
-            Ok(args) => args,
-            Err(e) => {
-                tracing::error!("Failed to decode args: {}", e);
-                let err_result = RerankerResult {
-                    success: false,
-                    error_message: Some(format!("Failed to decode args: {}", e)),
-                    stats: None,
-                    ranked_candidates: vec![],
-                };
-                return (Ok(err_result.encode_to_vec()), HashMap::new());
-            }
-        };
+    let args = RerankerArgs::decode(&mut Cursor::new(arg))
+        .map_err(|e| format!("Failed to decode args: {e}"))?;
 
-        // Parse args
-        let (query, documents, options) = match Self::parse_args(&args) {
-            Ok(parsed) => parsed,
-            Err(e) => {
-                tracing::error!("Failed to parse args: {}", e);
-                let err_result = RerankerResult {
-                    success: false,
-                    error_message: Some(format!("Invalid arguments: {}", e)),
-                    stats: None,
-                    ranked_candidates: vec![],
-                };
-                return (Ok(err_result.encode_to_vec()), HashMap::new());
-            }
-        };
+    let (query, documents, options) =
+        RerankerRunnerPlugin::parse_args(&args).map_err(|e| format!("Invalid arguments: {e}"))?;
 
-        tracing::debug!(
-            "Reranking {} documents for query: '{}'",
-            documents.len(),
-            query
-        );
+    tracing::debug!(
+        "Reranking {} documents for query: '{}'",
+        documents.len(),
+        query
+    );
 
-        // Get reranker
-        let reranker = match self.reranker.as_mut() {
-            Some(r) => r,
-            None => {
-                tracing::error!("Reranker not initialized");
-                let err_result = RerankerResult {
-                    success: false,
-                    error_message: Some("Reranker not loaded".to_string()),
-                    stats: None,
-                    ranked_candidates: vec![],
-                };
-                return (Ok(err_result.encode_to_vec()), HashMap::new());
-            }
-        };
+    let scoring_result = reranker
+        .compute_scores_with_stats(&query, &documents, options, token.as_ref())
+        .await
+        .map_err(|e| match e {
+            RerankerError::Cancelled => CANCELLED.to_string(),
+            other => format!("Reranking failed: {other}"),
+        })?;
 
-        // Execute reranking (async operation with blocking)
-        let rt = self.rt.clone();
-        let result = rt.block_on(async {
-            reranker
-                .compute_scores_with_stats(&query, &documents, options)
-                .await
-        });
+    let processing_time_ms = start.elapsed().as_millis() as u64;
 
-        match result {
-            Ok(scoring_result) => {
-                let processing_time_ms = start.elapsed().as_millis() as u64;
+    tracing::info!(
+        "Reranking completed: {} documents processed in {}ms (avg {:.1}ms/doc), cache hits: {}/{} ({:.1}%)",
+        documents.len(),
+        processing_time_ms,
+        processing_time_ms as f32 / documents.len().max(1) as f32,
+        scoring_result.stats.cache_hits,
+        documents.len(),
+        scoring_result.stats.cache_hit_rate * 100.0
+    );
 
-                tracing::info!(
-                    "Reranking completed: {} documents processed in {}ms (avg {:.1}ms/doc), cache hits: {}/{} ({:.1}%)",
-                    documents.len(),
-                    processing_time_ms,
-                    processing_time_ms as f32 / documents.len() as f32,
-                    scoring_result.stats.cache_hits,
-                    documents.len(),
-                    scoring_result.stats.cache_hit_rate * 100.0
-                );
+    let built =
+        RerankerRunnerPlugin::build_result(&args, scoring_result, &reranker, processing_time_ms)
+            .map_err(|e| format!("Failed to build result: {e}"))?;
+    Ok(built.encode_to_vec())
+}
 
-                // Build result with score blending and filtering
-                match Self::build_result(&args, scoring_result, reranker, processing_time_ms) {
-                    Ok(result) => (Ok(result.encode_to_vec()), HashMap::new()),
-                    Err(e) => {
-                        tracing::error!("Failed to build result: {}", e);
-                        let err_result = RerankerResult {
-                            success: false,
-                            error_message: Some(format!("Failed to build result: {}", e)),
-                            stats: None,
-                            ranked_candidates: vec![],
-                        };
-                        (Ok(err_result.encode_to_vec()), HashMap::new())
-                    }
-                }
-            }
-            Err(e) => {
-                tracing::error!("Reranking failed: {}", e);
-                let err_result = RerankerResult {
-                    success: false,
-                    error_message: Some(format!("Reranking failed: {}", e)),
-                    stats: None,
-                    ranked_candidates: vec![],
-                };
-                (Ok(err_result.encode_to_vec()), HashMap::new())
-            }
-        }
+#[async_trait::async_trait]
+impl PluginV2 for RerankerRunnerPlugin {
+    fn name(&self) -> String {
+        Self::RUNNER_NAME.to_string()
     }
 
-    fn cancel(&self) -> bool {
-        // Phase 1: Cancellation not supported
-        false
-    }
-
-    fn is_canceled(&self) -> bool {
-        false
+    fn description(&self) -> String {
+        "Rerank text candidates using llama.cpp-based Qwen3-Reranker-4B-GGUF model".to_string()
     }
 
     fn runner_settings_proto(&self) -> String {
         include_str!("../protobuf/reranker_settings.proto").to_string()
     }
 
-    fn job_args_proto(&self) -> String {
-        include_str!("../protobuf/reranker_args.proto").to_string()
+    fn method_proto_map(&self) -> HashMap<String, Vec<u8>> {
+        static CACHED: std::sync::OnceLock<HashMap<String, Vec<u8>>> = std::sync::OnceLock::new();
+        CACHED
+            .get_or_init(|| {
+                let mut m = HashMap::new();
+                m.insert(
+                    METHOD_RUN.to_string(),
+                    MethodSchema {
+                        args_proto: include_str!("../protobuf/reranker_args.proto").to_string(),
+                        result_proto: include_str!("../protobuf/reranker_result.proto").to_string(),
+                        description: Some("Rerank a set of candidates against a query".to_string()),
+                        output_type: StreamingOutputType::NonStreaming as i32,
+                        ..Default::default()
+                    }
+                    .encode_to_vec(),
+                );
+                m
+            })
+            .clone()
     }
 
-    fn result_output_proto(&self) -> Option<String> {
-        Some(include_str!("../protobuf/reranker_result.proto").to_string())
+    fn method_json_schema_map(&self) -> Option<HashMap<String, Vec<u8>>> {
+        static CACHED: std::sync::OnceLock<HashMap<String, Vec<u8>>> = std::sync::OnceLock::new();
+        Some(
+            CACHED
+                .get_or_init(|| {
+                    let mut m = HashMap::new();
+                    m.insert(
+                        METHOD_RUN.to_string(),
+                        MethodJsonSchema {
+                            args_schema: json_schema_string::<RerankerArgs>("run_args_schema"),
+                            result_schema: Some(json_schema_string::<RerankerResult>(
+                                "run_result_schema",
+                            )),
+                            ..Default::default()
+                        }
+                        .encode_to_vec(),
+                    );
+                    m
+                })
+                .clone(),
+        )
     }
 
     fn settings_schema(&self) -> String {
-        schema_to_json_string!(RerankerSettings, "settings_schema")
+        json_schema_string::<RerankerSettings>("settings_schema")
     }
 
-    fn arguments_schema(&self) -> String {
-        schema_to_json_string!(RerankerArgs, "arguments_schema")
+    fn set_cancellation_token(&mut self, token: CancelToken) {
+        self.token = Some(token);
     }
 
-    fn output_json_schema(&self) -> Option<String> {
-        schema_to_json_string_option!(RerankerResult, "output_json_schema")
+    async fn load(&mut self, settings: Vec<u8>) -> std::result::Result<(), String> {
+        self.load_sync(settings).map_err(|e| e.to_string())
+    }
+
+    async fn run(
+        &mut self,
+        arg: Vec<u8>,
+        metadata: HashMap<String, String>,
+        _using: Option<String>,
+    ) -> (
+        std::result::Result<Vec<u8>, String>,
+        HashMap<String, String>,
+    ) {
+        let token = self.token.clone();
+        let handle = self.rt_handle();
+        let reranker = self.reranker.clone();
+
+        // Honour cancellation even before the reranker is loaded so callers
+        // get a consistent "cancelled" error regardless of plugin state.
+        if token.as_ref().is_some_and(|t| t.is_cancelled()) {
+            return (Err(CANCELLED.to_string()), metadata);
+        }
+        let result = match reranker {
+            Some(reranker) => {
+                // Clone the token for the spawned task; keep the original
+                // around for the outer cancel-branch select.
+                let token_for_inner = token.clone();
+                let join = handle.spawn(run_reranker(reranker, arg, token_for_inner));
+                // Await the inner task even if the outer token fires —
+                // `run_reranker` observes the token at document boundaries
+                // and exits with `RerankerError::Cancelled`, releasing model
+                // resources before we return to the host. Without this join
+                // the next job could find the reranker still busy.
+                tokio::pin!(join);
+                let joined = match token.as_ref() {
+                    Some(t) => {
+                        let cancel_branch = async {
+                            t.cancelled().await;
+                        };
+                        tokio::pin!(cancel_branch);
+                        tokio::select! {
+                            biased;
+                            _ = &mut cancel_branch => (&mut join).await,
+                            j = &mut join => j,
+                        }
+                    }
+                    None => (&mut join).await,
+                };
+                let cancel_observed = token.as_ref().is_some_and(|t| t.is_cancelled());
+                match joined {
+                    Ok(Ok(_)) if cancel_observed => Err(CANCELLED.to_string()),
+                    Ok(Ok(bytes)) => Ok(bytes),
+                    Ok(Err(_)) if cancel_observed => Err(CANCELLED.to_string()),
+                    Ok(Err(e)) => Err(e),
+                    Err(e) => Err(format!("join error: {e}")),
+                }
+            }
+            None => Err("Reranker not loaded".to_string()),
+        };
+        (result, metadata)
+    }
+
+    async fn run_stream(
+        &mut self,
+        _args: Vec<u8>,
+        _metadata: HashMap<String, String>,
+        _using: Option<String>,
+        _output: HighLevelSink,
+    ) -> std::result::Result<HashMap<String, String>, String> {
+        Err("streaming is not supported by reranker-runner".to_string())
     }
 }
 
-// C API exports for dynamic plugin loading
-#[cfg(feature = "c-api")]
-mod plugin_exports {
-    use super::*;
-
-    #[allow(improper_ctypes_definitions)]
-    #[unsafe(no_mangle)]
-    pub extern "C" fn load_plugin() -> Box<dyn PluginRunner + Send + Sync> {
-        std::panic::catch_unwind(|| {
-            // Load environment variables
-            dotenvy::dotenv().ok();
-
-            // Initialize tracing (synchronously)
-            let runtime = tokio::runtime::Runtime::new()
-                .expect("Failed to create Tokio runtime for tracing init");
-            runtime.block_on(async {
-                command_utils::util::tracing::tracing_init_from_env()
-                    .await
-                    .unwrap_or_default();
-            });
-
-            Box::new(RerankerRunnerPlugin::new()) as Box<dyn PluginRunner + Send + Sync>
-        })
-        .unwrap_or_else(|e| {
-            eprintln!("load_plugin panic: {:?}", e);
-            Box::new(RerankerRunnerPlugin::new())
-        })
+fn build_plugin_instance() -> RerankerRunnerPlugin {
+    dotenvy::dotenv().ok();
+    if let Ok(rt) = tokio::runtime::Runtime::new() {
+        rt.block_on(async {
+            command_utils::util::tracing::tracing_init_from_env()
+                .await
+                .unwrap_or_default();
+        });
     }
-
-    #[unsafe(no_mangle)]
-    #[allow(improper_ctypes_definitions)]
-    pub extern "C" fn free_plugin(ptr: Box<dyn PluginRunner + Send + Sync>) {
-        drop(ptr);
-    }
+    RerankerRunnerPlugin::new()
 }
+
+register_plugin_v2!(RerankerRunnerPlugin, build_plugin_instance());
