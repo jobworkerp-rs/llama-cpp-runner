@@ -46,6 +46,34 @@ message LLMChatArgs {
     // When function_set_name is not specified, LLM discovers and selects
     // appropriate FunctionSets dynamically via pseudo-tool calls.
     optional bool auto_select_function_set = 6;
+
+    // OpenAI-compatible tools JSON array for client-side tool execution.
+    // Pass the verbatim JSON the OpenAI Chat Completions API expects, e.g.
+    // '[{"type":"function","function":{"name":"get_weather", ...}}]'.
+    // Mutually exclusive with use_function_calling (server-side execution)
+    // and with LLMChatArgs.json_schema (grammar conflict). When set, the
+    // model output is parsed and returned via pending_tool_calls /
+    // requires_tool_execution for client-side execution.
+    optional string client_tools_json = 7;
+    // OpenAI-compatible tool_choice. Accepts:
+    //   - "auto" | "none" | "required" (passed through to llama.cpp)
+    //   - {"type":"function","function":{"name":"<n>"}} JSON object: the
+    //     plugin filters client_tools_json down to that single function so
+    //     the model can only invoke it (function-specific semantics).
+    // Function names that are not present in client_tools_json are
+    // rejected. Default (when omitted): "auto".
+    optional string tool_choice = 8;
+    // Allow the model to emit multiple tool calls in a single response
+    // (OpenAI-compatible). Default: false.
+    optional bool parallel_tool_calls = 9;
+    // Reasoning extraction format hint forwarded to the chat template
+    // (e.g. "deepseek"). When set, llama.cpp may surface reasoning as
+    // `reasoning_content` deltas instead of inlining it into content.
+    optional string reasoning_format = 10;
+    // Arbitrary chat_template_kwargs JSON object forwarded to the jinja
+    // template, e.g. '{"enable_thinking":false}'. Use this to set
+    // model-specific switches without hard-coding them in the plugin.
+    optional string chat_template_kwargs = 11;
   }
 
   enum ChatRole {

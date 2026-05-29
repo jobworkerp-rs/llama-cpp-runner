@@ -35,6 +35,7 @@ openssl = { workspace = true }
 llama-cpp-sys-2 = { workspace = true }
 once_cell = { workspace = true }
 prost = { workspace = true }
+regex = { workspace = true }
 schemars = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

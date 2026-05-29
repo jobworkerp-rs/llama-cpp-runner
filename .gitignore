@@ -17,8 +17,6 @@ Cargo.lock
 ._*
 
 # Exclude documentation, logs, and temporary files
-docs/
-*/docs/
 log/
 logs/
 temp/

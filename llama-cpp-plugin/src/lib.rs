@@ -1,4 +1,5 @@
 pub mod model;
+pub mod oai_chat;
 pub mod reasoning_splitter;
 
 use anyhow::{Context, Result, anyhow};
@@ -58,10 +59,18 @@ enum StreamItem {
     Delta {
         text: String,
         reasoning: String,
+        /// Empty on the legacy (tools-disabled) chat path; populated by the
+        /// OAI streaming parser when the assistant emits tool calls. Each
+        /// entry follows OAI partial semantics (see `ToolCallDelta`).
+        tool_calls: Vec<oai_chat::ToolCallDelta>,
     },
     Final {
         last_text: String,
         last_reasoning: String,
+        /// Worker-resolved final `pending_tool_calls`. `None` on the legacy
+        /// path; populated by the tools worker after `parse_response_oaicompat`.
+        final_pending_tool_calls:
+            Option<Vec<jobworkerp_llama_protobuf::protobuf::llm::ToolCallRequest>>,
         usage: StreamUsage,
     },
     Error(anyhow::Error),
@@ -350,7 +359,11 @@ fn run_stream_blocking<F>(
                 // drains a slot. If the forwarder drops (host stopped consuming
                 // / cancellation), the send returns Err, we set cancel_flag,
                 // and bail at the next ControlFlow check.
-                match tx_for_sink.blocking_send(StreamItem::Delta { text, reasoning }) {
+                match tx_for_sink.blocking_send(StreamItem::Delta {
+                    text,
+                    reasoning,
+                    tool_calls: Vec::new(),
+                }) {
                     Ok(()) => {}
                     Err(_) => {
                         cancel_for_sink.store(true, Ordering::Relaxed);
@@ -367,6 +380,7 @@ fn run_stream_blocking<F>(
         Ok(usage) => StreamItem::Final {
             last_text,
             last_reasoning,
+            final_pending_tool_calls: None,
             usage,
         },
         Err(e) => StreamItem::Error(e),
@@ -375,37 +389,153 @@ fn run_stream_blocking<F>(
     let _ = inner_tx.blocking_send(terminal);
 }
 
-/// Build the wire bytes for one streaming chunk. Reuses
-/// `LlmChatResult`/`LlmCompletionResult` as the chunk type (their `done`
-/// field already supports streaming semantics — no proto changes needed).
-fn encode_chunk(
+/// Tools-aware sibling of [`run_stream_blocking`]. Bypasses
+/// `ReasoningSplitter` because the OAI parser pre-splits text / reasoning /
+/// tool_calls deltas via `oai_sink`. The terminal `Final` carries the
+/// worker-resolved `final_pending_tool_calls` so the receive loop can emit
+/// them on the final wire chunk.
+fn run_stream_blocking_with_tools<F>(
+    wrapper: &mut LlamaModelWrapper,
+    inner_tx: tokio::sync::mpsc::Sender<StreamItem>,
+    cancel_flag: Arc<AtomicBool>,
+    produce: F,
+) where
+    F: FnOnce(
+        &mut LlamaModelWrapper,
+        &mut dyn FnMut(&str) -> ControlFlow<()>,
+        &mut dyn FnMut(oai_chat::OaiStreamUpdate),
+    ) -> Result<(
+        StreamUsage,
+        Option<Vec<jobworkerp_llama_protobuf::protobuf::llm::ToolCallRequest>>,
+    )>,
+{
+    let final_payload = {
+        let cancel_for_raw = cancel_flag.clone();
+        let cancel_for_oai = cancel_flag.clone();
+        let tx_for_oai = inner_tx.clone();
+        // Raw sink: only honour cancel here. The OAI parser sees the same
+        // chunk through `oai_sink` (below), which is what the receive loop
+        // actually consumes.
+        let mut raw_sink = move |_chunk: &str| -> ControlFlow<()> {
+            if cancel_for_raw.load(Ordering::Relaxed) {
+                return ControlFlow::Break(());
+            }
+            ControlFlow::Continue(())
+        };
+        let mut oai_sink = move |upd: oai_chat::OaiStreamUpdate| {
+            if cancel_for_oai.load(Ordering::Relaxed) {
+                return;
+            }
+            // `MessageContent` is a oneof so a single chunk carries text OR
+            // tool_calls — not both. When the parser hands us both in one
+            // update (preface text followed by a tool call in the same
+            // batch), split into two `Delta`s so neither is dropped. Send
+            // the textual portion first to preserve emission order.
+            let has_text = !upd.text.is_empty() || !upd.reasoning.is_empty();
+            let has_tool_calls = !upd.tool_calls.is_empty();
+            if has_text {
+                let item = StreamItem::Delta {
+                    text: upd.text,
+                    reasoning: upd.reasoning,
+                    tool_calls: Vec::new(),
+                };
+                match tx_for_oai.blocking_send(item) {
+                    Ok(()) => {}
+                    Err(_) => {
+                        cancel_for_oai.store(true, Ordering::Relaxed);
+                        return;
+                    }
+                }
+            }
+            if has_tool_calls {
+                let item = StreamItem::Delta {
+                    text: String::new(),
+                    reasoning: String::new(),
+                    tool_calls: upd.tool_calls,
+                };
+                if tx_for_oai.blocking_send(item).is_err() {
+                    cancel_for_oai.store(true, Ordering::Relaxed);
+                }
+            }
+        };
+        produce(wrapper, &mut raw_sink, &mut oai_sink)
+    };
+    let terminal = match final_payload {
+        Ok((usage, pending)) => StreamItem::Final {
+            last_text: String::new(),
+            last_reasoning: String::new(),
+            final_pending_tool_calls: pending,
+            usage,
+        },
+        Err(e) => StreamItem::Error(e),
+    };
+    let _ = inner_tx.blocking_send(terminal);
+}
+
+/// Build the wire bytes for one streaming chunk. `tool_calls` carries per-delta
+/// partial fragments; by OpenAI streaming convention an empty `call_id` /
+/// `fn_name` on a continuation means "carry over from the previous delta at
+/// the same index". `pending_for_final`, when set, becomes the chunk's
+/// `pending_tool_calls` and forces `requires_tool_execution=Some(!empty)`.
+fn encode_chunk_with_tools(
     method: StreamMethod,
     text: String,
     reasoning: String,
+    tool_calls: Vec<oai_chat::ToolCallDelta>,
     done: bool,
+    pending_for_final: Option<Vec<jobworkerp_llama_protobuf::protobuf::llm::ToolCallRequest>>,
     usage: Option<StreamUsage>,
 ) -> Vec<u8> {
     let reasoning_field = (!reasoning.is_empty()).then_some(reasoning);
     match method {
-        StreamMethod::Chat => LlmChatResult {
-            content: Some(llm_chat_result::MessageContent {
-                content: Some(llm_chat_result::message_content::Content::Text(text)),
-            }),
-            reasoning_content: reasoning_field,
-            done,
-            usage: usage.map(|u| llm_chat_result::Usage {
-                model: String::new(),
-                prompt_tokens: Some(u.prompt_tokens),
-                completion_tokens: Some(u.completion_tokens),
-                total_prompt_time_sec: None,
-                total_completion_time_sec: Some(u.total_completion_time_sec),
-            }),
-            pending_tool_calls: None,
-            requires_tool_execution: None,
-            tool_execution_results: vec![],
-            tool_execution_started: None,
+        StreamMethod::Chat => {
+            // The MessageContent oneof can only carry text OR tool_calls. If
+            // any tool delta is present we emit it as ToolCalls; otherwise
+            // (including final chunks whose only tool payload is pending),
+            // we keep the text variant.
+            let content = if !tool_calls.is_empty() {
+                let calls = tool_calls
+                    .into_iter()
+                    .map(|d| llm_chat_result::message_content::ToolCall {
+                        call_id: d.id.unwrap_or_default(),
+                        fn_name: d.fn_name.unwrap_or_default(),
+                        fn_arguments: d.arguments_chunk,
+                        // Preserve the OAI streaming index so receivers can
+                        // demultiplex parallel tool calls.
+                        delta_index: Some(d.index),
+                    })
+                    .collect();
+                llm_chat_result::MessageContent {
+                    content: Some(llm_chat_result::message_content::Content::ToolCalls(
+                        llm_chat_result::message_content::ToolCalls { calls },
+                    )),
+                }
+            } else {
+                llm_chat_result::MessageContent {
+                    content: Some(llm_chat_result::message_content::Content::Text(text)),
+                }
+            };
+            let requires_tool_execution = pending_for_final.as_ref().map(|calls| !calls.is_empty());
+            let pending_tool_calls = pending_for_final
+                .map(|calls| jobworkerp_llama_protobuf::protobuf::llm::PendingToolCalls { calls });
+            LlmChatResult {
+                content: Some(content),
+                reasoning_content: reasoning_field,
+                done,
+                usage: usage.map(|u| llm_chat_result::Usage {
+                    model: String::new(),
+                    prompt_tokens: Some(u.prompt_tokens),
+                    completion_tokens: Some(u.completion_tokens),
+                    total_prompt_time_sec: None,
+                    total_completion_time_sec: Some(u.total_completion_time_sec),
+                }),
+                pending_tool_calls,
+                requires_tool_execution,
+                tool_execution_results: vec![],
+                tool_execution_started: None,
+            }
+            .encode_to_vec()
         }
-        .encode_to_vec(),
         StreamMethod::Completion => LlmCompletionResult {
             content: Some(llm_completion_result::MessageContent {
                 content: Some(llm_completion_result::message_content::Content::Text(text)),
@@ -741,16 +871,40 @@ impl PluginV2 for LlamaCppPlugin {
                 }
             };
             match decoded {
-                DecodedStream::Chat(chat_args) => run_stream_blocking(
-                    wrapper,
-                    extract_reasoning,
-                    inner_tx_for_blocking,
-                    cancel_for_blocking,
-                    move |w, sink| {
-                        w.run_chat_with_sink(chat_args, sink)
-                            .map(|r| StreamUsage::from_proto(r.usage.as_ref()))
-                    },
-                ),
+                DecodedStream::Chat(chat_args) => {
+                    // The OAI parser owns text/tool splitting, so divert to
+                    // the tools-aware worker when `client_tools_json` is set.
+                    let client_tools_json = chat_args
+                        .function_options
+                        .as_ref()
+                        .and_then(|fo| fo.client_tools_json.clone());
+                    if let Some(json) = client_tools_json {
+                        run_stream_blocking_with_tools(
+                            wrapper,
+                            inner_tx_for_blocking,
+                            cancel_for_blocking,
+                            move |w, raw_sink, oai_sink| {
+                                w.run_chat_with_sink_tools(chat_args, &json, raw_sink, oai_sink)
+                                    .map(|r| {
+                                        let usage = StreamUsage::from_proto(r.usage.as_ref());
+                                        let pending = r.pending_tool_calls.map(|p| p.calls);
+                                        (usage, pending)
+                                    })
+                            },
+                        );
+                    } else {
+                        run_stream_blocking(
+                            wrapper,
+                            extract_reasoning,
+                            inner_tx_for_blocking,
+                            cancel_for_blocking,
+                            move |w, sink| {
+                                w.run_chat_with_sink(chat_args, sink)
+                                    .map(|r| StreamUsage::from_proto(r.usage.as_ref()))
+                            },
+                        );
+                    }
+                }
                 DecodedStream::Completion(comp_args) => run_stream_blocking(
                     wrapper,
                     extract_reasoning,
@@ -781,8 +935,14 @@ impl PluginV2 for LlamaCppPlugin {
                 None => recv_branch.await,
             };
             match item_opt {
-                Some(StreamItem::Delta { text, reasoning }) => {
-                    let bytes = encode_chunk(method, text, reasoning, false, None);
+                Some(StreamItem::Delta {
+                    text,
+                    reasoning,
+                    tool_calls,
+                }) => {
+                    let bytes = encode_chunk_with_tools(
+                        method, text, reasoning, tool_calls, false, None, None,
+                    );
                     if let Err(e) = output.send(bytes).await {
                         // Host stopped consuming — propagate so the blocking
                         // thread bails at the next sink call.
@@ -793,9 +953,18 @@ impl PluginV2 for LlamaCppPlugin {
                 Some(StreamItem::Final {
                     last_text,
                     last_reasoning,
+                    final_pending_tool_calls,
                     usage,
                 }) => {
-                    let bytes = encode_chunk(method, last_text, last_reasoning, true, Some(usage));
+                    let bytes = encode_chunk_with_tools(
+                        method,
+                        last_text,
+                        last_reasoning,
+                        Vec::new(),
+                        true,
+                        final_pending_tool_calls,
+                        Some(usage),
+                    );
                     let _ = output.send(bytes).await;
                     break Ok(());
                 }
@@ -2218,5 +2387,323 @@ LLAMA_SYSTEM_PROMPT=You are a helpful assistant.
             }
         }
         assert!(plugin.is_model_loaded(), "wrapper must be restored");
+    }
+
+    // ------------------------------------------------------------------
+    // Client-side tool calling (ported from the `tooling` branch onto the
+    // v2 ABI). All tests below were written against the V1
+    // `MultiMethodPluginRunner` trait originally; the unary checks become
+    // `PluginV2::run` calls and the streaming guard becomes
+    // `PluginV2::run_stream` with a `HighLevelSink`.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_function_options_proto_roundtrip_with_client_tools() {
+        use jobworkerp_llama_protobuf::protobuf::llm::llm_chat_args::FunctionOptions;
+
+        let original = FunctionOptions {
+            use_function_calling: false,
+            function_set_name: None,
+            use_runners_as_function: None,
+            use_workers_as_function: None,
+            is_auto_calling: None,
+            auto_select_function_set: None,
+            client_tools_json: Some(
+                r#"[{"type":"function","function":{"name":"f","parameters":{"type":"object","properties":{}}}}]"#
+                    .to_string(),
+            ),
+            tool_choice: Some("required".to_string()),
+            parallel_tool_calls: Some(true),
+            reasoning_format: Some("deepseek".to_string()),
+            chat_template_kwargs: Some(r#"{"enable_thinking":false}"#.to_string()),
+        };
+
+        let mut buf = Vec::with_capacity(original.encoded_len());
+        original
+            .encode(&mut buf)
+            .expect("FunctionOptions encodes cleanly");
+        let decoded = FunctionOptions::decode(&buf[..]).expect("decodes back");
+        assert_eq!(decoded, original);
+
+        // Backwards compatibility: a pre-existing message with only the
+        // original 6 fields populated must decode with the new options None.
+        let legacy = FunctionOptions {
+            use_function_calling: true,
+            function_set_name: Some("set-a".to_string()),
+            ..Default::default()
+        };
+        let mut legacy_buf = Vec::with_capacity(legacy.encoded_len());
+        legacy
+            .encode(&mut legacy_buf)
+            .expect("legacy FunctionOptions encodes");
+        let legacy_decoded = FunctionOptions::decode(&legacy_buf[..]).expect("legacy decodes");
+        assert!(legacy_decoded.use_function_calling);
+        assert_eq!(legacy_decoded.function_set_name.as_deref(), Some("set-a"));
+        assert!(legacy_decoded.client_tools_json.is_none());
+        assert!(legacy_decoded.tool_choice.is_none());
+        assert!(legacy_decoded.parallel_tool_calls.is_none());
+        assert!(legacy_decoded.reasoning_format.is_none());
+        assert!(legacy_decoded.chat_template_kwargs.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_chat_rejects_json_schema_with_client_tools() {
+        use jobworkerp_llama_protobuf::protobuf::llm::llm_chat_args;
+
+        let env = "
+LLAMA_MODEL=Qwen3-0.6B-Q4_K_M.gguf
+LLAMA_HF_REPO=unsloth/Qwen3-0.6B-GGUF
+LLAMA_DISABLE_GPU=true
+LLAMA_THREADS=8
+LLAMA_USE_FLASH_ATTENTION=false
+";
+        dotenvy::from_read(env.as_bytes()).ok();
+        let mut plugin = LlamaCppPlugin::new();
+        if plugin.load_model_from_env().is_err() {
+            eprintln!("skipping: model not available");
+            return;
+        }
+
+        let request = LlmChatArgs {
+            options: None,
+            function_options: Some(llm_chat_args::FunctionOptions {
+                client_tools_json: Some(
+                    r#"[{"type":"function","function":{"name":"a","parameters":{"type":"object"}}}]"#
+                        .to_string(),
+                ),
+                ..Default::default()
+            }),
+            messages: vec![llm_chat_args::ChatMessage {
+                role: llm_chat_args::ChatRole::User as i32,
+                content: Some(llm_chat_args::MessageContent {
+                    content: Some(llm_chat_args::message_content::Content::Text(
+                        "hi".to_string(),
+                    )),
+                }),
+            }],
+            json_schema: Some(r#"{"type":"object"}"#.to_string()),
+            ..Default::default()
+        };
+        let mut buf = Vec::with_capacity(request.encoded_len());
+        request.encode(&mut buf).unwrap();
+        let (res, _) = plugin
+            .run(buf, HashMap::new(), Some(METHOD_CHAT.into()))
+            .await;
+        let err = res.expect_err("json_schema + client_tools must be rejected");
+        assert!(
+            err.to_string().contains("json_schema") && err.to_string().contains("client_tools"),
+            "error should mention both: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_chat_rejects_client_tools_with_use_function_calling() {
+        use jobworkerp_llama_protobuf::protobuf::llm::llm_chat_args;
+
+        let env = "
+LLAMA_MODEL=Qwen3-0.6B-Q4_K_M.gguf
+LLAMA_HF_REPO=unsloth/Qwen3-0.6B-GGUF
+LLAMA_DISABLE_GPU=true
+LLAMA_THREADS=8
+LLAMA_USE_FLASH_ATTENTION=false
+";
+        dotenvy::from_read(env.as_bytes()).ok();
+        let mut plugin = LlamaCppPlugin::new();
+        if plugin.load_model_from_env().is_err() {
+            eprintln!("skipping: model not available");
+            return;
+        }
+
+        let request = LlmChatArgs {
+            options: None,
+            function_options: Some(llm_chat_args::FunctionOptions {
+                use_function_calling: true,
+                client_tools_json: Some(
+                    r#"[{"type":"function","function":{"name":"a","parameters":{"type":"object"}}}]"#
+                        .to_string(),
+                ),
+                ..Default::default()
+            }),
+            messages: vec![llm_chat_args::ChatMessage {
+                role: llm_chat_args::ChatRole::User as i32,
+                content: Some(llm_chat_args::MessageContent {
+                    content: Some(llm_chat_args::message_content::Content::Text(
+                        "hi".to_string(),
+                    )),
+                }),
+            }],
+            ..Default::default()
+        };
+        let mut buf = Vec::with_capacity(request.encoded_len());
+        request.encode(&mut buf).unwrap();
+        let (res, _) = plugin
+            .run(buf, HashMap::new(), Some(METHOD_CHAT.into()))
+            .await;
+        let err = res.expect_err("use_function_calling + client_tools must be rejected");
+        // The server-side function-calling guard fires first.
+        assert!(
+            err.to_string().contains("function calling")
+                || err.to_string().contains("mutually exclusive"),
+            "error should mention the conflict: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_chat_rejects_tool_choice_naming_unknown_function() {
+        use jobworkerp_llama_protobuf::protobuf::llm::llm_chat_args;
+
+        let env = "
+LLAMA_MODEL=Qwen3-0.6B-Q4_K_M.gguf
+LLAMA_HF_REPO=unsloth/Qwen3-0.6B-GGUF
+LLAMA_DISABLE_GPU=true
+LLAMA_THREADS=8
+LLAMA_USE_FLASH_ATTENTION=false
+";
+        dotenvy::from_read(env.as_bytes()).ok();
+        let mut plugin = LlamaCppPlugin::new();
+        if plugin.load_model_from_env().is_err() {
+            eprintln!("skipping: model not available");
+            return;
+        }
+
+        let request = LlmChatArgs {
+            options: None,
+            function_options: Some(llm_chat_args::FunctionOptions {
+                client_tools_json: Some(
+                    r#"[{"type":"function","function":{"name":"a","parameters":{"type":"object"}}}]"#
+                        .to_string(),
+                ),
+                tool_choice: Some(
+                    r#"{"type":"function","function":{"name":"missing"}}"#.to_string(),
+                ),
+                ..Default::default()
+            }),
+            messages: vec![llm_chat_args::ChatMessage {
+                role: llm_chat_args::ChatRole::User as i32,
+                content: Some(llm_chat_args::MessageContent {
+                    content: Some(llm_chat_args::message_content::Content::Text(
+                        "hi".to_string(),
+                    )),
+                }),
+            }],
+            ..Default::default()
+        };
+        let mut buf = Vec::with_capacity(request.encoded_len());
+        request.encode(&mut buf).unwrap();
+        let (res, _) = plugin
+            .run(buf, HashMap::new(), Some(METHOD_CHAT.into()))
+            .await;
+        let err = res.expect_err("unknown function name must be rejected");
+        assert!(
+            err.to_string().contains("missing"),
+            "error should name the missing function: {err}"
+        );
+    }
+
+    /// Streaming counterpart to the unary `test_chat_rejects_json_schema_with_client_tools`.
+    /// `run_stream` should reject the request before producing any chunk.
+    #[tokio::test]
+    async fn test_run_stream_rejects_json_schema_with_client_tools() {
+        use jobworkerp_llama_protobuf::protobuf::llm::llm_chat_args;
+
+        let env = "
+LLAMA_MODEL=Qwen3-0.6B-Q4_K_M.gguf
+LLAMA_HF_REPO=unsloth/Qwen3-0.6B-GGUF
+LLAMA_DISABLE_GPU=true
+LLAMA_THREADS=8
+LLAMA_USE_FLASH_ATTENTION=false
+";
+        dotenvy::from_read(env.as_bytes()).ok();
+        let mut plugin = LlamaCppPlugin::new();
+        if plugin.load_model_from_env().is_err() {
+            eprintln!("skipping: model not available");
+            return;
+        }
+
+        let request = LlmChatArgs {
+            options: None,
+            function_options: Some(llm_chat_args::FunctionOptions {
+                client_tools_json: Some(
+                    r#"[{"type":"function","function":{"name":"a","parameters":{"type":"object"}}}]"#
+                        .to_string(),
+                ),
+                ..Default::default()
+            }),
+            messages: vec![llm_chat_args::ChatMessage {
+                role: llm_chat_args::ChatRole::User as i32,
+                content: Some(llm_chat_args::MessageContent {
+                    content: Some(llm_chat_args::message_content::Content::Text(
+                        "hi".to_string(),
+                    )),
+                }),
+            }],
+            json_schema: Some(r#"{"type":"object"}"#.to_string()),
+            ..Default::default()
+        };
+        let mut buf = Vec::with_capacity(request.encoded_len());
+        request.encode(&mut buf).unwrap();
+        let (sink, mut rx) = make_test_sink(8);
+        let res = plugin
+            .run_stream(buf, HashMap::new(), Some(METHOD_CHAT.into()), sink)
+            .await;
+        let err = res.expect_err("json_schema + client_tools must be rejected mid-stream");
+        assert!(
+            err.contains("json_schema") && err.contains("client_tools"),
+            "stream error should mention both: {err}"
+        );
+        // The worker bails before pushing any chunk.
+        assert!(rx.try_recv().is_err(), "no chunk should have been emitted");
+    }
+
+    #[tokio::test]
+    async fn test_run_stream_rejects_client_tools_with_use_function_calling() {
+        use jobworkerp_llama_protobuf::protobuf::llm::llm_chat_args;
+
+        let env = "
+LLAMA_MODEL=Qwen3-0.6B-Q4_K_M.gguf
+LLAMA_HF_REPO=unsloth/Qwen3-0.6B-GGUF
+LLAMA_DISABLE_GPU=true
+LLAMA_THREADS=8
+LLAMA_USE_FLASH_ATTENTION=false
+";
+        dotenvy::from_read(env.as_bytes()).ok();
+        let mut plugin = LlamaCppPlugin::new();
+        if plugin.load_model_from_env().is_err() {
+            eprintln!("skipping: model not available");
+            return;
+        }
+
+        let request = LlmChatArgs {
+            options: None,
+            function_options: Some(llm_chat_args::FunctionOptions {
+                use_function_calling: true,
+                client_tools_json: Some(
+                    r#"[{"type":"function","function":{"name":"a","parameters":{"type":"object"}}}]"#
+                        .to_string(),
+                ),
+                ..Default::default()
+            }),
+            messages: vec![llm_chat_args::ChatMessage {
+                role: llm_chat_args::ChatRole::User as i32,
+                content: Some(llm_chat_args::MessageContent {
+                    content: Some(llm_chat_args::message_content::Content::Text(
+                        "hi".to_string(),
+                    )),
+                }),
+            }],
+            ..Default::default()
+        };
+        let mut buf = Vec::with_capacity(request.encoded_len());
+        request.encode(&mut buf).unwrap();
+        let (sink, mut rx) = make_test_sink(8);
+        let res = plugin
+            .run_stream(buf, HashMap::new(), Some(METHOD_CHAT.into()), sink)
+            .await;
+        let err = res.expect_err("use_function_calling + client_tools must be rejected mid-stream");
+        assert!(
+            err.contains("function calling") || err.contains("mutually exclusive"),
+            "stream error should mention the conflict: {err}"
+        );
+        assert!(rx.try_recv().is_err(), "no chunk should have been emitted");
     }
 }
