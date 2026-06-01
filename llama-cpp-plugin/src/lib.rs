@@ -273,7 +273,7 @@ fn dispatch_chat(
     };
     tracing::debug!("LLMRunner {METHOD_CHAT}: {args:?}");
     let mut sink = make_cancel_sink(cancel.clone());
-    let result = match wrapper.run_chat_with_sink(args, &mut sink) {
+    let result = match wrapper.run_chat_with_sink(args, Some(cancel.clone()), &mut sink) {
         Ok(r) => r,
         Err(e) => return DispatchOutcome::Err(e),
     };
@@ -295,7 +295,7 @@ fn dispatch_completion(
     };
     tracing::debug!("LLMRunner {METHOD_COMPLETION}: {args:?}");
     let mut sink = make_cancel_sink(cancel.clone());
-    let result = match wrapper.run_completion_with_sink(args, &mut sink) {
+    let result = match wrapper.run_completion_with_sink(args, Some(cancel.clone()), &mut sink) {
         Ok(r) => r,
         Err(e) => return DispatchOutcome::Err(e),
     };
@@ -889,6 +889,9 @@ impl PluginV2 for LlamaCppPlugin {
                     return;
                 }
             };
+            // `cancel_for_blocking` is moved into the streaming worker; the
+            // model layer needs its own handle for the abort callback.
+            let cancel_for_model = cancel_for_blocking.clone();
             match decoded {
                 DecodedStream::Chat(mut chat_args) => {
                     // The OAI parser owns text/tool splitting, so divert to
@@ -909,12 +912,18 @@ impl PluginV2 for LlamaCppPlugin {
                             inner_tx_for_blocking,
                             cancel_for_blocking,
                             move |w, raw_sink, oai_sink| {
-                                w.run_chat_with_sink_tools(chat_args, &json, raw_sink, oai_sink)
-                                    .map(|r| {
-                                        let usage = StreamUsage::from_proto(r.usage.as_ref());
-                                        let pending = r.pending_tool_calls.map(|p| p.calls);
-                                        (usage, pending)
-                                    })
+                                w.run_chat_with_sink_tools(
+                                    chat_args,
+                                    &json,
+                                    Some(cancel_for_model),
+                                    raw_sink,
+                                    oai_sink,
+                                )
+                                .map(|r| {
+                                    let usage = StreamUsage::from_proto(r.usage.as_ref());
+                                    let pending = r.pending_tool_calls.map(|p| p.calls);
+                                    (usage, pending)
+                                })
                             },
                         );
                     } else {
@@ -924,7 +933,7 @@ impl PluginV2 for LlamaCppPlugin {
                             inner_tx_for_blocking,
                             cancel_for_blocking,
                             move |w, sink| {
-                                w.run_chat_with_sink(chat_args, sink)
+                                w.run_chat_with_sink(chat_args, Some(cancel_for_model), sink)
                                     .map(|r| StreamUsage::from_proto(r.usage.as_ref()))
                             },
                         );
@@ -936,7 +945,7 @@ impl PluginV2 for LlamaCppPlugin {
                     inner_tx_for_blocking,
                     cancel_for_blocking,
                     move |w, sink| {
-                        w.run_completion_with_sink(comp_args, sink)
+                        w.run_completion_with_sink(comp_args, Some(cancel_for_model), sink)
                             .map(|r| StreamUsage::from_proto(r.usage.as_ref()))
                     },
                 ),

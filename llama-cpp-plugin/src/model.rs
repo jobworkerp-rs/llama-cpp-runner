@@ -24,7 +24,15 @@ use llama_cpp_sys_2::{LLAMA_FLASH_ATTN_TYPE_DISABLED, LLAMA_FLASH_ATTN_TYPE_ENAB
 use mtmd_support::{MediaLimits, MtmdRuntime};
 use serde::{Deserialize, Serialize};
 use std::{
-    ffi::CString, num::NonZeroU32, ops::ControlFlow, path::PathBuf, sync::OnceLock, time::Duration,
+    ffi::CString,
+    num::NonZeroU32,
+    ops::ControlFlow,
+    path::PathBuf,
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
 };
 
 // Error-message constants that callers (tests) match against. Centralising
@@ -272,7 +280,7 @@ type ChatBuildResult = (
     Vec<MediaInput>,
 );
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 pub struct InferenceArgs {
     /// The prompt
     prompt: String,
@@ -306,6 +314,14 @@ pub struct InferenceArgs {
     /// reaching the sampler.
     #[serde(default, skip_serializing, skip_deserializing)]
     grammar_spec: Option<crate::oai_chat::GrammarSpec>,
+    /// Cooperative cancel flag installed on the underlying `LlamaContext` as
+    /// an abort callback. When set to `true` mid-decode, llama.cpp aborts
+    /// the in-flight `decode`/`encode` call instead of completing the whole
+    /// batch — essential for long-prompt prefill, where the per-batch GPU
+    /// computation can otherwise run for minutes before the sink-based
+    /// cancel poll between batches gets a chance to fire.
+    #[serde(default, skip_serializing, skip_deserializing)]
+    cancel_flag: Option<Arc<AtomicBool>>,
 }
 
 impl std::fmt::Debug for InferenceArgs {
@@ -456,6 +472,52 @@ pub struct DecodeOutput {
     pub completion_tokens: u32,
 }
 
+/// RAII guard: installs an abort flag on the wrapped `LlamaContext` on
+/// construction, clears it on drop. Holds a raw pointer rather than `&mut`
+/// so the surrounding code can keep its own `&mut LlamaContext` borrow
+/// active — the guard does not touch `ctx` between construction and drop.
+///
+/// SAFETY invariants for callers:
+/// - The `LlamaContext` referenced by `ctx_ptr` must outlive this guard.
+/// - No other code may call `set_abort_flag` / `clear_abort_callback` on
+///   that context while the guard is alive.
+///
+/// `None` flag is a no-op so the legacy `run()` path pays no cancellation
+/// overhead.
+struct AbortGuard {
+    ctx_ptr: *mut llama_cpp_2::context::LlamaContext<'static>,
+    armed: bool,
+}
+
+impl AbortGuard {
+    fn new(
+        ctx: &mut llama_cpp_2::context::LlamaContext<'static>,
+        flag: Option<Arc<AtomicBool>>,
+    ) -> Self {
+        let armed = if let Some(flag) = flag {
+            ctx.set_abort_flag(flag);
+            true
+        } else {
+            false
+        };
+        Self {
+            ctx_ptr: ctx as *mut _,
+            armed,
+        }
+    }
+}
+
+impl Drop for AbortGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            // SAFETY: see struct-level invariants. The pointer is valid
+            // because the caller's `&mut LlamaContext` outlives this guard,
+            // and no other concurrent access is permitted while we hold it.
+            unsafe { (*self.ctx_ptr).clear_abort_callback() };
+        }
+    }
+}
+
 impl From<LlamaArg> for InferenceArgs {
     fn from(req: LlamaArg) -> Self {
         Self {
@@ -470,6 +532,7 @@ impl From<LlamaArg> for InferenceArgs {
             json_schema: None,
             medias: req.medias,
             grammar_spec: None,
+            cancel_flag: None,
         }
     }
 }
@@ -986,6 +1049,10 @@ impl LlamaModelWrapper {
         };
         let ctx = sync_ctx.ctx_mut();
 
+        // Install before the first `ctx.decode` so a cancel raised during
+        // the very first prefill batch is honoured.
+        let _abort_guard = AbortGuard::new(ctx, args.cancel_flag.clone());
+
         // Cap the position budget at n_ctx so a default `max_new_tokens` of
         // 4096 doesn't fail outright on small-context models. This mirrors
         // the multimodal core path which already applies `.min(n_ctx)`.
@@ -1012,14 +1079,53 @@ impl LlamaModelWrapper {
         let mut batch = LlamaBatch::new(n_batch.min(suffix.len()), 1);
         let last_index: i32 = prompt_tokens - 1;
         let mut pos: i32 = n_keep as i32;
+        let mut prefill_cancelled = false;
         for chunk in suffix.chunks(n_batch) {
+            // Poll cancellation between prefill chunks. A long prompt with a
+            // large n_batch can keep the GPU busy for many seconds per chunk,
+            // during which the main generation loop (and therefore the
+            // per-token sink callback) has not yet started. Without this
+            // probe, a client-side cancel observed via cancel_flag would be
+            // ignored until generation began. Sending an empty piece lets
+            // the existing sink-based cancel path trip without polluting the
+            // output: empty deltas are dropped by every downstream encoder
+            // (chat/completion streaming, legacy text concatenation).
+            if sink_requests_stop(sink, "") {
+                prefill_cancelled = true;
+                break;
+            }
             batch.clear();
             for &token in chunk {
                 batch.add(token, pos, &[0], pos == last_index)?;
                 pos += 1;
             }
-            ctx.decode(&mut batch)
-                .with_context(|| "llama_decode() failed during prompt prefill")?;
+            // If the abort callback fires mid-batch (i.e. the host cancelled
+            // during this `llama_decode`), `decode` returns an error. Treat
+            // it as cancellation rather than propagating a low-level
+            // compute-failure error to the caller, so the request surfaces
+            // as `Err(CANCELLED)` upstream and the KV write-back is skipped
+            // (we already took `cached_tokens` above).
+            if let Err(e) = ctx.decode(&mut batch) {
+                if cancel_observed(args.cancel_flag.as_ref()) {
+                    prefill_cancelled = true;
+                    break;
+                }
+                return Err(
+                    anyhow::Error::new(e).context("llama_decode() failed during prompt prefill")
+                );
+            }
+        }
+
+        if prefill_cancelled {
+            // Skip the generation loop entirely. Mirror the in-loop cancel
+            // contract: leave `cached_tokens` empty (already taken above) so
+            // the next request starts from a clean KV cache rather than
+            // reusing a half-evaluated prefix.
+            return Ok(DecodeOutput {
+                text: String::new(),
+                prompt_tokens: prompt_tokens as u32,
+                completion_tokens: 0,
+            });
         }
 
         // main loop
@@ -1162,7 +1268,13 @@ impl LlamaModelWrapper {
 
             n_cur += 1;
 
-            ctx.decode(&mut batch).with_context(|| "failed to eval")?;
+            if let Err(e) = ctx.decode(&mut batch) {
+                if cancel_observed(args.cancel_flag.as_ref()) {
+                    cancelled = true;
+                    break;
+                }
+                return Err(anyhow::Error::new(e).context("failed to eval"));
+            }
 
             n_decode += 1;
         }
@@ -1307,9 +1419,30 @@ impl LlamaModelWrapper {
         };
         let ctx = sync_ctx.ctx_mut();
 
-        let n_past = mtmd
-            .eval_chunks_from(&chunks, start_index, n_keep, ctx, n_batch)
-            .map_err(|e| anyhow::anyhow!(e).context("mtmd: eval_chunks_from"))?;
+        // Install the abort flag before mtmd's `eval_chunks_from`, which
+        // internally drives `ctx.decode()` on each chunk. Image / audio
+        // prefill on long contexts can take many seconds per chunk, so
+        // honouring the host cancel during this phase — not just after it
+        // completes — is the whole point of wiring the callback.
+        let _abort_guard = AbortGuard::new(ctx, args.cancel_flag.clone());
+
+        let n_past = match mtmd.eval_chunks_from(&chunks, start_index, n_keep, ctx, n_batch) {
+            Ok(n) => n,
+            Err(e) => {
+                if cancel_observed(args.cancel_flag.as_ref()) {
+                    // KV cache state is undefined after an aborted prefill;
+                    // we already took `cached_chunks`, so the next request
+                    // will perform a full clear. Return a zero-length result
+                    // matching the cancel contract of the text path.
+                    return Ok(DecodeOutput {
+                        text: String::new(),
+                        prompt_tokens: 0,
+                        completion_tokens: 0,
+                    });
+                }
+                return Err(anyhow::anyhow!(e).context("mtmd: eval_chunks_from"));
+            }
+        };
 
         let n_len = if let Some(max_new) = args.max_new_tokens {
             (n_past + max_new).min(n_ctx)
@@ -1360,8 +1493,13 @@ impl LlamaModelWrapper {
             batch.clear();
             batch.add(token, n_cur, &[0], true)?;
             n_cur += 1;
-            ctx.decode(&mut batch)
-                .with_context(|| "failed to eval in multimodal loop")?;
+            if let Err(e) = ctx.decode(&mut batch) {
+                if cancel_observed(args.cancel_flag.as_ref()) {
+                    cancelled = true;
+                    break;
+                }
+                return Err(anyhow::Error::new(e).context("failed to eval in multimodal loop"));
+            }
             first = false;
             n_decode += 1;
         }
@@ -1392,7 +1530,7 @@ impl LlamaModelWrapper {
     }
 
     pub fn run_chat(&mut self, args: LlmChatArgs) -> Result<LlmChatResult> {
-        self.run_chat_with_sink(args, &mut |_| ControlFlow::Continue(()))
+        self.run_chat_with_sink(args, None, &mut |_| ControlFlow::Continue(()))
     }
 
     /// Streaming-aware variant of [`Self::run_chat`]. The `sink` is invoked
@@ -1402,9 +1540,17 @@ impl LlamaModelWrapper {
     /// extracted reasoning_content. Callers that re-split reasoning in real
     /// time should ignore the result's `reasoning_content`/`content` payload
     /// (they will already have streamed both) and use only the metadata.
+    ///
+    /// `cancel_flag`, when `Some`, is installed on the underlying
+    /// `LlamaContext` as a ggml abort callback for the duration of the
+    /// decode. Setting it to `true` from another thread aborts the
+    /// in-flight `decode` call (notably the long per-batch GPU computation
+    /// during prefill) instead of having to wait for the next sink poll
+    /// between batches.
     pub fn run_chat_with_sink(
         &mut self,
         args: LlmChatArgs,
+        cancel_flag: Option<Arc<AtomicBool>>,
         sink: &mut dyn FnMut(&str) -> ControlFlow<()>,
     ) -> Result<LlmChatResult> {
         if let Some(ref fo) = args.function_options
@@ -1429,7 +1575,13 @@ impl LlamaModelWrapper {
             .and_then(|fo| fo.client_tools_json.clone())
         {
             let mut oai_sink = |_: crate::oai_chat::OaiStreamUpdate| {};
-            return self.run_chat_with_sink_tools(args, &client_tools_json, sink, &mut oai_sink);
+            return self.run_chat_with_sink_tools(
+                args,
+                &client_tools_json,
+                cancel_flag,
+                sink,
+                &mut oai_sink,
+            );
         }
 
         let options = args.options.unwrap_or_default();
@@ -1453,6 +1605,7 @@ impl LlamaModelWrapper {
             json_schema: args.json_schema,
             medias: Vec::new(),
             grammar_spec: None,
+            cancel_flag: cancel_flag.clone(),
         };
 
         let t_start = ggml_time_us();
@@ -1519,6 +1672,7 @@ impl LlamaModelWrapper {
         &mut self,
         mut args: LlmChatArgs,
         tools_json: &str,
+        cancel_flag: Option<Arc<AtomicBool>>,
         sink: &mut dyn FnMut(&str) -> ControlFlow<()>,
         oai_sink: &mut dyn FnMut(crate::oai_chat::OaiStreamUpdate),
     ) -> Result<LlmChatResult> {
@@ -1597,6 +1751,7 @@ impl LlamaModelWrapper {
             json_schema: None,
             medias: Vec::new(),
             grammar_spec,
+            cancel_flag,
         };
 
         let extra_stops = tmpl_result.additional_stops.clone();
@@ -1672,14 +1827,16 @@ impl LlamaModelWrapper {
     /// (see `validate_completion_args`) so jobworkerp completion workers can
     /// reuse their existing payload shape.
     pub fn run_completion(&mut self, args: LlmCompletionArgs) -> Result<LlmCompletionResult> {
-        self.run_completion_with_sink(args, &mut |_| ControlFlow::Continue(()))
+        self.run_completion_with_sink(args, None, &mut |_| ControlFlow::Continue(()))
     }
 
     /// Streaming-aware variant of [`Self::run_completion`]. See
-    /// [`Self::run_chat_with_sink`] for the sink contract.
+    /// [`Self::run_chat_with_sink`] for the sink contract. `cancel_flag`
+    /// follows the same abort-callback semantics as in `run_chat_with_sink`.
     pub fn run_completion_with_sink(
         &mut self,
         args: LlmCompletionArgs,
+        cancel_flag: Option<Arc<AtomicBool>>,
         sink: &mut dyn FnMut(&str) -> ControlFlow<()>,
     ) -> Result<LlmCompletionResult> {
         validate_completion_args(&args)?;
@@ -1709,6 +1866,7 @@ impl LlamaModelWrapper {
             json_schema: args.json_schema,
             medias: Vec::new(),
             grammar_spec: None,
+            cancel_flag,
         };
 
         let t_start = ggml_time_us();
@@ -2116,6 +2274,15 @@ fn sink_requests_stop(sink: &mut dyn FnMut(&str) -> ControlFlow<()>, chunk: &str
     matches!(sink(chunk), ControlFlow::Break(()))
 }
 
+/// Returns `true` when an external cancel flag is `Some` and set to `true`.
+/// Used to distinguish "the host cancelled mid-`llama_decode`" (which
+/// surfaces as an opaque compute error) from a real compute failure, so
+/// the decode loops can translate the former into a graceful cancel
+/// exit instead of an `Err`.
+fn cancel_observed(flag: Option<&Arc<AtomicBool>>) -> bool {
+    flag.is_some_and(|f| f.load(Ordering::Relaxed))
+}
+
 /// Strip the chat template's `generation_prompt` from a generated response
 /// so the OAI parser sees only the in-turn body. Eager-grammar paths
 /// (`tool_choice="required"`) make the model regenerate the assistant
@@ -2257,15 +2424,8 @@ mod tests {
         InferenceArgs {
             prompt: prompt.to_string(),
             sample_len: Some(128),
-            max_new_tokens: None,
-            temperature: None,
-            top_p: None,
-            repeat_penalty: None,
-            repeat_last_n: None,
-            seed: None,
-            json_schema: None,
             medias,
-            grammar_spec: None,
+            ..Default::default()
         }
     }
 
@@ -2383,15 +2543,8 @@ mod tests {
         let args = InferenceArgs {
             prompt: prompt.to_string(),
             sample_len: Some(64),
-            max_new_tokens: None,
-            temperature: None,
-            top_p: None,
-            repeat_penalty: None,
-            repeat_last_n: None,
             seed: Some(1234),
-            json_schema: None,
-            medias: vec![],
-            grammar_spec: None,
+            ..Default::default()
         };
 
         let output = wrapper
@@ -2417,15 +2570,8 @@ mod tests {
             InferenceArgs {
                 prompt: prompt.to_string(),
                 sample_len: Some(48),
-                max_new_tokens: None,
-                temperature: None,
-                top_p: None,
-                repeat_penalty: None,
-                repeat_last_n: None,
                 seed: Some(1234),
-                json_schema: None,
-                medias: vec![],
-                grammar_spec: None,
+                ..Default::default()
             }
         }
         let prompt_a = "The capital of France is";
@@ -2477,15 +2623,8 @@ mod tests {
             InferenceArgs {
                 prompt: prompt.to_string(),
                 sample_len: Some(48),
-                max_new_tokens: None,
-                temperature: None,
-                top_p: None,
-                repeat_penalty: None,
-                repeat_last_n: None,
                 seed: Some(1234),
-                json_schema: None,
-                medias: vec![],
-                grammar_spec: None,
+                ..Default::default()
             }
         }
         // Shared prefix, differing tails — the case prefix reuse optimizes.
@@ -2530,6 +2669,96 @@ mod tests {
         assert!(wrapper.run(bad).is_err(), "oversized request should fail");
         let after_err = wrapper.run(args(&prompt_b)).expect("recovers after error");
         assert_eq!(after_err, baseline_b, "must recover after a failed request");
+    }
+
+    /// A sink that requests cancellation on its very first invocation must
+    /// short-circuit the request inside the prompt-prefill loop — before any
+    /// token is sampled. Long prompts otherwise keep the GPU busy in
+    /// `ctx.decode` chunks while no per-token sink callback fires, hiding
+    /// the host's cancel.
+    #[test]
+    #[ignore]
+    fn test_prefill_cancellation_short_circuits() {
+        let mut wrapper = LlamaModelWrapper::new(LlamaModelConfig::default()).expect("load");
+        // Long enough that prefill spans multiple n_batch chunks; the exact
+        // content is irrelevant.
+        let prompt = "The capital of France is Paris. ".repeat(64);
+        let args = InferenceArgs {
+            prompt: prompt.clone(),
+            // Additive cap so the long prompt is not rejected by the
+            // absolute-position check `sample_len` applies.
+            max_new_tokens: Some(64),
+            seed: Some(1234),
+            ..Default::default()
+        };
+        // Sink trips on first invocation: if cancel is honoured during
+        // prefill, decode returns empty with zero completion tokens.
+        let mut called = 0usize;
+        let mut sink = |_chunk: &str| -> ControlFlow<()> {
+            called += 1;
+            ControlFlow::Break(())
+        };
+        let out = wrapper
+            .decode_text_only_core_with_sink(&prompt, &args, &mut sink)
+            .expect("prefill cancel must not return Err");
+        assert!(
+            out.text.is_empty(),
+            "cancelled prefill must produce no decoded text, got {:?}",
+            out.text
+        );
+        assert_eq!(
+            out.completion_tokens, 0,
+            "cancelled prefill must report zero completion tokens"
+        );
+        assert!(
+            out.prompt_tokens > 0,
+            "prompt must have been tokenized before the prefill loop"
+        );
+        assert!(
+            called >= 1,
+            "sink must have been polled at least once during prefill"
+        );
+    }
+
+    /// Pre-arm `cancel_flag` with a no-op sink so any cancellation observed
+    /// must have come through `llama_set_abort_callback`, not sink polling.
+    /// Verifies that cancellation propagates *through* `llama_decode`, not
+    /// just between batches.
+    #[test]
+    #[ignore]
+    fn test_abort_callback_cancels_during_decode() {
+        let mut wrapper = LlamaModelWrapper::new(LlamaModelConfig::default()).expect("load");
+
+        let prompt = "The capital of France is Paris. ".repeat(128);
+        let cancel_flag = Arc::new(AtomicBool::new(true));
+        let args = InferenceArgs {
+            prompt: prompt.clone(),
+            max_new_tokens: Some(64),
+            seed: Some(1234),
+            cancel_flag: Some(cancel_flag.clone()),
+            ..Default::default()
+        };
+        let mut sink = |_chunk: &str| -> ControlFlow<()> { ControlFlow::Continue(()) };
+        let started = std::time::Instant::now();
+        let out = wrapper
+            .decode_text_only_core_with_sink(&prompt, &args, &mut sink)
+            .expect("aborted decode must surface as Ok cancellation, not Err");
+        let elapsed = started.elapsed();
+        assert!(
+            out.text.is_empty(),
+            "aborted prefill must produce no text, got {:?}",
+            out.text
+        );
+        assert_eq!(
+            out.completion_tokens, 0,
+            "aborted prefill must report zero completion tokens"
+        );
+        // Loose upper bound vs the wall-clock cost of completing the full
+        // prefill of a 4k-token prompt; real aborts fire in O(100ms).
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "abort did not cancel quickly enough, took {elapsed:?}"
+        );
     }
 
     #[test]
@@ -2858,19 +3087,12 @@ mod tests {
         let args = InferenceArgs {
             prompt: "What do you see in this image?".to_string(),
             sample_len: Some(512),
-            max_new_tokens: None,
-            temperature: None,
-            top_p: None,
-            repeat_penalty: None,
-            repeat_last_n: None,
-            seed: None,
-            json_schema: None,
             medias: vec![MediaInput {
                 kind: MediaKind::Image as i32,
                 source: Some(Source::Encoded(image_bytes)),
                 id: None,
             }],
-            grammar_spec: None,
+            ..Default::default()
         };
 
         let output = wrapper.run(args).expect("Multimodal generation failed");
@@ -2920,15 +3142,8 @@ mod tests {
         let text_args = |prompt: &str| InferenceArgs {
             prompt: prompt.to_string(),
             sample_len: Some(48),
-            max_new_tokens: None,
-            temperature: None,
-            top_p: None,
-            repeat_penalty: None,
-            repeat_last_n: None,
             seed: Some(1234),
-            json_schema: None,
-            medias: vec![],
-            grammar_spec: None,
+            ..Default::default()
         };
         let image_args = InferenceArgs {
             medias: vec![MediaInput {
@@ -3001,19 +3216,13 @@ mod tests {
         let img_args = |prompt: &str| InferenceArgs {
             prompt: prompt.to_string(),
             sample_len: Some(48),
-            max_new_tokens: None,
-            temperature: None,
-            top_p: None,
-            repeat_penalty: None,
-            repeat_last_n: None,
             seed: Some(1234),
-            json_schema: None,
             medias: vec![MediaInput {
                 kind: MediaKind::Image as i32,
                 source: Some(Source::Encoded(image_bytes.clone())),
                 id: None,
             }],
-            grammar_spec: None,
+            ..Default::default()
         };
         let q_a = "What is in this image?";
         let q_b = "What colors appear in this image?";
@@ -3076,15 +3285,9 @@ mod tests {
         let args = |prompt: &str, medias: Vec<MediaInput>| InferenceArgs {
             prompt: prompt.to_string(),
             sample_len: Some(48),
-            max_new_tokens: None,
-            temperature: None,
-            top_p: None,
-            repeat_penalty: None,
-            repeat_last_n: None,
             seed: Some(1234),
-            json_schema: None,
             medias,
-            grammar_spec: None,
+            ..Default::default()
         };
         let img_args = || {
             args(
@@ -3169,19 +3372,12 @@ mod tests {
         let args = InferenceArgs {
             prompt: "Transcribe the following audio.".to_string(),
             sample_len: Some(1024),
-            max_new_tokens: None,
-            temperature: None,
-            top_p: None,
-            repeat_penalty: None,
-            repeat_last_n: None,
-            seed: None,
-            json_schema: None,
             medias: vec![MediaInput {
                 kind: MediaKind::Audio as i32,
                 source: Some(Source::Encoded(audio_bytes)),
                 id: None,
             }],
-            grammar_spec: None,
+            ..Default::default()
         };
 
         let output = wrapper.run(args).expect("Audio generation failed");
@@ -3679,16 +3875,10 @@ LLAMA_SYSTEM_PROMPT=You are a helpful assistant. When a relevant tool is availab
     fn poc_inference_args(prompt: &str, temperature: Option<f64>) -> InferenceArgs {
         InferenceArgs {
             prompt: prompt.to_string(),
-            sample_len: None,
             max_new_tokens: Some(192),
             temperature,
-            top_p: None,
-            repeat_penalty: None,
-            repeat_last_n: None,
             seed: Some(1024),
-            json_schema: None,
-            medias: Vec::new(),
-            grammar_spec: None,
+            ..Default::default()
         }
     }
 
