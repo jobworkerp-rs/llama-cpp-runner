@@ -250,9 +250,10 @@ pub(crate) fn extract_enable_thinking(chat_template_kwargs: Option<&str>) -> Opt
 ///   non-empty, prepend a `{"role":"system","content":...}` entry.
 /// - `assistant` messages carrying `ToolCalls` become
 ///   `{"role":"assistant","content":null,"tool_calls":[...]}`.
-/// - `tool` messages carrying `ToolExecutionRequests` fan out into one
-///   `{"role":"tool","tool_call_id":..,"content":..}` per request — OAI
-///   requires a dedicated message per executed call.
+/// - `tool` messages carrying `ToolResults` fan out into one
+///   `{"role":"tool","tool_call_id":..,"content":..}` per result; when
+///   `is_error` is set, `"[ERROR] "` is prepended to `content` (OAI/jinja
+///   templates have no native error field).
 /// - `Image` content is rejected: the tools path rejects multimodal input
 ///   upstream so it should never reach here.
 /// - `UNSPECIFIED` role is rejected.
@@ -314,20 +315,31 @@ pub(crate) fn build_oai_messages_json(
                     "tool_calls": calls,
                 }));
             }
-            Some(llm_chat_args::message_content::Content::ToolExecutionRequests(ter)) => {
+            Some(llm_chat_args::message_content::Content::ToolExecutionRequests(_)) => {
+                bail!(
+                    "ToolExecutionRequests is no longer accepted; \
+                     use ToolResults on a TOOL message"
+                );
+            }
+            Some(llm_chat_args::message_content::Content::ToolResults(tr)) => {
                 if role != "tool" {
-                    bail!(
-                        "ToolExecutionRequests content is only valid on tool messages (got {role})"
-                    );
+                    bail!("ToolResults content is only valid on tool messages (got {role})");
                 }
-                if ter.requests.is_empty() {
-                    bail!("ToolExecutionRequests must contain at least one entry");
+                if tr.results.is_empty() {
+                    bail!("ToolResults must contain at least one entry");
                 }
-                for req in &ter.requests {
+                for r in &tr.results {
+                    if r.call_id.is_empty() {
+                        bail!("ToolResult.call_id must not be empty");
+                    }
                     out.push(json!({
                         "role": "tool",
-                        "tool_call_id": req.call_id,
-                        "content": req.fn_arguments,
+                        "tool_call_id": r.call_id,
+                        "content": if r.is_error {
+                            format!("[ERROR] {}", r.content)
+                        } else {
+                            r.content.clone()
+                        },
                     }));
                 }
             }
@@ -614,7 +626,8 @@ mod tests {
     use jobworkerp_llama_protobuf::protobuf::llm::llm_chat_args::{
         ChatMessage, ChatRole, MessageContent,
         message_content::{
-            Content, ToolCall, ToolCalls, ToolExecutionRequest, ToolExecutionRequests,
+            Content, ToolCall, ToolCalls, ToolExecutionRequest, ToolExecutionRequests, ToolResult,
+            ToolResults,
         },
     };
 
@@ -692,21 +705,23 @@ mod tests {
     }
 
     #[test]
-    fn test_build_oai_messages_tool_role_fans_out_per_request() {
+    fn test_build_oai_messages_tool_results_fans_out() {
         let tool_msg = ChatMessage {
             role: ChatRole::Tool as i32,
             content: Some(MessageContent {
-                content: Some(Content::ToolExecutionRequests(ToolExecutionRequests {
-                    requests: vec![
-                        ToolExecutionRequest {
+                content: Some(Content::ToolResults(ToolResults {
+                    results: vec![
+                        ToolResult {
                             call_id: "c1".to_string(),
                             fn_name: "get_weather".to_string(),
-                            fn_arguments: r#"{"temp":22}"#.to_string(),
+                            content: r#"{"temp":22}"#.to_string(),
+                            is_error: false,
                         },
-                        ToolExecutionRequest {
+                        ToolResult {
                             call_id: "c2".to_string(),
                             fn_name: "get_time".to_string(),
-                            fn_arguments: r#"{"hour":12}"#.to_string(),
+                            content: r#"{"hour":12}"#.to_string(),
+                            is_error: false,
                         },
                     ],
                 })),
@@ -720,6 +735,103 @@ mod tests {
         assert_eq!(arr[0]["content"], r#"{"temp":22}"#);
         assert_eq!(arr[1]["tool_call_id"], "c2");
         assert_eq!(arr[1]["content"], r#"{"hour":12}"#);
+    }
+
+    #[test]
+    fn test_build_oai_messages_tool_results_is_error_prefix() {
+        let tool_msg = ChatMessage {
+            role: ChatRole::Tool as i32,
+            content: Some(MessageContent {
+                content: Some(Content::ToolResults(ToolResults {
+                    results: vec![ToolResult {
+                        call_id: "c1".to_string(),
+                        fn_name: String::new(),
+                        content: "boom".to_string(),
+                        is_error: true,
+                    }],
+                })),
+            }),
+        };
+        let v = build("", &[tool_msg]);
+        let arr = v.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["content"], "[ERROR] boom");
+    }
+
+    #[test]
+    fn test_build_oai_messages_tool_results_empty_results_errors() {
+        let tool_msg = ChatMessage {
+            role: ChatRole::Tool as i32,
+            content: Some(MessageContent {
+                content: Some(Content::ToolResults(ToolResults { results: vec![] })),
+            }),
+        };
+        let err = build_oai_messages_json("", &[tool_msg]).unwrap_err();
+        assert!(
+            err.to_string().contains("at least one entry"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_build_oai_messages_tool_results_empty_call_id_errors() {
+        let tool_msg = ChatMessage {
+            role: ChatRole::Tool as i32,
+            content: Some(MessageContent {
+                content: Some(Content::ToolResults(ToolResults {
+                    results: vec![ToolResult {
+                        call_id: String::new(),
+                        fn_name: String::new(),
+                        content: "ok".to_string(),
+                        is_error: false,
+                    }],
+                })),
+            }),
+        };
+        let err = build_oai_messages_json("", &[tool_msg]).unwrap_err();
+        assert!(
+            err.to_string().contains("call_id"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_build_oai_messages_tool_results_rejected_on_non_tool_role() {
+        let bogus = ChatMessage {
+            role: ChatRole::User as i32,
+            content: Some(MessageContent {
+                content: Some(Content::ToolResults(ToolResults {
+                    results: vec![ToolResult {
+                        call_id: "c1".to_string(),
+                        fn_name: String::new(),
+                        content: "ok".to_string(),
+                        is_error: false,
+                    }],
+                })),
+            }),
+        };
+        let err = build_oai_messages_json("", &[bogus]).unwrap_err();
+        assert!(err.to_string().contains("tool"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn test_build_oai_messages_tool_execution_requests_now_rejected() {
+        let tool_msg = ChatMessage {
+            role: ChatRole::Tool as i32,
+            content: Some(MessageContent {
+                content: Some(Content::ToolExecutionRequests(ToolExecutionRequests {
+                    requests: vec![ToolExecutionRequest {
+                        call_id: "c1".to_string(),
+                        fn_name: "get_weather".to_string(),
+                        fn_arguments: r#"{"temp":22}"#.to_string(),
+                    }],
+                })),
+            }),
+        };
+        let err = build_oai_messages_json("", &[tool_msg]).unwrap_err();
+        let msg = err.to_string();
+        // Error should hint at the new ToolResults variant for migration.
+        assert!(msg.contains("ToolResults"), "unexpected error: {msg}");
     }
 
     #[test]
