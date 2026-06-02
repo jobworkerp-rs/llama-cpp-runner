@@ -481,6 +481,32 @@ fn run_stream_blocking_with_tools<F>(
     let _ = inner_tx.blocking_send(terminal);
 }
 
+/// Build the intermediate finalize chunk used by the client-tools split wire
+/// shape. Carries only the resolved `pending_tool_calls` (no text, no partial
+/// tool delta) with `done=false`, so the chunk is unambiguously a "tool-call
+/// signal" rather than a stray empty text delta. Only meaningful for the Chat
+/// stream method — the completion path never produces this chunk.
+fn encode_intermediate_finalize_chunk(
+    method: StreamMethod,
+    pending: Vec<jobworkerp_llama_protobuf::protobuf::llm::ToolCallRequest>,
+) -> Vec<u8> {
+    debug_assert!(matches!(method, StreamMethod::Chat));
+    let requires_tool_execution = Some(!pending.is_empty());
+    LlmChatResult {
+        content: None,
+        reasoning_content: None,
+        done: false,
+        usage: None,
+        pending_tool_calls: Some(jobworkerp_llama_protobuf::protobuf::llm::PendingToolCalls {
+            calls: pending,
+        }),
+        requires_tool_execution,
+        tool_execution_results: vec![],
+        tool_execution_started: None,
+    }
+    .encode_to_vec()
+}
+
 /// Build the wire bytes for one streaming chunk. `tool_calls` carries per-delta
 /// partial fragments; by OpenAI streaming convention an empty `call_id` /
 /// `fn_name` on a continuation means "carry over from the previous delta at
@@ -498,20 +524,7 @@ fn encode_chunk_with_tools(
     let reasoning_field = (!reasoning.is_empty()).then_some(reasoning);
     match method {
         StreamMethod::Chat => {
-            // The intermediate finalize chunk used by the client-tools split
-            // wire shape carries only the resolved `pending_tool_calls`
-            // (empty text, no partial tool delta) — omit `content` entirely
-            // so the chunk is unambiguously a "tool-call signal", not a
-            // stray empty text delta.
-            let is_intermediate_finalize_signal = !done
-                && tool_calls.is_empty()
-                && text.is_empty()
-                && pending_for_final
-                    .as_ref()
-                    .is_some_and(|calls| !calls.is_empty());
-            let content = if is_intermediate_finalize_signal {
-                None
-            } else if !tool_calls.is_empty() {
+            let content = if !tool_calls.is_empty() {
                 let calls = tool_calls
                     .into_iter()
                     .map(|d| llm_chat_result::message_content::ToolCall {
@@ -573,10 +586,8 @@ fn encode_chunk_with_tools(
     }
 }
 
-/// Forward one encoded chunk to the host sink, flipping `cancel_flag` so the
-/// blocking generator bails at the next sink callback if the receiver has
-/// gone away. Centralising this here pins the error-string contract that
-/// existing tests match against (`"output receiver dropped: ..."`).
+/// Flips `cancel_flag` on send failure so the blocking generator bails at
+/// its next sink callback. The error string is matched verbatim by tests.
 async fn send_or_cancel(
     output: &HighLevelSink,
     cancel_flag: &Arc<AtomicBool>,
@@ -618,15 +629,7 @@ async fn emit_final_chunks(
             n = pending.len(),
             "emitting pending_tool_calls (intermediate finalize chunk)"
         );
-        let intermediate = encode_chunk_with_tools(
-            method,
-            String::new(),
-            String::new(),
-            Vec::new(),
-            false,
-            Some(pending),
-            None,
-        );
+        let intermediate = encode_intermediate_finalize_chunk(method, pending);
         send_or_cancel(output, cancel_flag, intermediate).await?;
 
         // Terminator carries usage only; last_text/last_reasoning are dropped
@@ -991,19 +994,15 @@ impl PluginV2 for LlamaCppPlugin {
                     return;
                 }
             };
-            // `cancel_for_blocking` is moved into the streaming worker; the
-            // model layer needs its own handle for the abort callback.
+            // Abort-callback handle for the model layer (cancel_for_blocking
+            // is moved into the streaming worker).
             let cancel_for_model = cancel_for_blocking.clone();
             match decoded {
                 DecodedStream::Chat(mut chat_args) => {
-                    // The OAI parser owns text/tool splitting, so divert to
-                    // the tools-aware worker when `client_tools_json` is set.
-                    // `take()` moves the (potentially multi-KB) tool-defs
-                    // JSON out of `function_options` instead of cloning it;
-                    // `chat_args` is then passed by value to the worker
-                    // with `client_tools_json=None` on its inner options,
-                    // which is harmless because the worker treats the
-                    // string we hand it as the canonical source.
+                    // Divert to the tools-aware worker when client_tools_json
+                    // is set. `take()` avoids cloning the (potentially multi-KB)
+                    // tool-defs JSON; the worker uses the extracted string as
+                    // the canonical source.
                     let client_tools_json = chat_args
                         .function_options
                         .as_mut()
@@ -2854,13 +2853,11 @@ LLAMA_SYSTEM_PROMPT=You are a helpful assistant.
         }
     }
 
-    /// Drain everything currently queued on `rx`. Assumes the sender side
-    /// has already been dropped — `try_recv` short-circuits as soon as the
-    /// channel empties, so a still-live producer would silently return an
-    /// incomplete view.
+    /// Drain everything queued on `rx` until the sender side closes. Callers
+    /// drop the sink before calling so `recv()` terminates promptly.
     async fn drain_all(rx: &mut tokio::sync::mpsc::Receiver<Vec<u8>>) -> Vec<Vec<u8>> {
         let mut out = Vec::new();
-        while let Ok(bytes) = rx.try_recv() {
+        while let Some(bytes) = rx.recv().await {
             out.push(bytes);
         }
         out
@@ -3003,22 +3000,14 @@ LLAMA_SYSTEM_PROMPT=You are a helpful assistant.
     }
 
     #[test]
-    fn test_encode_chunk_with_tools_intermediate_finalize_omits_content() {
+    fn test_encode_intermediate_finalize_chunk_omits_content() {
         let calls = vec![make_tool_call_request("call_x", "fn", "{}")];
-        let bytes = encode_chunk_with_tools(
-            StreamMethod::Chat,
-            String::new(),
-            String::new(),
-            Vec::new(),
-            false,
-            Some(calls),
-            None,
-        );
+        let bytes = encode_intermediate_finalize_chunk(StreamMethod::Chat, calls);
         let decoded = LlmChatResult::decode(&mut Cursor::new(bytes)).expect("decode");
         assert!(!decoded.done);
         assert!(
             decoded.content.is_none(),
-            "intermediate finalize chunk (done=false + empty text + pending=Some) must omit content"
+            "intermediate finalize chunk must omit content"
         );
         assert_eq!(decoded.requires_tool_execution, Some(true));
         assert!(decoded.pending_tool_calls.is_some());

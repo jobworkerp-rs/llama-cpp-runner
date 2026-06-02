@@ -1550,7 +1550,7 @@ impl LlamaModelWrapper {
     /// between batches.
     pub fn run_chat_with_sink(
         &mut self,
-        args: LlmChatArgs,
+        mut args: LlmChatArgs,
         cancel_flag: Option<Arc<AtomicBool>>,
         sink: &mut dyn FnMut(&str) -> ControlFlow<()>,
     ) -> Result<LlmChatResult> {
@@ -1566,14 +1566,16 @@ impl LlamaModelWrapper {
         }
 
         // Tools path: when the caller passes `client_tools_json`, route
-        // through the OpenAI-compatible chat template + tool parser. The
-        // path's mutual-exclusion guards (json_schema, use_function_calling)
-        // live in `run_chat_with_sink_tools` itself so the streaming entry
+        // through the OpenAI-compatible chat template + tool parser. `take()`
+        // moves the (potentially multi-KB) tool-defs JSON out of
+        // `function_options` instead of cloning it. The path's
+        // mutual-exclusion guards (json_schema, use_function_calling) live in
+        // `run_chat_with_sink_tools` itself so the streaming entry
         // (`spawn_chat_stream_with_tools`) is validated by the same code.
         if let Some(client_tools_json) = args
             .function_options
-            .as_ref()
-            .and_then(|fo| fo.client_tools_json.clone())
+            .as_mut()
+            .and_then(|fo| fo.client_tools_json.take())
         {
             let mut oai_sink = |_: crate::oai_chat::OaiStreamUpdate| {};
             return self.run_chat_with_sink_tools(
