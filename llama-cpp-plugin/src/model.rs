@@ -314,14 +314,19 @@ pub struct InferenceArgs {
     /// reaching the sampler.
     #[serde(default, skip_serializing, skip_deserializing)]
     grammar_spec: Option<crate::oai_chat::GrammarSpec>,
-    /// Cooperative cancel flag installed on the underlying `LlamaContext` as
-    /// an abort callback. When set to `true` mid-decode, llama.cpp aborts
-    /// the in-flight `decode`/`encode` call instead of completing the whole
-    /// batch — essential for long-prompt prefill, where the per-batch GPU
-    /// computation can otherwise run for minutes before the sink-based
-    /// cancel poll between batches gets a chance to fire.
+    /// Cooperative cancel flag installed on the underlying `LlamaContext`
+    /// as a ggml abort callback. See `LlamaContext::set_abort_flag`.
     #[serde(default, skip_serializing, skip_deserializing)]
     cancel_flag: Option<Arc<AtomicBool>>,
+}
+
+impl InferenceArgs {
+    /// `true` iff a host-side cancel flag was attached and is currently set.
+    fn is_cancel_requested(&self) -> bool {
+        self.cancel_flag
+            .as_ref()
+            .is_some_and(|f| f.load(Ordering::Relaxed))
+    }
 }
 
 impl std::fmt::Debug for InferenceArgs {
@@ -476,14 +481,12 @@ pub struct DecodeOutput {
 /// construction, clears it on drop. Holds a raw pointer rather than `&mut`
 /// so the surrounding code can keep its own `&mut LlamaContext` borrow
 /// active — the guard does not touch `ctx` between construction and drop.
+/// A `None` flag is a no-op.
 ///
 /// SAFETY invariants for callers:
 /// - The `LlamaContext` referenced by `ctx_ptr` must outlive this guard.
 /// - No other code may call `set_abort_flag` / `clear_abort_callback` on
 ///   that context while the guard is alive.
-///
-/// `None` flag is a no-op so the legacy `run()` path pays no cancellation
-/// overhead.
 struct AbortGuard {
     ctx_ptr: *mut llama_cpp_2::context::LlamaContext<'static>,
     armed: bool,
@@ -494,12 +497,10 @@ impl AbortGuard {
         ctx: &mut llama_cpp_2::context::LlamaContext<'static>,
         flag: Option<Arc<AtomicBool>>,
     ) -> Self {
-        let armed = if let Some(flag) = flag {
+        let armed = flag.is_some();
+        if let Some(flag) = flag {
             ctx.set_abort_flag(flag);
-            true
-        } else {
-            false
-        };
+        }
         Self {
             ctx_ptr: ctx as *mut _,
             armed,
@@ -1106,7 +1107,7 @@ impl LlamaModelWrapper {
             // as `Err(CANCELLED)` upstream and the KV write-back is skipped
             // (we already took `cached_tokens` above).
             if let Err(e) = ctx.decode(&mut batch) {
-                if cancel_observed(args.cancel_flag.as_ref()) {
+                if args.is_cancel_requested() {
                     prefill_cancelled = true;
                     break;
                 }
@@ -1269,7 +1270,7 @@ impl LlamaModelWrapper {
             n_cur += 1;
 
             if let Err(e) = ctx.decode(&mut batch) {
-                if cancel_observed(args.cancel_flag.as_ref()) {
+                if args.is_cancel_requested() {
                     cancelled = true;
                     break;
                 }
@@ -1429,7 +1430,7 @@ impl LlamaModelWrapper {
         let n_past = match mtmd.eval_chunks_from(&chunks, start_index, n_keep, ctx, n_batch) {
             Ok(n) => n,
             Err(e) => {
-                if cancel_observed(args.cancel_flag.as_ref()) {
+                if args.is_cancel_requested() {
                     // KV cache state is undefined after an aborted prefill;
                     // we already took `cached_chunks`, so the next request
                     // will perform a full clear. Return a zero-length result
@@ -1494,7 +1495,7 @@ impl LlamaModelWrapper {
             batch.add(token, n_cur, &[0], true)?;
             n_cur += 1;
             if let Err(e) = ctx.decode(&mut batch) {
-                if cancel_observed(args.cancel_flag.as_ref()) {
+                if args.is_cancel_requested() {
                     cancelled = true;
                     break;
                 }
@@ -1605,7 +1606,7 @@ impl LlamaModelWrapper {
             json_schema: args.json_schema,
             medias: Vec::new(),
             grammar_spec: None,
-            cancel_flag: cancel_flag.clone(),
+            cancel_flag,
         };
 
         let t_start = ggml_time_us();
@@ -2272,15 +2273,6 @@ fn check_token_length(tokens_list: &[LlamaToken], ctx: &LlamaContext, n_len: i32
 /// expressed in one place.
 fn sink_requests_stop(sink: &mut dyn FnMut(&str) -> ControlFlow<()>, chunk: &str) -> bool {
     matches!(sink(chunk), ControlFlow::Break(()))
-}
-
-/// Returns `true` when an external cancel flag is `Some` and set to `true`.
-/// Used to distinguish "the host cancelled mid-`llama_decode`" (which
-/// surfaces as an opaque compute error) from a real compute failure, so
-/// the decode loops can translate the former into a graceful cancel
-/// exit instead of an `Err`.
-fn cancel_observed(flag: Option<&Arc<AtomicBool>>) -> bool {
-    flag.is_some_and(|f| f.load(Ordering::Relaxed))
 }
 
 /// Strip the chat template's `generation_prompt` from a generated response
