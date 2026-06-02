@@ -1954,8 +1954,31 @@ impl LlamaModelWrapper {
                     Some(llm_chat_args::message_content::Content::ToolCalls(tc)) => {
                         serde_json::to_string(&tc.calls).unwrap_or_default()
                     }
-                    Some(llm_chat_args::message_content::Content::ToolExecutionRequests(ter)) => {
-                        serde_json::to_string(&ter.requests).unwrap_or_default()
+                    Some(llm_chat_args::message_content::Content::ToolExecutionRequests(_)) => {
+                        bail!(
+                            "ToolExecutionRequests is no longer accepted; \
+                             use ToolResults on a TOOL message"
+                        );
+                    }
+                    Some(llm_chat_args::message_content::Content::ToolResults(tr)) => {
+                        if tr.results.is_empty() {
+                            bail!("ToolResults must contain at least one entry");
+                        }
+                        let mut rendered = Vec::with_capacity(tr.results.len());
+                        for r in &tr.results {
+                            if r.call_id.is_empty() {
+                                bail!("ToolResult.call_id must not be empty");
+                            }
+                            rendered.push(serde_json::json!({
+                                "call_id": r.call_id,
+                                "content": if r.is_error {
+                                    format!("[ERROR] {}", r.content)
+                                } else {
+                                    r.content.clone()
+                                },
+                            }));
+                        }
+                        serde_json::to_string(&rendered).unwrap_or_default()
                     }
                     None => String::new(),
                 },
