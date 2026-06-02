@@ -273,7 +273,7 @@ fn dispatch_chat(
     };
     tracing::debug!("LLMRunner {METHOD_CHAT}: {args:?}");
     let mut sink = make_cancel_sink(cancel.clone());
-    let result = match wrapper.run_chat_with_sink(args, &mut sink) {
+    let result = match wrapper.run_chat_with_sink(args, Some(cancel.clone()), &mut sink) {
         Ok(r) => r,
         Err(e) => return DispatchOutcome::Err(e),
     };
@@ -295,7 +295,7 @@ fn dispatch_completion(
     };
     tracing::debug!("LLMRunner {METHOD_COMPLETION}: {args:?}");
     let mut sink = make_cancel_sink(cancel.clone());
-    let result = match wrapper.run_completion_with_sink(args, &mut sink) {
+    let result = match wrapper.run_completion_with_sink(args, Some(cancel.clone()), &mut sink) {
         Ok(r) => r,
         Err(e) => return DispatchOutcome::Err(e),
     };
@@ -481,6 +481,32 @@ fn run_stream_blocking_with_tools<F>(
     let _ = inner_tx.blocking_send(terminal);
 }
 
+/// Build the intermediate finalize chunk used by the client-tools split wire
+/// shape. Carries only the resolved `pending_tool_calls` (no text, no partial
+/// tool delta) with `done=false`, so the chunk is unambiguously a "tool-call
+/// signal" rather than a stray empty text delta. Only meaningful for the Chat
+/// stream method — the completion path never produces this chunk.
+fn encode_intermediate_finalize_chunk(
+    method: StreamMethod,
+    pending: Vec<jobworkerp_llama_protobuf::protobuf::llm::ToolCallRequest>,
+) -> Vec<u8> {
+    debug_assert!(matches!(method, StreamMethod::Chat));
+    let requires_tool_execution = Some(!pending.is_empty());
+    LlmChatResult {
+        content: None,
+        reasoning_content: None,
+        done: false,
+        usage: None,
+        pending_tool_calls: Some(jobworkerp_llama_protobuf::protobuf::llm::PendingToolCalls {
+            calls: pending,
+        }),
+        requires_tool_execution,
+        tool_execution_results: vec![],
+        tool_execution_started: None,
+    }
+    .encode_to_vec()
+}
+
 /// Build the wire bytes for one streaming chunk. `tool_calls` carries per-delta
 /// partial fragments; by OpenAI streaming convention an empty `call_id` /
 /// `fn_name` on a continuation means "carry over from the previous delta at
@@ -498,10 +524,6 @@ fn encode_chunk_with_tools(
     let reasoning_field = (!reasoning.is_empty()).then_some(reasoning);
     match method {
         StreamMethod::Chat => {
-            // The MessageContent oneof can only carry text OR tool_calls. If
-            // any tool delta is present we emit it as ToolCalls; otherwise
-            // (including final chunks whose only tool payload is pending),
-            // we keep the text variant.
             let content = if !tool_calls.is_empty() {
                 let calls = tool_calls
                     .into_iter()
@@ -514,21 +536,21 @@ fn encode_chunk_with_tools(
                         delta_index: Some(d.index),
                     })
                     .collect();
-                llm_chat_result::MessageContent {
+                Some(llm_chat_result::MessageContent {
                     content: Some(llm_chat_result::message_content::Content::ToolCalls(
                         llm_chat_result::message_content::ToolCalls { calls },
                     )),
-                }
+                })
             } else {
-                llm_chat_result::MessageContent {
+                Some(llm_chat_result::MessageContent {
                     content: Some(llm_chat_result::message_content::Content::Text(text)),
-                }
+                })
             };
             let requires_tool_execution = pending_for_final.as_ref().map(|calls| !calls.is_empty());
             let pending_tool_calls = pending_for_final
                 .map(|calls| jobworkerp_llama_protobuf::protobuf::llm::PendingToolCalls { calls });
             LlmChatResult {
-                content: Some(content),
+                content,
                 reasoning_content: reasoning_field,
                 done,
                 usage: usage.map(|u| llm_chat_result::Usage {
@@ -562,6 +584,89 @@ fn encode_chunk_with_tools(
         }
         .encode_to_vec(),
     }
+}
+
+/// Flips `cancel_flag` on send failure so the blocking generator bails at
+/// its next sink callback. The error string is matched verbatim by tests.
+async fn send_or_cancel(
+    output: &HighLevelSink,
+    cancel_flag: &Arc<AtomicBool>,
+    bytes: Vec<u8>,
+) -> std::result::Result<(), String> {
+    output.send(bytes).await.map_err(|e| {
+        cancel_flag.store(true, Ordering::Relaxed);
+        format!("output receiver dropped: {e}")
+    })
+}
+
+/// Emit the terminal chunk(s) for a `StreamItem::Final`. Split out from the
+/// receive loop so the chunk-boundary contract can be unit-tested without a
+/// real model.
+///
+/// When the worker resolved a non-empty `pending_tool_calls`, the client-tools
+/// wire shape requires two chunks: a `done=false` intermediate finalize chunk
+/// that carries the tool-call decision (no `content`, no `usage`), followed
+/// by an independent `done=true` terminator (Usage only, no
+/// `pending_tool_calls`). Otherwise a single `done=true` chunk carries the
+/// last text plus usage.
+async fn emit_final_chunks(
+    method: StreamMethod,
+    last_text: String,
+    last_reasoning: String,
+    final_pending_tool_calls: Option<
+        Vec<jobworkerp_llama_protobuf::protobuf::llm::ToolCallRequest>,
+    >,
+    usage: StreamUsage,
+    output: &HighLevelSink,
+    cancel_flag: &Arc<AtomicBool>,
+) -> std::result::Result<(), String> {
+    if let Some(pending) = final_pending_tool_calls.filter(|c| !c.is_empty()) {
+        // The tool-call decision rides on an intermediate `done=false` chunk
+        // so clients can react to it without peeking inside the terminator;
+        // usage is reserved for the terminator.
+        tracing::debug!(
+            target: "llama_cpp_plugin::stream",
+            n = pending.len(),
+            "emitting pending_tool_calls (intermediate finalize chunk)"
+        );
+        let intermediate = encode_intermediate_finalize_chunk(method, pending);
+        send_or_cancel(output, cancel_flag, intermediate).await?;
+
+        // Terminator carries usage only; last_text/last_reasoning are dropped
+        // here so the chunk unambiguously means "stream end".
+        tracing::debug!(
+            target: "llama_cpp_plugin::stream",
+            "stream end (terminator after tool_calls)"
+        );
+        let terminal = encode_chunk_with_tools(
+            method,
+            String::new(),
+            String::new(),
+            Vec::new(),
+            true,
+            None,
+            Some(usage),
+        );
+        return send_or_cancel(output, cancel_flag, terminal).await;
+    }
+
+    // Text-only path: a single `done=true` chunk carries the last text plus
+    // usage, matching what genai's adapter and existing clients already
+    // consume.
+    tracing::debug!(
+        target: "llama_cpp_plugin::stream",
+        "stream end (text-only terminator)"
+    );
+    let terminal = encode_chunk_with_tools(
+        method,
+        last_text,
+        last_reasoning,
+        Vec::new(),
+        true,
+        None,
+        Some(usage),
+    );
+    send_or_cancel(output, cancel_flag, terminal).await
 }
 
 impl Default for LlamaCppPlugin {
@@ -729,7 +834,17 @@ impl PluginV2 for LlamaCppPlugin {
     }
 
     async fn load(&mut self, settings: Vec<u8>) -> std::result::Result<(), String> {
-        ensure_tracing_initialized().await;
+        // Tracing init wires up the OTLP exporter, which internally uses
+        // `hyper-util` and therefore requires a tokio reactor handle. The
+        // *host* runtime driving this future is a different `tokio` symbol
+        // copy from this dylib's, so `tokio::runtime::Handle::current()`
+        // resolved from inside hyper-util sees "no reactor" and panics
+        // (hyper-util-0.1.20/src/rt/tokio.rs:115). Drive the init on the
+        // plugin-owned runtime so the reactor lookup hits *this* dylib's
+        // tokio handle, then `await` the join so the rest of `load` is
+        // sequenced after it.
+        let handle = self.rt_handle();
+        let _ = handle.spawn(ensure_tracing_initialized()).await;
         (|| -> Result<()> {
             let settings = LlamaRunnerSettings::decode(&mut Cursor::new(settings))
                 .map_err(|e| anyhow!("decode error: {e}"))?;
@@ -879,16 +994,15 @@ impl PluginV2 for LlamaCppPlugin {
                     return;
                 }
             };
+            // Abort-callback handle for the model layer (cancel_for_blocking
+            // is moved into the streaming worker).
+            let cancel_for_model = cancel_for_blocking.clone();
             match decoded {
                 DecodedStream::Chat(mut chat_args) => {
-                    // The OAI parser owns text/tool splitting, so divert to
-                    // the tools-aware worker when `client_tools_json` is set.
-                    // `take()` moves the (potentially multi-KB) tool-defs
-                    // JSON out of `function_options` instead of cloning it;
-                    // `chat_args` is then passed by value to the worker
-                    // with `client_tools_json=None` on its inner options,
-                    // which is harmless because the worker treats the
-                    // string we hand it as the canonical source.
+                    // Divert to the tools-aware worker when client_tools_json
+                    // is set. `take()` avoids cloning the (potentially multi-KB)
+                    // tool-defs JSON; the worker uses the extracted string as
+                    // the canonical source.
                     let client_tools_json = chat_args
                         .function_options
                         .as_mut()
@@ -899,12 +1013,18 @@ impl PluginV2 for LlamaCppPlugin {
                             inner_tx_for_blocking,
                             cancel_for_blocking,
                             move |w, raw_sink, oai_sink| {
-                                w.run_chat_with_sink_tools(chat_args, &json, raw_sink, oai_sink)
-                                    .map(|r| {
-                                        let usage = StreamUsage::from_proto(r.usage.as_ref());
-                                        let pending = r.pending_tool_calls.map(|p| p.calls);
-                                        (usage, pending)
-                                    })
+                                w.run_chat_with_sink_tools(
+                                    chat_args,
+                                    &json,
+                                    Some(cancel_for_model),
+                                    raw_sink,
+                                    oai_sink,
+                                )
+                                .map(|r| {
+                                    let usage = StreamUsage::from_proto(r.usage.as_ref());
+                                    let pending = r.pending_tool_calls.map(|p| p.calls);
+                                    (usage, pending)
+                                })
                             },
                         );
                     } else {
@@ -914,7 +1034,7 @@ impl PluginV2 for LlamaCppPlugin {
                             inner_tx_for_blocking,
                             cancel_for_blocking,
                             move |w, sink| {
-                                w.run_chat_with_sink(chat_args, sink)
+                                w.run_chat_with_sink(chat_args, Some(cancel_for_model), sink)
                                     .map(|r| StreamUsage::from_proto(r.usage.as_ref()))
                             },
                         );
@@ -926,7 +1046,7 @@ impl PluginV2 for LlamaCppPlugin {
                     inner_tx_for_blocking,
                     cancel_for_blocking,
                     move |w, sink| {
-                        w.run_completion_with_sink(comp_args, sink)
+                        w.run_completion_with_sink(comp_args, Some(cancel_for_model), sink)
                             .map(|r| StreamUsage::from_proto(r.usage.as_ref()))
                     },
                 ),
@@ -958,11 +1078,8 @@ impl PluginV2 for LlamaCppPlugin {
                     let bytes = encode_chunk_with_tools(
                         method, text, reasoning, tool_calls, false, None, None,
                     );
-                    if let Err(e) = output.send(bytes).await {
-                        // Host stopped consuming — propagate so the blocking
-                        // thread bails at the next sink call.
-                        cancel_flag.store(true, Ordering::Relaxed);
-                        break Err(format!("output receiver dropped: {e}"));
+                    if let Err(e) = send_or_cancel(&output, &cancel_flag, bytes).await {
+                        break Err(e);
                     }
                 }
                 Some(StreamItem::Final {
@@ -971,17 +1088,16 @@ impl PluginV2 for LlamaCppPlugin {
                     final_pending_tool_calls,
                     usage,
                 }) => {
-                    let bytes = encode_chunk_with_tools(
+                    break emit_final_chunks(
                         method,
                         last_text,
                         last_reasoning,
-                        Vec::new(),
-                        true,
                         final_pending_tool_calls,
-                        Some(usage),
-                    );
-                    let _ = output.send(bytes).await;
-                    break Ok(());
+                        usage,
+                        &output,
+                        &cancel_flag,
+                    )
+                    .await;
                 }
                 Some(StreamItem::Error(e)) => break Err(e.to_string()),
                 None => break Ok(()),
@@ -2711,5 +2827,303 @@ LLAMA_SYSTEM_PROMPT=You are a helpful assistant.
             "stream error should mention the conflict: {err}"
         );
         assert!(rx.try_recv().is_err(), "no chunk should have been emitted");
+    }
+
+    /// `emit_final_chunks` is the single point that materialises terminal
+    /// chunks for the streaming chat path. These tests pin its contract
+    /// without spinning up a llama.cpp model — the wire shape is what other
+    /// clients depend on, so it deserves direct unit coverage.
+    fn make_stream_usage(prompt: u32, completion: u32) -> StreamUsage {
+        StreamUsage {
+            prompt_tokens: prompt,
+            completion_tokens: completion,
+            total_completion_time_sec: 1.0,
+        }
+    }
+
+    fn make_tool_call_request(
+        id: &str,
+        name: &str,
+        args: &str,
+    ) -> jobworkerp_llama_protobuf::protobuf::llm::ToolCallRequest {
+        jobworkerp_llama_protobuf::protobuf::llm::ToolCallRequest {
+            call_id: id.to_string(),
+            fn_name: name.to_string(),
+            fn_arguments: args.to_string(),
+        }
+    }
+
+    /// Drain everything queued on `rx` until the sender side closes. Callers
+    /// drop the sink before calling so `recv()` terminates promptly.
+    async fn drain_all(rx: &mut tokio::sync::mpsc::Receiver<Vec<u8>>) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        while let Some(bytes) = rx.recv().await {
+            out.push(bytes);
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn test_emit_final_chunks_splits_tool_calls_into_two_chunks() {
+        let (sink, mut rx) = make_test_sink(STREAM_CHANNEL_DEPTH);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let calls = vec![make_tool_call_request(
+            "call_abc",
+            "get_weather",
+            "{\"city\":\"Tokyo\"}",
+        )];
+        emit_final_chunks(
+            StreamMethod::Chat,
+            String::new(),
+            String::new(),
+            Some(calls.clone()),
+            make_stream_usage(7, 11),
+            &sink,
+            &cancel,
+        )
+        .await
+        .expect("emit_final_chunks must succeed");
+        drop(sink);
+
+        let chunks = drain_all(&mut rx).await;
+        assert_eq!(
+            chunks.len(),
+            2,
+            "tool-call finalize must emit exactly two chunks"
+        );
+
+        // Intermediate finalize chunk: done=false, content=None, pending set.
+        let intermediate =
+            LlmChatResult::decode(&mut Cursor::new(&chunks[0])).expect("decode intermediate");
+        assert!(!intermediate.done, "intermediate chunk must be done=false");
+        assert!(
+            intermediate.content.is_none(),
+            "intermediate finalize chunk must omit content (got {:?})",
+            intermediate.content
+        );
+        assert_eq!(
+            intermediate.requires_tool_execution,
+            Some(true),
+            "intermediate chunk must carry requires_tool_execution=Some(true)"
+        );
+        let pending = intermediate
+            .pending_tool_calls
+            .expect("intermediate chunk must carry pending_tool_calls");
+        assert_eq!(pending.calls.len(), 1);
+        assert_eq!(pending.calls[0].call_id, "call_abc");
+        assert_eq!(pending.calls[0].fn_name, "get_weather");
+        assert!(
+            intermediate.usage.is_none(),
+            "usage belongs on the terminal chunk only"
+        );
+
+        // Terminal chunk: done=true, pending cleared, usage present.
+        let terminal =
+            LlmChatResult::decode(&mut Cursor::new(&chunks[1])).expect("decode terminal");
+        assert!(terminal.done, "terminal chunk must be done=true");
+        assert!(
+            terminal.pending_tool_calls.is_none(),
+            "terminal chunk must clear pending_tool_calls (got {:?})",
+            terminal.pending_tool_calls
+        );
+        assert!(
+            terminal.requires_tool_execution.is_none(),
+            "terminal chunk must clear requires_tool_execution"
+        );
+        let usage = terminal.usage.expect("terminal chunk must carry usage");
+        assert_eq!(usage.prompt_tokens, Some(7));
+        assert_eq!(usage.completion_tokens, Some(11));
+    }
+
+    #[tokio::test]
+    async fn test_emit_final_chunks_text_only_keeps_single_done_chunk() {
+        let (sink, mut rx) = make_test_sink(STREAM_CHANNEL_DEPTH);
+        let cancel = Arc::new(AtomicBool::new(false));
+        emit_final_chunks(
+            StreamMethod::Chat,
+            "final-text".to_string(),
+            String::new(),
+            None,
+            make_stream_usage(3, 5),
+            &sink,
+            &cancel,
+        )
+        .await
+        .expect("emit_final_chunks must succeed");
+        drop(sink);
+
+        let chunks = drain_all(&mut rx).await;
+        assert_eq!(
+            chunks.len(),
+            1,
+            "text-only final must emit exactly one chunk"
+        );
+        let terminal = LlmChatResult::decode(&mut Cursor::new(&chunks[0])).expect("decode");
+        assert!(terminal.done);
+        assert!(terminal.pending_tool_calls.is_none());
+        let content = terminal
+            .content
+            .expect("text-only final must carry content");
+        match content.content.expect("inner content") {
+            llm_chat_result::message_content::Content::Text(t) => assert_eq!(t, "final-text"),
+            other => panic!("expected Text content, got {other:?}"),
+        }
+        assert!(terminal.usage.is_some(), "usage on terminal chunk");
+    }
+
+    #[tokio::test]
+    async fn test_emit_final_chunks_completion_method_emits_single_terminal() {
+        let (sink, mut rx) = make_test_sink(STREAM_CHANNEL_DEPTH);
+        let cancel = Arc::new(AtomicBool::new(false));
+        emit_final_chunks(
+            StreamMethod::Completion,
+            "comp-final".to_string(),
+            String::new(),
+            None,
+            make_stream_usage(2, 4),
+            &sink,
+            &cancel,
+        )
+        .await
+        .expect("emit_final_chunks must succeed");
+        drop(sink);
+
+        let chunks = drain_all(&mut rx).await;
+        assert_eq!(
+            chunks.len(),
+            1,
+            "completion path never produces a finalize intermediate"
+        );
+        let terminal = LlmCompletionResult::decode(&mut Cursor::new(&chunks[0])).expect("decode");
+        assert!(terminal.done);
+        assert!(terminal.usage.is_some());
+    }
+
+    #[test]
+    fn test_encode_intermediate_finalize_chunk_omits_content() {
+        let calls = vec![make_tool_call_request("call_x", "fn", "{}")];
+        let bytes = encode_intermediate_finalize_chunk(StreamMethod::Chat, calls);
+        let decoded = LlmChatResult::decode(&mut Cursor::new(bytes)).expect("decode");
+        assert!(!decoded.done);
+        assert!(
+            decoded.content.is_none(),
+            "intermediate finalize chunk must omit content"
+        );
+        assert_eq!(decoded.requires_tool_execution, Some(true));
+        assert!(decoded.pending_tool_calls.is_some());
+        assert!(decoded.usage.is_none());
+    }
+
+    /// End-to-end verification that the split wire shape holds end-to-end
+    /// when Qwen3 actually chooses to call a tool. Kept `#[ignore]` because
+    /// it depends on a downloaded model; run with
+    /// `cargo test --release -p jobworkerp-llama-cpp-plugin --features metal \
+    ///   -- --ignored --test-threads=1 \
+    ///   test_streaming_chat_tool_calls_separated_wire_shape`.
+    #[ignore = "depends on model"]
+    #[tokio::test]
+    async fn test_streaming_chat_tool_calls_separated_wire_shape() {
+        use jobworkerp_llama_protobuf::protobuf::llm::llm_chat_args;
+
+        let Some(mut plugin) = setup_plugin_or_skip() else {
+            return;
+        };
+
+        let tools = r#"[
+          {"type":"function","function":{
+            "name":"get_weather",
+            "description":"Get the current weather in a city.",
+            "parameters":{
+              "type":"object",
+              "properties":{"city":{"type":"string"}},
+              "required":["city"]
+            }
+          }}
+        ]"#;
+
+        let request = LlmChatArgs {
+            options: Some(llm_chat_args::LlmOptions {
+                max_tokens: Some(128),
+                temperature: Some(0.2),
+                ..Default::default()
+            }),
+            function_options: Some(llm_chat_args::FunctionOptions {
+                client_tools_json: Some(tools.to_string()),
+                // Force a tool call so the test exercises the split branch
+                // regardless of how chatty the small Qwen3 model gets.
+                tool_choice: Some("required".to_string()),
+                ..Default::default()
+            }),
+            messages: vec![llm_chat_args::ChatMessage {
+                role: llm_chat_args::ChatRole::User as i32,
+                content: Some(llm_chat_args::MessageContent {
+                    content: Some(llm_chat_args::message_content::Content::Text(
+                        "/no_think What's the weather in Tokyo?".to_string(),
+                    )),
+                }),
+            }],
+            ..Default::default()
+        };
+        let buf = request.encode_to_vec();
+        let (sink, mut rx) = make_test_sink(STREAM_CHANNEL_DEPTH);
+        let stream_future = plugin.run_stream(buf, HashMap::new(), Some(METHOD_CHAT.into()), sink);
+
+        let drain = async {
+            let mut chunks = Vec::new();
+            while let Some(bytes) = rx.recv().await {
+                let decoded = LlmChatResult::decode(&mut Cursor::new(bytes)).expect("decode chunk");
+                chunks.push(decoded);
+            }
+            chunks
+        };
+
+        let (stream_result, chunks) = tokio::join!(stream_future, drain);
+        stream_result.expect("run_stream must succeed");
+
+        // Locate the intermediate finalize chunk that carries pending_tool_calls.
+        let pending_idx = chunks
+            .iter()
+            .position(|c| {
+                c.pending_tool_calls
+                    .as_ref()
+                    .is_some_and(|p| !p.calls.is_empty())
+            })
+            .expect("expected an intermediate chunk with non-empty pending_tool_calls");
+        let pending_chunk = &chunks[pending_idx];
+        assert!(
+            !pending_chunk.done,
+            "intermediate finalize chunk must be done=false"
+        );
+        assert_eq!(
+            pending_chunk.requires_tool_execution,
+            Some(true),
+            "intermediate finalize chunk must carry requires_tool_execution=Some(true)"
+        );
+
+        // The next chunk after the finalize must be the pure terminator.
+        let terminator = chunks
+            .get(pending_idx + 1)
+            .expect("terminator chunk must follow the intermediate finalize chunk");
+        assert!(terminator.done, "terminator chunk must be done=true");
+        assert!(
+            terminator.pending_tool_calls.is_none(),
+            "terminator chunk must clear pending_tool_calls"
+        );
+        assert!(
+            terminator.requires_tool_execution.is_none(),
+            "terminator chunk must clear requires_tool_execution"
+        );
+        assert!(
+            terminator.usage.is_some(),
+            "terminator chunk should carry usage"
+        );
+
+        // No further `done=true` chunks should follow the terminator.
+        for (i, c) in chunks.iter().enumerate().skip(pending_idx + 2) {
+            assert!(
+                !c.done,
+                "no chunk after the terminator should be done=true (chunk {i})"
+            );
+        }
     }
 }

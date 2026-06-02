@@ -465,7 +465,15 @@ impl PluginV2 for EmbeddingLlmRunnerPlugin {
     }
 
     async fn load(&mut self, settings: Vec<u8>) -> std::result::Result<(), String> {
-        ensure_tracing_initialized().await;
+        // OTLP exporter init reaches into hyper-util, which calls
+        // `tokio::runtime::Handle::current()`. The host-side runtime driving
+        // this future is a separate `tokio` symbol copy from the one linked
+        // into this dylib, so hyper-util sees no reactor and panics
+        // ("there is no reactor running…", hyper-util-0.1.20/src/rt/tokio.rs:115).
+        // Run the init on the plugin-owned runtime so the lookup hits *this*
+        // dylib's tokio handle.
+        let handle = self.rt_handle();
+        let _ = handle.spawn(ensure_tracing_initialized()).await;
         self.load_sync(settings).map_err(|e| e.to_string())
     }
 

@@ -126,6 +126,8 @@ LlmChatResult {
 
 クライアントは原則として `pending_tool_calls` (= canonical な集約結果) を信頼すれば十分です。`content.ToolCalls` はストリーミングでの逐次表示用です。
 
+> 上記は **非ストリーミング** (`run` 経由) のレスポンス形です。ストリーミング (`run_stream` 経由) では `done=true` のチャンクと `pending_tool_calls` を運ぶチャンクが**別チャンクに分離**されます。詳細は「ストリーミング」セクションを参照してください。
+
 ## 多ターン継続 (tool 結果の返却)
 
 ツール実行後、クライアントは結果を `ROLE=TOOL` メッセージの `ToolExecutionRequests` として次のリクエストに含めます。
@@ -155,7 +157,7 @@ LlmChatArgs {
 
 ## ストリーミング (`begin_stream` / `receive_stream`)
 
-`function_options.client_tools_json` が設定されている場合、streaming chunk は OpenAI streaming 仕様の partial accumulation に従います。
+`function_options.client_tools_json` が設定されている場合、streaming chunk は OpenAI streaming 仕様の partial accumulation に従います。**ただし tool_call 確定時の wire shape は分離型** (Anthropic / Gemini 流) であり、`done=true` の終端チャンクと `pending_tool_calls` のシグナルチャンクが別チャンクに分かれます (詳細は後述「tool_call 確定時のチャンク分離」)。
 
 ### chunk が運ぶフィールド
 
@@ -179,13 +181,55 @@ LlmChatArgs {
 
 `parallel_tool_calls=true` のときは複数の `delta_index` が interleave されて届きます。クライアント accumulator は `delta_index` で振り分けてください (`call_id`/`fn_name` の空文字列は「同 index の継続」を意味します)。
 
-### 最終 chunk
+なお `MessageContent::ToolCalls` の partial chunk は **UI 用の途中表示** を想定したオプションのストリームです。クライアントが accumulator を持たない場合は、後述の「中間 finalize chunk」が運ぶ canonical な `pending_tool_calls` だけを消費すれば十分です。
 
-`done=true` の最終 chunk には、worker 側で解決済みの canonical な `pending_tool_calls` が含まれます。受信側で accumulator を持たないクライアントはこれを使って完成形を得られます。
+### tool_call 確定時のチャンク分離
+
+モデルが tool_call を確定したとき、本プラグインは以下の **2 つの chunk を順に** 送出します。
+
+```text
+chunk N  : LlmChatResult {
+  done: false,
+  content: None,                       // 中間 finalize chunk はペイロードなし
+  pending_tool_calls: Some(PendingToolCalls { calls: [...] }),
+  requires_tool_execution: Some(true),
+  usage: None,
+  ..
+}                                     // ← (1) 中間 finalize chunk: tool 呼び出し決定のシグナル
+
+chunk N+1: LlmChatResult {
+  done: true,
+  content: Some(MessageContent { content: Some(Text("")) }),
+  pending_tool_calls: None,
+  requires_tool_execution: None,
+  usage: Some(Usage { prompt_tokens, completion_tokens, ... }),
+  ..
+}                                     // ← (2) 終端 chunk: ストリーム終端マーカー (Usage のみ)
+```
+
+クライアントは:
+
+- **`pending_tool_calls=Some(non_empty)` または `requires_tool_execution=Some(true)`** が見えた時点で「ツール呼び出しが確定した」と判断し、ツール実行の準備に入って構いません (`done` の値で待つ必要はありません)。
+- **`done=true`** チャンクは「LLM 側のストリーム生成が完了した」だけを意味します。直前に受信した `pending_tool_calls` の中身は (2) の終端チャンクには載りません。
+
+> ⚠️ **アンチパターン**: `done=true` を待ってから `pending_tool_calls` を読むコードは tool_call を取り逃がします。`pending_tool_calls` / `requires_tool_execution` を検出した時点で確定として扱ってください — `done=true` チャンクは終端マーカーだけで、`pending_tool_calls` を運びません。
+
+### tool_call **無し** のテキスト応答
+
+ツールを呼ばずに通常のテキストで完結する応答は単一の `done=true` チャンクで終端します。
+
+```text
+chunk N-1: LlmChatResult { done: false, content: Some(Text(<delta>)), .. }
+chunk N  : LlmChatResult { done: true,  content: Some(Text(<最終 text または "">)),
+                            pending_tool_calls: None,
+                            usage: Some(...), .. }
+```
+
+`done=true` チャンクに最終テキストが乗ります。
 
 ### collect_stream (内部経路)
 
-`MultiMethodPluginRunner::collect_stream` を使うと、ストリームを内部で完全集約した単一 `LlmChatResult` を取得できます (jobworkerp の `STREAMING_TYPE_INTERNAL` 経路)。`ToolCallAccumulator` が delta を再構成し、最終 chunk の `pending_tool_calls` を優先 (= 二重 finalize 防止)。
+`MultiMethodPluginRunner::collect_stream` を使うと、ストリームを内部で完全集約した単一 `LlmChatResult` を取得できます (jobworkerp の `STREAMING_TYPE_INTERNAL` 経路)。`ToolCallAccumulator` が delta を再構成し、**中間 finalize chunk** が運ぶ `pending_tool_calls` を canonical として採用します (= 二重 finalize 防止、`done=true` チャンク側には pending を持たせない)。
 
 ## エラーケース
 
