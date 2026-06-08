@@ -3,7 +3,7 @@ use hf_hub::api::sync::ApiBuilder;
 use jobworkerp_llama_protobuf::protobuf::llama_cpp::{LlamaArg, LlamaRunnerSettings, MediaInput};
 use jobworkerp_llama_protobuf::protobuf::llm::{
     LlmChatArgs, LlmChatResult, LlmCompletionArgs, LlmCompletionResult, llm_chat_args,
-    llm_chat_result, llm_completion_result,
+    llm_chat_result, llm_completion_args, llm_completion_result,
 };
 use llama_cpp_2::{
     context::{
@@ -329,6 +329,12 @@ impl InferenceArgs {
     }
 }
 
+fn cancel_flag_requested(cancel_flag: &Option<Arc<AtomicBool>>) -> bool {
+    cancel_flag
+        .as_ref()
+        .is_some_and(|flag| flag.load(Ordering::Relaxed))
+}
+
 impl std::fmt::Debug for InferenceArgs {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("InferenceArgs")
@@ -346,6 +352,68 @@ impl std::fmt::Debug for InferenceArgs {
             )
             .field("medias", &format!("[{} items]", self.medias.len()))
             .finish()
+    }
+}
+
+fn chat_inference_args(
+    options: llm_chat_args::LlmOptions,
+    json_schema: Option<String>,
+    cancel_flag: Option<Arc<AtomicBool>>,
+) -> InferenceArgs {
+    InferenceArgs {
+        prompt: String::new(),
+        sample_len: None,
+        max_new_tokens: Some(options.max_tokens.unwrap_or(4096)),
+        temperature: options.temperature.map(f64::from),
+        top_p: options.top_p.map(f64::from),
+        repeat_penalty: options.repeat_penalty,
+        repeat_last_n: options.repeat_last_n.map(|v| v as u32),
+        seed: options.seed.map(|s| s as u32),
+        json_schema,
+        medias: Vec::new(),
+        grammar_spec: None,
+        cancel_flag,
+    }
+}
+
+fn completion_inference_args(
+    options: llm_completion_args::LlmOptions,
+    json_schema: Option<String>,
+    cancel_flag: Option<Arc<AtomicBool>>,
+) -> InferenceArgs {
+    InferenceArgs {
+        prompt: String::new(),
+        sample_len: None,
+        max_new_tokens: Some(options.max_tokens.unwrap_or(4096)),
+        temperature: options.temperature.map(f64::from),
+        top_p: options.top_p.map(f64::from),
+        repeat_penalty: options.repeat_penalty,
+        repeat_last_n: options.repeat_last_n.map(|v| v as u32),
+        seed: options.seed.map(|s| s as u32),
+        json_schema,
+        medias: Vec::new(),
+        grammar_spec: None,
+        cancel_flag,
+    }
+}
+
+fn cancelled_completion_result() -> LlmCompletionResult {
+    LlmCompletionResult {
+        content: Some(llm_completion_result::MessageContent {
+            content: Some(llm_completion_result::message_content::Content::Text(
+                String::new(),
+            )),
+        }),
+        reasoning_content: None,
+        done: true,
+        context: None,
+        usage: Some(llm_completion_result::Usage {
+            model: String::new(),
+            prompt_tokens: Some(0),
+            completion_tokens: Some(0),
+            total_prompt_time_sec: None,
+            total_completion_time_sec: Some(0.0),
+        }),
     }
 }
 
@@ -498,7 +566,7 @@ impl AbortGuard {
         flag: Option<Arc<AtomicBool>>,
     ) -> Self {
         let armed = flag.is_some();
-        if let Some(flag) = flag {
+        if armed && let Some(flag) = flag {
             ctx.set_abort_flag(flag);
         }
         Self {
@@ -1011,6 +1079,13 @@ impl LlamaModelWrapper {
             .str_to_token(formatted_prompt, AddBos::Always)
             .with_context(|| "failed to tokenize prompt")?;
         let prompt_tokens = tokens_list.len() as i32;
+        if args.is_cancel_requested() {
+            return Ok(DecodeOutput {
+                text: String::new(),
+                prompt_tokens: prompt_tokens as u32,
+                completion_tokens: 0,
+            });
+        }
 
         // Build the context once (lazy) then take it out of `self` for exclusive
         // use; the guard restores it on every exit path (incl. `?`/panic) so the
@@ -1148,6 +1223,11 @@ impl LlamaModelWrapper {
         let mut output_buffer = String::with_capacity((n_len * 4) as usize);
 
         while n_cur < n_len {
+            if args.is_cancel_requested() {
+                cancelled = true;
+                break;
+            }
+
             // sample the next token
             {
                 // `sample` already calls `llama_sampler_accept` internally, so
@@ -1596,20 +1676,7 @@ impl LlamaModelWrapper {
         // `prompt` is left empty and `medias` is empty because the core path
         // consumes `formatted_prompt` and `bitmaps` directly; only the
         // sampler/limits fields of InferenceArgs are read downstream.
-        let inference_args = InferenceArgs {
-            prompt: String::new(),
-            sample_len: None,
-            max_new_tokens: Some(options.max_tokens.unwrap_or(4096)),
-            temperature: options.temperature.map(f64::from),
-            top_p: options.top_p.map(f64::from),
-            repeat_penalty: options.repeat_penalty,
-            repeat_last_n: options.repeat_last_n.map(|v| v as u32),
-            seed: options.seed.map(|s| s as u32),
-            json_schema: args.json_schema,
-            medias: Vec::new(),
-            grammar_spec: None,
-            cancel_flag,
-        };
+        let inference_args = chat_inference_args(options, args.json_schema, cancel_flag);
 
         let t_start = ggml_time_us();
         let output: DecodeOutput = if medias.is_empty() {
@@ -1742,20 +1809,8 @@ impl LlamaModelWrapper {
                 grammar_lazy: tmpl_result.grammar_lazy,
                 grammar_triggers: tmpl_result.grammar_triggers.clone(),
             });
-        let inference_args = InferenceArgs {
-            prompt: String::new(),
-            sample_len: None,
-            max_new_tokens: Some(options.max_tokens.unwrap_or(4096)),
-            temperature: options.temperature.map(f64::from),
-            top_p: options.top_p.map(f64::from),
-            repeat_penalty: options.repeat_penalty,
-            repeat_last_n: options.repeat_last_n.map(|v| v as u32),
-            seed: options.seed.map(|s| s as u32),
-            json_schema: None,
-            medias: Vec::new(),
-            grammar_spec,
-            cancel_flag,
-        };
+        let mut inference_args = chat_inference_args(options, None, cancel_flag);
+        inference_args.grammar_spec = grammar_spec;
 
         let extra_stops = tmpl_result.additional_stops.clone();
         let t_start = ggml_time_us();
@@ -1843,6 +1898,9 @@ impl LlamaModelWrapper {
         sink: &mut dyn FnMut(&str) -> ControlFlow<()>,
     ) -> Result<LlmCompletionResult> {
         validate_completion_args(&args)?;
+        if cancel_flag_requested(&cancel_flag) {
+            return Ok(cancelled_completion_result());
+        }
 
         let options = args.options.unwrap_or_default();
         let extract_reasoning = options.extract_reasoning_content.unwrap_or(false);
@@ -1856,21 +1914,11 @@ impl LlamaModelWrapper {
             .as_deref()
             .unwrap_or(self.system_prompt.as_str());
         let formatted_prompt = self.format_single_turn_inner(sys, &args.prompt)?;
+        if cancel_flag_requested(&cancel_flag) {
+            return Ok(cancelled_completion_result());
+        }
 
-        let inference_args = InferenceArgs {
-            prompt: String::new(),
-            sample_len: None,
-            max_new_tokens: Some(options.max_tokens.unwrap_or(4096)),
-            temperature: options.temperature.map(f64::from),
-            top_p: options.top_p.map(f64::from),
-            repeat_penalty: options.repeat_penalty,
-            repeat_last_n: options.repeat_last_n.map(|v| v as u32),
-            seed: options.seed.map(|s| s as u32),
-            json_schema: args.json_schema,
-            medias: Vec::new(),
-            grammar_spec: None,
-            cancel_flag,
-        };
+        let inference_args = completion_inference_args(options, args.json_schema, cancel_flag);
 
         let t_start = ggml_time_us();
         let output =
@@ -2529,6 +2577,107 @@ mod tests {
         let args: InferenceArgs = arg.into();
         assert!(args.prompt.is_empty());
         assert_eq!(args.medias.len(), 2);
+    }
+
+    #[test]
+    fn test_chat_inference_args_preserve_cancel_flag() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let args = chat_inference_args(
+            llm_chat_args::LlmOptions {
+                max_tokens: Some(32),
+                ..Default::default()
+            },
+            None,
+            Some(cancel.clone()),
+        );
+
+        cancel.store(true, Ordering::Relaxed);
+        assert!(
+            args.is_cancel_requested(),
+            "chat cancellation must remain visible to the decode layer"
+        );
+    }
+
+    #[test]
+    fn test_completion_inference_args_preserve_cancel_flag() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let args = completion_inference_args(
+            llm_completion_args::LlmOptions {
+                max_tokens: Some(32),
+                ..Default::default()
+            },
+            None,
+            Some(cancel.clone()),
+        );
+
+        cancel.store(true, Ordering::Relaxed);
+        assert!(
+            args.is_cancel_requested(),
+            "completion cancellation must remain visible to the decode layer"
+        );
+    }
+
+    #[test]
+    fn test_cancel_flag_requested_reflects_token_bridge_flag() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let flag = Some(cancel.clone());
+
+        assert!(
+            !cancel_flag_requested(&flag),
+            "fresh token bridge flag must start as not cancelled"
+        );
+        cancel.store(true, Ordering::Relaxed);
+        assert!(
+            cancel_flag_requested(&flag),
+            "set_cancellation_token bridge flag must become visible to model input/decode"
+        );
+    }
+
+    #[test]
+    fn test_cancelled_completion_result_is_terminal_empty_output() {
+        let result = cancelled_completion_result();
+
+        assert!(result.done, "cancelled completion result must be terminal");
+        assert_eq!(
+            result
+                .usage
+                .as_ref()
+                .and_then(|usage| usage.completion_tokens),
+            Some(0),
+            "cancelled completion must not report generated tokens"
+        );
+        match result.content.and_then(|content| content.content) {
+            Some(llm_completion_result::message_content::Content::Text(text)) => {
+                assert!(text.is_empty(), "cancelled completion text must be empty");
+            }
+            other => panic!("cancelled completion must be empty text, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_text_decode_loop_polls_cancel_before_sampling() {
+        let source = include_str!("model.rs");
+
+        assert!(
+            source.contains("while n_cur < n_len {\n            if args.is_cancel_requested()"),
+            "decode loop must poll cancellation before sampling the next token"
+        );
+    }
+
+    #[test]
+    fn test_metal_abort_callback_commits_deferred_buffers_without_capture() {
+        let source = include_str!(
+            "../../modules/llama-cpp-rs/llama-cpp-sys-2/llama.cpp/ggml/src/ggml-metal/ggml-metal-context.m"
+        );
+
+        assert!(
+            source.contains("ctx->abort_callback != NULL || (use_capture && ctx->capture_started)"),
+            "Metal abort callbacks must drive deferred command-buffer commits outside GPU capture"
+        );
+        assert!(
+            source.contains("const bool abort_requested = ctx->abort_callback && ctx->abort_callback(ctx->abort_callback_data);"),
+            "Metal backend must poll the abort callback before committing deferred command buffers"
+        );
     }
 
     /// Regression test: a prompt longer than the configured `n_batch` must be

@@ -1,3 +1,6 @@
 [submodule "modules/command-utils"]
 	path = modules/command-utils
 	url = https://github.com/sutr-app/command-utils
+[submodule "modules/llama-cpp-rs"]
+	path = modules/llama-cpp-rs
+	url = https://github.com/sutr-app/llama-cpp-rs.git
