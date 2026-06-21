@@ -72,6 +72,10 @@ jobworkerp 標準 completion runner (Ollama / GenAI) との互換性差分:
 - args: `llama-protobuf/protobuf/jobworkerp/runner/llm/completion_args.proto`
 - result: `llama-protobuf/protobuf/jobworkerp/runner/llm/completion_result.proto`
 
+## キャンセル
+
+`chat` / `completion` の streaming 実行では、JobworkerP の cancel token を共有 cancel flag に変換し、sink と `llama.cpp` の abort callback の両方で監視します。sink はトークン境界で停止し、abort callback は長い prompt prefill や `llama_decode` 中のキャンセルを backend が対応する粒度で中断します。cancel が観測されると、プラグインは部分 KV キャッシュを書き戻さずにキャンセル扱いで終了します。
+
 ## Runner Settings
 
 プラグインの初期化には `llama_cpp.LlamaRunnerSettings` を使います。

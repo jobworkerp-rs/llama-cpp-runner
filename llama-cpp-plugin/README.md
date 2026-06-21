@@ -72,6 +72,10 @@ Relevant protobuf:
 - args: `llama-protobuf/protobuf/jobworkerp/runner/llm/completion_args.proto`
 - result: `llama-protobuf/protobuf/jobworkerp/runner/llm/completion_result.proto`
 
+## Cancellation
+
+For streaming `chat` / `completion`, the JobworkerP cancel token is converted into a shared cancel flag and observed by both the output sink and the `llama.cpp` abort callback. The sink stops at token boundaries; the abort callback can interrupt long prompt prefill and in-flight `llama_decode` calls at the granularity supported by the active backend. If cancellation is observed, the plugin exits as cancellation without writing back partial KV-cache metadata.
+
 ## Runner Settings
 
 The plugin is initialized with `llama_cpp.LlamaRunnerSettings`.

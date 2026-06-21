@@ -271,6 +271,9 @@ fn dispatch_chat(
         Ok(a) => a,
         Err(e) => return DispatchOutcome::Err(anyhow!("decode error: {e}")),
     };
+    if cancel.load(Ordering::Relaxed) {
+        return DispatchOutcome::Cancelled;
+    }
     tracing::debug!("LLMRunner {METHOD_CHAT}: {args:?}");
     let mut sink = make_cancel_sink(cancel.clone());
     let result = match wrapper.run_chat_with_sink(args, Some(cancel.clone()), &mut sink) {
@@ -293,6 +296,9 @@ fn dispatch_completion(
         Ok(a) => a,
         Err(e) => return DispatchOutcome::Err(anyhow!("decode error: {e}")),
     };
+    if cancel.load(Ordering::Relaxed) {
+        return DispatchOutcome::Cancelled;
+    }
     tracing::debug!("LLMRunner {METHOD_COMPLETION}: {args:?}");
     let mut sink = make_cancel_sink(cancel.clone());
     let result = match wrapper.run_completion_with_sink(args, Some(cancel.clone()), &mut sink) {
@@ -2178,6 +2184,69 @@ LLAMA_SYSTEM_PROMPT=You are a helpful assistant.
             matches!(result, Err(ref e) if e == CANCELLED),
             "precancelled token must surface as Err(CANCELLED), got {result:?}"
         );
+        tokio::task::spawn_blocking(move || drop(plugin))
+            .await
+            .unwrap();
+    }
+
+    /// A token cancelled after `run()` has spawned blocking work must still be
+    /// converted into the per-request cancel flag used by the completion path.
+    /// Holding the model mutex makes the blocking task wait at the input
+    /// boundary; after cancellation, releasing the lock would otherwise expose
+    /// "llama_model is not loaded" if the token was not propagated.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_run_completion_token_cancels_while_waiting_for_model_lock() {
+        use jobworkerp_llama_protobuf::protobuf::llm::llm_completion_args;
+
+        let mut plugin = LlamaCppPlugin::new();
+        let (token, cancel_handle) = make_fresh_token();
+        plugin.set_cancellation_token(token);
+
+        let model = plugin.llama_model.clone();
+        let (locked_tx, locked_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let lock_holder = tokio::task::spawn_blocking(move || {
+            let guard = model.lock().expect("model mutex");
+            let _ = locked_tx.send(());
+            let _ = release_rx.recv();
+            drop(guard);
+        });
+        locked_rx.await.expect("lock holder should acquire mutex");
+
+        let request = LlmCompletionArgs {
+            prompt: "This request should be cancelled before model input.".to_string(),
+            options: Some(llm_completion_args::LlmOptions {
+                max_tokens: Some(8),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let result = {
+            let run = plugin.run(
+                request.encode_to_vec(),
+                HashMap::new(),
+                Some(METHOD_COMPLETION.into()),
+            );
+            tokio::pin!(run);
+
+            tokio::task::yield_now().await;
+            cancel_handle.cancel();
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            release_tx
+                .send(())
+                .expect("lock holder should still be waiting");
+
+            let (result, _) = tokio::time::timeout(std::time::Duration::from_secs(2), run)
+                .await
+                .expect("cancelled completion run should finish promptly");
+            result
+        };
+        lock_holder.await.expect("lock holder should exit");
+        assert!(
+            matches!(result, Err(ref e) if e == CANCELLED),
+            "cancelled token must surface as Err(CANCELLED), got {result:?}"
+        );
+
         tokio::task::spawn_blocking(move || drop(plugin))
             .await
             .unwrap();

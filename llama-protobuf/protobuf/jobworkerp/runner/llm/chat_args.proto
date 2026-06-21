@@ -118,6 +118,18 @@ message LLMChatArgs {
     // Multiple tool execution requests
     message ToolExecutionRequests { repeated ToolExecutionRequest requests = 1; }
 
+    // One client-executed tool result. Carried on a ChatRole::TOOL message
+    // whose preceding ASSISTANT message included a matching call_id.
+    message ToolResult {
+      string call_id = 1;   // REQUIRED — matches an earlier ToolCall.call_id
+      string fn_name = 2;   // optional; required by some providers (e.g. Gemini), unused by OAI tool messages
+      string content = 3;   // the tool's output text (typically JSON)
+      bool is_error = 4;    // true when the tool failed; runner translation is provider-specific
+    }
+
+    // Multiple client-executed tool results (parallel tool round).
+    message ToolResults { repeated ToolResult results = 1; }
+
     oneof content {
       // The role of the message.
       string text = 1;
@@ -130,6 +142,10 @@ message LLMChatArgs {
 
       // Tool execution requests from client (TOOL role, requesting server to execute)
       ToolExecutionRequests tool_execution_requests = 4;
+
+      // Client-executed tool results (TOOL role). Replaces the legacy use of
+      // ToolExecutionRequests on TOOL role.
+      ToolResults tool_results = 5;
     }
   }
 
