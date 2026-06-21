@@ -45,8 +45,13 @@ jobworkerp-plugin-abi-macros = { git = "https://github.com/jobworkerp-rs/jobwork
 # `mtmd` feature enables the multimodal projector module used by image/audio inputs.
 # Fork adds `MtmdInputChunks::eval_chunk` (single-chunk partial prefill) for
 # multimodal KV-cache prefix reuse, not available upstream.
-llama-cpp-2 = { git = "https://github.com/sutr-app/llama-cpp-rs", branch = "abort", features = ["mtmd", "llguidance"] }
-llama-cpp-sys-2 = { git = "https://github.com/sutr-app/llama-cpp-rs", branch = "abort" }
+# Pinned to `abort2`: the `abort` branch was rebuilt on llama-cpp-2 0.1.150 but
+# dropped the fork's OpenAI-compat (tool-calling) patches when upstream PR #1037
+# intentionally removed OpenAI-compatible API support. `abort2` predates that
+# removal (0.1.147) and carries all three fork patches the plugin depends on:
+# oaicompat tool-calling, abort callback, and `MtmdInputChunks::eval_chunk`.
+llama-cpp-2 = { git = "https://github.com/sutr-app/llama-cpp-rs", branch = "abort2", features = ["mtmd", "llguidance"] }
+llama-cpp-sys-2 = { git = "https://github.com/sutr-app/llama-cpp-rs", branch = "abort2" }
 once_cell = { version = "1" }
 # Force OpenSSL to be statically linked (vendored) so the resulting plugin .so
 # does not depend on the host's libssl/libcrypto versions. Without this, the
