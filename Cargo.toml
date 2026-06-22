@@ -41,6 +41,8 @@ envy = { version = "0.4" }
 futures = { version = "0.3" }
 hf-hub = { version = "0.5" }
 itertools = { version = "0.14" }
+minijinja = { version = "2", features = ["json"] }
+minijinja-contrib = { version = "2", features = ["pycompat"] }
 # New V2 ABI: shared between jobworkerp-rs host and every plugin. The ABI
 # is `#[repr(C)]` except for FfiFuture, so host/plugin can resolve their
 # own tokio / tokio-util / rustc independently.

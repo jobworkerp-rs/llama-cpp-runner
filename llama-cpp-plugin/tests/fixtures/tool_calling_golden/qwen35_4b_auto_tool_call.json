@@ -1,0 +1,233 @@
+{
+  "fixture_version": 1,
+  "is_synthetic": false,
+  "model_family": "qwen35_tool_call",
+  "model_repo": "unsloth/Qwen3.5-4B-GGUF",
+  "model_file": "Qwen3.5-4B-UD-Q4_K_XL.gguf",
+  "scenario": "auto_tool_choice_enable_thinking_false",
+  "params": {
+    "messages_json": [
+      {
+        "role": "system",
+        "content": "You are a tool caller."
+      },
+      {
+        "role": "user",
+        "content": "What is the weather in Tokyo? Use get_weather."
+      }
+    ],
+    "tools_json": [
+      {
+        "type": "function",
+        "function": {
+          "name": "get_weather",
+          "description": "Get the current weather in a given city.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "city": {
+                "type": "string",
+                "description": "City name, e.g. Tokyo"
+              }
+            },
+            "required": [
+              "city"
+            ]
+          }
+        }
+      }
+    ],
+    "tool_choice": "auto",
+    "parallel_tool_calls": false,
+    "enable_thinking": false,
+    "chat_template_kwargs": {
+      "enable_thinking": false
+    }
+  },
+  "template": {
+    "prompt": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Get the current weather in a given city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name, e.g. Tokyo\"}}, \"required\": [\"city\"]}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>\n\nYou are a tool caller.<|im_end|>\n<|im_start|>user\nWhat is the weather in Tokyo? Use get_weather.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+    "grammar": "root ::= tool-call\nspace ::= | \" \" | \"\\n\"{1,2} [ \\t]{0,20}\ntool-call ::= \"<tool_call>\\n\" space (tool-get-weather) space \"</tool_call>\"\ntool-get-weather ::= (\"<function=\" \"get_weather\" \">\\n\") space tool-get-weather-arg-city space \"</function>\\n\"\ntool-get-weather-arg-city ::= (\"<parameter=\" \"city\" \">\\n\") \"\" until-suffix \"</parameter>\\n\"\nuntil-suffix ::= ([^<] | \"<\" [^/] | \"</\" [^p] | \"</p\" [^a] | \"</pa\" [^r] | \"</par\" [^a] | \"</para\" [^m] | \"</param\" [^e] | \"</parame\" [^t] | \"</paramet\" [^e] | \"</paramete\" [^r] | \"</parameter\" [^>] | \"</parameter>\" [^\\n])*\n",
+    "grammar_lazy": true,
+    "grammar_triggers": [
+      {
+        "trigger_type": "Word",
+        "value": "<tool_call>\n",
+        "token": null
+      }
+    ],
+    "preserved_tokens": [
+      "<think>",
+      "</think>",
+      "<tool_call>",
+      "</tool_call>",
+      "<function=",
+      ">",
+      "</function>",
+      "<parameter=",
+      "</parameter>"
+    ],
+    "additional_stops": [],
+    "generation_prompt": "<|im_start|>assistant\n<think>\n\n</think>\n\n",
+    "chat_format": 2,
+    "parser": "{\"parsers\":[{\"type\":\"epsilon\"},{\"type\":\"epsilon\"},{\"type\":\"epsilon\"},{\"delimiters\":[\"</parameter>\\n\"],\"type\":\"until\"},{\"child\":3,\"name\":\"until-suffix\",\"trigger\":false,\"type\":\"rule\"},{\"name\":\"until-suffix\",\"type\":\"ref\"},{\"children\":[],\"type\":\"choice\"},{\"literal\":\"</parameter>\\n\",\"type\":\"literal\"},{\"child\":7,\"tag\":\"tool-arg-close\",\"type\":\"tag\"},{\"child\":8,\"type\":\"atomic\"},{\"child\":4,\"name\":\"tool-get_weather-arg-city-schema\",\"raw\":true,\"schema\":{\"description\":\"City name, e.g. Tokyo\",\"type\":\"string\"},\"type\":\"schema\"},{\"child\":10,\"tag\":\"tool-arg-string-value\",\"type\":\"tag\"},{\"literal\":\"city\",\"type\":\"literal\"},{\"child\":12,\"tag\":\"tool-arg-name\",\"type\":\"tag\"},{\"child\":13,\"type\":\"atomic\"},{\"literal\":\"<parameter=\",\"type\":\"literal\"},{\"children\":[15,14],\"type\":\"sequence\"},{\"literal\":\">\\n\",\"type\":\"literal\"},{\"children\":[15,14,17],\"type\":\"sequence\"},{\"child\":18,\"tag\":\"tool-arg-open\",\"type\":\"tag\"},{\"child\":19,\"type\":\"atomic\"},{\"literal\":\"\",\"type\":\"literal\"},{\"children\":[20,21],\"type\":\"sequence\"},{\"children\":[20,21,11],\"type\":\"sequence\"},{\"children\":[20,21,11,9],\"type\":\"sequence\"},{\"child\":24,\"tag\":\"tool-arg\",\"type\":\"tag\"},{\"child\":25,\"name\":\"tool-get-weather-arg-city\",\"trigger\":false,\"type\":\"rule\"},{\"name\":\"tool-get-weather-arg-city\",\"type\":\"ref\"},{\"type\":\"epsilon\"},{\"children\":[28,26],\"type\":\"sequence\"},{\"type\":\"epsilon\"},{\"literal\":\"<parameter=\",\"type\":\"literal\"},{\"child\":31,\"type\":\"and\"},{\"literal\":\"get_weather\",\"type\":\"literal\"},{\"child\":33,\"tag\":\"tool-name\",\"type\":\"tag\"},{\"child\":34,\"type\":\"atomic\"},{\"literal\":\"<function=\",\"type\":\"literal\"},{\"children\":[36,35],\"type\":\"sequence\"},{\"literal\":\">\\n\",\"type\":\"literal\"},{\"children\":[36,35,38],\"type\":\"sequence\"},{\"child\":39,\"tag\":\"tool-open\",\"type\":\"tag\"},{\"child\":40,\"type\":\"atomic\"},{\"type\":\"epsilon\"},{\"type\":\"space\"},{\"children\":[41,30],\"type\":\"sequence\"},{\"children\":[41,30,43],\"type\":\"sequence\"},{\"children\":[41,30,43,28,26],\"type\":\"sequence\"},{\"literal\":\"</function>\\n\",\"type\":\"literal\"},{\"child\":47,\"tag\":\"tool-close\",\"type\":\"tag\"},{\"child\":48,\"type\":\"atomic\"},{\"type\":\"space\"},{\"children\":[41,30,43,28,26,50],\"type\":\"sequence\"},{\"children\":[41,30,43,28,26,50,49],\"type\":\"sequence\"},{\"child\":52,\"name\":\"tool-get-weather\",\"trigger\":false,\"type\":\"rule\"},{\"name\":\"tool-get-weather\",\"type\":\"ref\"},{\"children\":[53],\"type\":\"choice\"},{\"type\":\"epsilon\"},{\"type\":\"space\"},{\"type\":\"space\"},{\"literal\":\"<tool_call>\\n\",\"type\":\"literal\"},{\"children\":[59,58],\"type\":\"sequence\"},{\"children\":[59,58,55],\"type\":\"sequence\"},{\"children\":[59,58,55,57],\"type\":\"sequence\"},{\"literal\":\"</tool_call>\",\"type\":\"literal\"},{\"children\":[59,58,55,57,63],\"type\":\"sequence\"},{\"child\":64,\"name\":\"tool-call\",\"trigger\":true,\"type\":\"rule\"},{\"name\":\"tool-call\",\"type\":\"ref\"},{\"child\":65,\"max_count\":1,\"min_count\":0,\"type\":\"repetition\"},{\"delimiters\":[\"<tool_call>\\n\"],\"type\":\"until\"},{\"type\":\"end\"},{\"child\":68,\"tag\":\"content\",\"type\":\"tag\"},{\"child\":70,\"max_count\":1,\"min_count\":0,\"type\":\"repetition\"},{\"children\":[1,71],\"type\":\"sequence\"},{\"children\":[1,71,67],\"type\":\"sequence\"},{\"children\":[1,71,67,69],\"type\":\"sequence\"},{\"literal\":\"<|im_start|>assistant\\n\",\"type\":\"literal\"},{\"type\":\"space\"},{\"children\":[75,76,1,71,67,69],\"type\":\"sequence\"}],\"root\":77,\"rules\":{\"tool-call\":65,\"tool-get-weather\":53,\"tool-get-weather-arg-city\":26,\"until-suffix\":4}}",
+    "parse_tool_calls": true
+  },
+  "parse": [
+    {
+      "name": "generated_tool_call",
+      "raw_response": "<tool_call>\n<function=get_weather>\n<parameter=city>\nTokyo\n</parameter>\n</function>\n</tool_call>",
+      "parsed_json": {
+        "role": "assistant",
+        "content": "<think>\n\n</think>\n\n",
+        "tool_calls": [
+          {
+            "type": "function",
+            "function": {
+              "name": "get_weather",
+              "arguments": "{\"city\":\"Tokyo\"}"
+            },
+            "id": "H5FDGOev2DBfYKbVowp56OBJnYy9XR3h"
+          }
+        ]
+      }
+    }
+  ],
+  "streaming": [
+    {
+      "name": "split_tool_call_tags",
+      "chunks": [
+        "",
+        "<tool_call>",
+        "\n",
+        "<",
+        "function",
+        "=get",
+        "_weather",
+        ">",
+        "\n",
+        "<",
+        "parameter",
+        "=",
+        "city",
+        ">",
+        "\n",
+        "Tok",
+        "yo",
+        "\n",
+        "</",
+        "parameter",
+        ">",
+        "\n",
+        "</",
+        "function",
+        ">",
+        "\n",
+        "</tool_call>",
+        ""
+      ],
+      "deltas": [
+        [
+          {
+            "content": "<think>\n\n</think>\n\n"
+          }
+        ],
+        [],
+        [],
+        [],
+        [],
+        [],
+        [],
+        [],
+        [
+          {
+            "tool_calls": [
+              {
+                "index": 0,
+                "id": "JMtd8kmvCHpk0v9079xwVFZUzVcMuQmi",
+                "type": "function",
+                "function": {
+                  "name": "get_weather",
+                  "arguments": "{"
+                }
+              }
+            ]
+          }
+        ],
+        [],
+        [],
+        [],
+        [],
+        [],
+        [
+          {
+            "tool_calls": [
+              {
+                "index": 0,
+                "function": {
+                  "arguments": "\"city\":\""
+                }
+              }
+            ]
+          }
+        ],
+        [
+          {
+            "tool_calls": [
+              {
+                "index": 0,
+                "function": {
+                  "arguments": "Tok"
+                }
+              }
+            ]
+          }
+        ],
+        [
+          {
+            "tool_calls": [
+              {
+                "index": 0,
+                "function": {
+                  "arguments": "yo"
+                }
+              }
+            ]
+          }
+        ],
+        [],
+        [],
+        [],
+        [],
+        [
+          {
+            "tool_calls": [
+              {
+                "index": 0,
+                "function": {
+                  "arguments": "\""
+                }
+              }
+            ]
+          }
+        ],
+        [],
+        [],
+        [],
+        [
+          {
+            "tool_calls": [
+              {
+                "index": 0,
+                "function": {
+                  "arguments": "}"
+                }
+              }
+            ]
+          }
+        ],
+        [],
+        []
+      ]
+    }
+  ]
+}

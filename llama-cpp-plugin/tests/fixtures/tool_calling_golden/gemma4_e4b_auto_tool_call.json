@@ -1,0 +1,201 @@
+{
+  "fixture_version": 1,
+  "is_synthetic": false,
+  "model_family": "gemma4_tool_call",
+  "model_repo": "unsloth/gemma-4-E4B-it-GGUF",
+  "model_file": "gemma-4-E4B-it-UD-Q4_K_XL.gguf",
+  "scenario": "auto_tool_choice_enable_thinking_false",
+  "params": {
+    "messages_json": [
+      {
+        "role": "system",
+        "content": "You are a tool caller."
+      },
+      {
+        "role": "user",
+        "content": "What is the weather in Tokyo? Use get_weather."
+      }
+    ],
+    "tools_json": [
+      {
+        "type": "function",
+        "function": {
+          "name": "get_weather",
+          "description": "Get the current weather in a given city.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "city": {
+                "type": "string",
+                "description": "City name, e.g. Tokyo"
+              }
+            },
+            "required": [
+              "city"
+            ]
+          }
+        }
+      }
+    ],
+    "tool_choice": "auto",
+    "parallel_tool_calls": false,
+    "enable_thinking": false,
+    "chat_template_kwargs": {
+      "enable_thinking": false
+    }
+  },
+  "template": {
+    "prompt": "<|turn>system\nYou are a tool caller.<|tool>declaration:get_weather{description:<|\"|>Get the current weather in a given city.<|\"|>,parameters:{properties:{city:{description:<|\"|>City name, e.g. Tokyo<|\"|>,type:<|\"|>STRING<|\"|>}},required:[<|\"|>city<|\"|>],type:<|\"|>OBJECT<|\"|>}}<tool|><turn|>\n<|turn>user\nWhat is the weather in Tokyo? Use get_weather.<turn|>\n<|turn>model\n",
+    "grammar": "gemma4-array ::= \"[\" space (\"]\" | gemma4-value (\",\" space gemma4-value)* space \"]\")\ngemma4-bool ::= json-bool\ngemma4-dict ::= \"{\" space (\"}\" | gemma4-dict-kv (\",\" space gemma4-dict-kv)* space \"}\")\ngemma4-dict-key ::= gemma4-dict-key-name \":\"\ngemma4-dict-key-name ::= [^:}]+\ngemma4-dict-kv ::= gemma4-dict-key space gemma4-value\ngemma4-null ::= json-null\ngemma4-number ::= json-number\ngemma4-string ::= \"<|\\\"|>\" gemma4-string-content \"<|\\\"|>\"\ngemma4-string-content ::= ([^<] | \"<\" [^|] | \"<|\" [^\"] | \"<|\\\"\" [^|] | \"<|\\\"|\" [^>])*\ngemma4-value ::= gemma4-string | gemma4-dict | gemma4-array | gemma4-number | gemma4-bool | gemma4-null\njson-bool ::= (\"true\" | \"false\") space\njson-null ::= \"null\" space\njson-number ::= \"-\"? (\"0\" | [1-9] [0-9]*) (\".\" [0-9]+)? ((\"e\" | \"E\") [+-]? [0-9]+)? space\nroot ::= tool-call\nspace ::= | \" \" | \"\\n\"{1,2} [ \\t]{0,20}\ntool-call ::= (\"<|tool_call>call:\" (tool-get-weather) \"<tool_call|>\")?\ntool-get-weather ::= (\"get_weather\") gemma4-dict\n",
+    "grammar_lazy": true,
+    "grammar_triggers": [
+      {
+        "trigger_type": "Word",
+        "value": "<|tool_call>",
+        "token": null
+      }
+    ],
+    "preserved_tokens": [
+      "<|channel>",
+      "<channel|>",
+      "<|tool_call>",
+      "<tool_call|>",
+      "<|turn>"
+    ],
+    "additional_stops": [],
+    "generation_prompt": "<|turn>model\n",
+    "chat_format": 3,
+    "parser": "{\"parsers\":[{\"literal\":\"<|turn>model\\n\",\"type\":\"literal\"},{\"child\":0,\"name\":\"start\",\"trigger\":false,\"type\":\"rule\"},{\"name\":\"start\",\"type\":\"ref\"},{\"literal\":\"<channel|>\",\"type\":\"literal\"},{\"delimiters\":[\"<channel|>\"],\"type\":\"until\"},{\"type\":\"space\"},{\"literal\":\"<|channel>thought\",\"type\":\"literal\"},{\"children\":[6,5],\"type\":\"sequence\"},{\"children\":[6,5,4],\"type\":\"sequence\"},{\"children\":[6,5,4,3],\"type\":\"sequence\"},{\"child\":9,\"tag\":\"content\",\"type\":\"tag\"},{\"child\":10,\"name\":\"thought\",\"trigger\":false,\"type\":\"rule\"},{\"name\":\"thought\",\"type\":\"ref\"},{\"literal\":\"thought\",\"type\":\"literal\"},{\"child\":13,\"type\":\"not\"},{\"literal\":\"<|channel>\",\"type\":\"literal\"},{\"children\":[15,14],\"type\":\"sequence\"},{\"child\":16,\"max_count\":-1,\"min_count\":0,\"type\":\"repetition\"},{\"child\":17,\"grammar\":\"\",\"type\":\"gbnf\"},{\"literal\":\"<|channel>\",\"type\":\"literal\"},{\"child\":19,\"type\":\"not\"},{\"name\":\"thought\",\"type\":\"ref\"},{\"literal\":\"<|channel>\",\"type\":\"literal\"},{\"child\":22,\"type\":\"and\"},{\"children\":[23,18],\"type\":\"sequence\"},{\"children\":[23,18,11],\"type\":\"sequence\"},{\"children\":[25,20],\"type\":\"choice\"},{\"delimiters\":[\"<|\\\"|>\"],\"type\":\"until\"},{\"child\":27,\"name\":\"gemma4-string-content\",\"trigger\":false,\"type\":\"rule\"},{\"name\":\"gemma4-string-content\",\"type\":\"ref\"},{\"literal\":\"<|\\\"|>\",\"type\":\"literal\"},{\"name\":\"gemma4-string-content\",\"type\":\"ref\"},{\"literal\":\"<|\\\"|>\",\"type\":\"literal\"},{\"children\":[32,28],\"type\":\"sequence\"},{\"children\":[32,28,30],\"type\":\"sequence\"},{\"child\":34,\"name\":\"gemma4-string\",\"trigger\":false,\"type\":\"rule\"},{\"name\":\"gemma4-string\",\"type\":\"ref\"},{\"type\":\"any\"},{\"child\":37,\"name\":\"json-bool\",\"trigger\":false,\"type\":\"rule\"},{\"literal\":\"true\",\"type\":\"literal\"},{\"literal\":\"false\",\"type\":\"literal\"},{\"children\":[39,40],\"type\":\"choice\"},{\"type\":\"space\"},{\"children\":[41,42],\"type\":\"sequence\"},{\"child\":43,\"name\":\"json-bool\",\"trigger\":false,\"type\":\"rule\"},{\"name\":\"json-bool\",\"type\":\"ref\"},{\"child\":44,\"name\":\"gemma4-bool\",\"trigger\":false,\"type\":\"rule\"},{\"name\":\"gemma4-bool\",\"type\":\"ref\"},{\"type\":\"any\"},{\"child\":48,\"name\":\"json-null\",\"trigger\":false,\"type\":\"rule\"},{\"literal\":\"null\",\"type\":\"literal\"},{\"type\":\"space\"},{\"children\":[50,51],\"type\":\"sequence\"},{\"child\":52,\"name\":\"json-null\",\"trigger\":false,\"type\":\"rule\"},{\"name\":\"json-null\",\"type\":\"ref\"},{\"child\":53,\"name\":\"gemma4-null\",\"trigger\":false,\"type\":\"rule\"},{\"name\":\"gemma4-null\",\"type\":\"ref\"},{\"type\":\"any\"},{\"child\":57,\"name\":\"json-number\",\"trigger\":false,\"type\":\"rule\"},{\"max_count\":1,\"min_count\":1,\"negated\":false,\"pattern\":\"[1-9]\",\"ranges\":[{\"end\":57,\"start\":49}],\"type\":\"chars\"},{\"max_count\":-1,\"min_count\":1,\"negated\":false,\"pattern\":\"[0-9]\",\"ranges\":[{\"end\":57,\"start\":48}],\"type\":\"chars\"},{\"literal\":\"0\",\"type\":\"literal\"},{\"max_count\":-1,\"min_count\":0,\"negated\":false,\"pattern\":\"[0-9]\",\"ranges\":[{\"end\":57,\"start\":48}],\"type\":\"chars\"},{\"children\":[59,62],\"type\":\"sequence\"},{\"children\":[61,63],\"type\":\"choice\"},{\"literal\":\".\",\"type\":\"literal\"},{\"children\":[65,60],\"type\":\"sequence\"},{\"literal\":\"e\",\"type\":\"literal\"},{\"literal\":\"E\",\"type\":\"literal\"},{\"children\":[67,68],\"type\":\"choice\"},{\"max_count\":1,\"min_count\":1,\"negated\":false,\"pattern\":\"[+-]\",\"ranges\":[{\"end\":43,\"start\":43},{\"end\":45,\"start\":45}],\"type\":\"chars\"},{\"child\":70,\"max_count\":1,\"min_count\":0,\"type\":\"repetition\"},{\"children\":[69,71,60],\"type\":\"sequence\"},{\"max_count\":1,\"min_count\":1,\"negated\":false,\"pattern\":\"[0-9.eE+-]\",\"ranges\":[{\"end\":57,\"start\":48},{\"end\":46,\"start\":46},{\"end\":101,\"start\":101},{\"end\":69,\"start\":69},{\"end\":43,\"start\":43},{\"end\":45,\"start\":45}],\"type\":\"chars\"},{\"child\":73,\"type\":\"not\"},{\"literal\":\"-\",\"type\":\"literal\"},{\"child\":75,\"max_count\":1,\"min_count\":0,\"type\":\"repetition\"},{\"child\":66,\"max_count\":1,\"min_count\":0,\"type\":\"repetition\"},{\"child\":72,\"max_count\":1,\"min_count\":0,\"type\":\"repetition\"},{\"type\":\"space\"},{\"children\":[76,64,77,78,74,79],\"type\":\"sequence\"},{\"child\":80,\"name\":\"json-number\",\"trigger\":false,\"type\":\"rule\"},{\"name\":\"json-number\",\"type\":\"ref\"},{\"child\":81,\"name\":\"gemma4-number\",\"trigger\":false,\"type\":\"rule\"},{\"name\":\"gemma4-number\",\"type\":\"ref\"},{\"literal\":\":\",\"type\":\"literal\"},{\"max_count\":-1,\"min_count\":1,\"negated\":true,\"pattern\":\"[^:}]\",\"ranges\":[{\"end\":58,\"start\":58},{\"end\":125,\"start\":125}],\"type\":\"chars\"},{\"child\":86,\"name\":\"gemma4-dict-key-name\",\"trigger\":false,\"type\":\"rule\"},{\"name\":\"gemma4-dict-key-name\",\"type\":\"ref\"},{\"children\":[87,85],\"type\":\"sequence\"},{\"child\":89,\"name\":\"gemma4-dict-key\",\"trigger\":false,\"type\":\"rule\"},{\"name\":\"gemma4-dict-key\",\"type\":\"ref\"},{\"name\":\"gemma4-value\",\"type\":\"ref\"},{\"type\":\"space\"},{\"name\":\"gemma4-dict-key\",\"type\":\"ref\"},{\"children\":[90,93],\"type\":\"sequence\"},{\"children\":[90,93,140],\"type\":\"sequence\"},{\"child\":96,\"name\":\"gemma4-dict-kv\",\"trigger\":false,\"type\":\"rule\"},{\"name\":\"gemma4-dict-kv\",\"type\":\"ref\"},{\"type\":\"any\"},{\"child\":99,\"name\":\"gemma4-dict\",\"trigger\":false,\"type\":\"rule\"},{\"type\":\"space\"},{\"name\":\"gemma4-dict-kv\",\"type\":\"ref\"},{\"literal\":\",\",\"type\":\"literal\"},{\"children\":[103,101,97],\"type\":\"sequence\"},{\"child\":104,\"max_count\":-1,\"min_count\":0,\"type\":\"repetition\"},{\"children\":[97,105],\"type\":\"sequence\"},{\"literal\":\"{\",\"type\":\"literal\"},{\"literal\":\"}\",\"type\":\"literal\"},{\"literal\":\"}\",\"type\":\"literal\"},{\"children\":[97,105,101,109],\"type\":\"sequence\"},{\"children\":[108,110],\"type\":\"choice\"},{\"children\":[107,101,111],\"type\":\"sequence\"},{\"child\":112,\"name\":\"gemma4-dict\",\"trigger\":false,\"type\":\"rule\"},{\"name\":\"gemma4-dict\",\"type\":\"ref\"},{\"type\":\"any\"},{\"child\":115,\"name\":\"gemma4-array\",\"trigger\":false,\"type\":\"rule\"},{\"type\":\"space\"},{\"name\":\"gemma4-value\",\"type\":\"ref\"},{\"literal\":\",\",\"type\":\"literal\"},{\"children\":[119,117,140],\"type\":\"sequence\"},{\"child\":120,\"max_count\":-1,\"min_count\":0,\"type\":\"repetition\"},{\"children\":[140,121],\"type\":\"sequence\"},{\"literal\":\"[\",\"type\":\"literal\"},{\"literal\":\"]\",\"type\":\"literal\"},{\"literal\":\"]\",\"type\":\"literal\"},{\"children\":[140,121,117,125],\"type\":\"sequence\"},{\"children\":[124,126],\"type\":\"choice\"},{\"children\":[123,117,127],\"type\":\"sequence\"},{\"child\":128,\"name\":\"gemma4-array\",\"trigger\":false,\"type\":\"rule\"},{\"name\":\"gemma4-array\",\"type\":\"ref\"},{\"type\":\"any\"},{\"child\":131,\"name\":\"gemma4-value\",\"trigger\":false,\"type\":\"rule\"},{\"name\":\"gemma4-string\",\"type\":\"ref\"},{\"name\":\"gemma4-dict\",\"type\":\"ref\"},{\"name\":\"gemma4-array\",\"type\":\"ref\"},{\"name\":\"gemma4-number\",\"type\":\"ref\"},{\"name\":\"gemma4-bool\",\"type\":\"ref\"},{\"name\":\"gemma4-null\",\"type\":\"ref\"},{\"children\":[35,113,129,83,46,55],\"type\":\"choice\"},{\"child\":139,\"name\":\"gemma4-value\",\"trigger\":false,\"type\":\"rule\"},{\"name\":\"gemma4-value\",\"type\":\"ref\"},{\"children\":[],\"type\":\"choice\"},{\"literal\":\"{\",\"type\":\"literal\"},{\"child\":143,\"type\":\"and\"},{\"literal\":\"get_weather\",\"type\":\"literal\"},{\"child\":145,\"tag\":\"tool-name\",\"type\":\"tag\"},{\"child\":146,\"type\":\"atomic\"},{\"children\":[147,144],\"type\":\"sequence\"},{\"child\":148,\"tag\":\"tool-open\",\"type\":\"tag\"},{\"child\":149,\"type\":\"atomic\"},{\"name\":\"gemma4-dict\",\"type\":\"ref\"},{\"child\":113,\"tag\":\"tool-args\",\"type\":\"tag\"},{\"children\":[150,152],\"type\":\"sequence\"},{\"child\":153,\"tag\":\"tool\",\"type\":\"tag\"},{\"child\":154,\"name\":\"tool-get-weather\",\"trigger\":false,\"type\":\"rule\"},{\"name\":\"tool-get-weather\",\"type\":\"ref\"},{\"children\":[155],\"type\":\"choice\"},{\"literal\":\"<|tool_call>call:\",\"type\":\"literal\"},{\"children\":[158,157],\"type\":\"sequence\"},{\"literal\":\"<tool_call|>\",\"type\":\"literal\"},{\"children\":[158,157,160],\"type\":\"sequence\"},{\"child\":161,\"max_count\":1,\"min_count\":0,\"type\":\"repetition\"},{\"child\":162,\"name\":\"tool-call\",\"trigger\":true,\"type\":\"rule\"},{\"name\":\"tool-call\",\"type\":\"ref\"},{\"delimiters\":[\"<|tool_call>\"],\"type\":\"until\"},{\"child\":165,\"name\":\"scan-to-toolcall\",\"trigger\":false,\"type\":\"rule\"},{\"name\":\"scan-to-toolcall\",\"type\":\"ref\"},{\"delimiters\":[\"<|channel>\",\"<channel|>\",\"<|tool_call>\"],\"type\":\"until\"},{\"child\":168,\"tag\":\"content\",\"type\":\"tag\"},{\"child\":169,\"name\":\"content\",\"trigger\":false,\"type\":\"rule\"},{\"name\":\"content\",\"type\":\"ref\"},{\"children\":[26,170],\"type\":\"sequence\"},{\"child\":172,\"name\":\"message\",\"trigger\":false,\"type\":\"rule\"},{\"name\":\"message\",\"type\":\"ref\"},{\"child\":173,\"max_count\":-1,\"min_count\":0,\"type\":\"repetition\"},{\"children\":[1,175],\"type\":\"sequence\"},{\"children\":[1,175,166],\"type\":\"sequence\"},{\"children\":[1,175,166,163],\"type\":\"sequence\"}],\"root\":178,\"rules\":{\"content\":170,\"gemma4-array\":129,\"gemma4-bool\":46,\"gemma4-dict\":113,\"gemma4-dict-key\":90,\"gemma4-dict-key-name\":87,\"gemma4-dict-kv\":97,\"gemma4-null\":55,\"gemma4-number\":83,\"gemma4-string\":35,\"gemma4-string-content\":28,\"gemma4-value\":140,\"json-bool\":44,\"json-null\":53,\"json-number\":81,\"message\":173,\"scan-to-toolcall\":166,\"start\":1,\"thought\":11,\"tool-call\":163,\"tool-get-weather\":155}}",
+    "parse_tool_calls": true
+  },
+  "parse": [
+    {
+      "name": "generated_tool_call",
+      "raw_response": "<|tool_call>call:get_weather{city:<|\"|>Tokyo<|\"|>}<tool_call|>",
+      "parsed_json": {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+          {
+            "type": "function",
+            "function": {
+              "name": "get_weather",
+              "arguments": "{\"city\":\"Tokyo\"}"
+            },
+            "id": "e1rmcGyeUpA4QNuntatJk9IBX142wFT3"
+          }
+        ]
+      }
+    }
+  ],
+  "streaming": [
+    {
+      "name": "split_tool_call_tags",
+      "chunks": [
+        "",
+        "<|tool_call>",
+        "call",
+        ":",
+        "get",
+        "_",
+        "weather",
+        "{",
+        "city",
+        ":",
+        "<|\"|>",
+        "Tokyo",
+        "<|\"|>",
+        "}",
+        "<tool_call|>",
+        ""
+      ],
+      "deltas": [
+        [],
+        [],
+        [],
+        [],
+        [],
+        [],
+        [],
+        [
+          {
+            "tool_calls": [
+              {
+                "index": 0,
+                "id": "IgePF2H2XliFEosanNrHfiQmCxXtJej5",
+                "type": "function",
+                "function": {
+                  "name": "get_weather",
+                  "arguments": "{"
+                }
+              }
+            ]
+          }
+        ],
+        [
+          {
+            "tool_calls": [
+              {
+                "index": 0,
+                "function": {
+                  "arguments": "\"city"
+                }
+              }
+            ]
+          }
+        ],
+        [],
+        [
+          {
+            "tool_calls": [
+              {
+                "index": 0,
+                "function": {
+                  "arguments": "\":\""
+                }
+              }
+            ]
+          }
+        ],
+        [
+          {
+            "tool_calls": [
+              {
+                "index": 0,
+                "function": {
+                  "arguments": "Tokyo"
+                }
+              }
+            ]
+          }
+        ],
+        [
+          {
+            "tool_calls": [
+              {
+                "index": 0,
+                "function": {
+                  "arguments": "\""
+                }
+              }
+            ]
+          }
+        ],
+        [
+          {
+            "tool_calls": [
+              {
+                "index": 0,
+                "function": {
+                  "arguments": "}"
+                }
+              }
+            ]
+          }
+        ],
+        [],
+        []
+      ]
+    }
+  ]
+}

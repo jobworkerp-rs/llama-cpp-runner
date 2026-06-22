@@ -1,0 +1,103 @@
+{
+  "fixture_version": 1,
+  "is_synthetic": true,
+  "model_family": "schema_smoke",
+  "model_repo": "local/schema-smoke",
+  "model_file": "schema-smoke.gguf",
+  "scenario": "fixture_schema_contract",
+  "params": {
+    "messages_json": [
+      {
+        "role": "user",
+        "content": "weather?"
+      }
+    ],
+    "tools_json": [
+      {
+        "type": "function",
+        "function": {
+          "name": "get_weather",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "city": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "city"
+            ]
+          }
+        }
+      }
+    ],
+    "tool_choice": "auto",
+    "parallel_tool_calls": false,
+    "enable_thinking": false,
+    "chat_template_kwargs": {
+      "enable_thinking": false
+    }
+  },
+  "template": {
+    "prompt": "schema smoke prompt with get_weather",
+    "grammar": null,
+    "grammar_lazy": false,
+    "grammar_triggers": [],
+    "preserved_tokens": [],
+    "additional_stops": [],
+    "generation_prompt": "assistant",
+    "chat_format": 0,
+    "parser": null,
+    "parse_tool_calls": true
+  },
+  "parse": [
+    {
+      "name": "synthetic_tool_call",
+      "raw_response": "<tool_call>{\"name\":\"get_weather\",\"arguments\":{\"city\":\"Tokyo\"}}</tool_call>",
+      "parsed_json": {
+        "role": "assistant",
+        "content": null,
+        "tool_calls": [
+          {
+            "type": "function",
+            "function": {
+              "name": "get_weather",
+              "arguments": "{\"city\":\"Tokyo\"}"
+            }
+          }
+        ]
+      }
+    }
+  ],
+  "streaming": [
+    {
+      "name": "split_tool_call_tags",
+      "chunks": [
+        "<tool",
+        "_call>",
+        "{\"name\":\"get_weather\",\"arguments\":{\"city\":\"Tokyo\"}}",
+        "</tool_call>",
+        ""
+      ],
+      "deltas": [
+        [],
+        [],
+        [],
+        [
+          {
+            "tool_calls": [
+              {
+                "index": 0,
+                "function": {
+                  "name": "get_weather",
+                  "arguments": "{\"city\":\"Tokyo\"}"
+                }
+              }
+            ]
+          }
+        ],
+        []
+      ]
+    }
+  ]
+}
