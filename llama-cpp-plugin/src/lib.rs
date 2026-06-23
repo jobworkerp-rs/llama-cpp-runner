@@ -67,8 +67,8 @@ enum StreamItem {
     Final {
         last_text: String,
         last_reasoning: String,
-        /// Worker-resolved final `pending_tool_calls`. `None` on the legacy
-        /// path; populated by the tools worker after `parse_response_oaicompat`.
+        /// Worker-resolved final `pending_tool_calls`. `None` on non-tools
+        /// paths; populated by the tools worker after Rust parse-back.
         final_pending_tool_calls:
             Option<Vec<jobworkerp_llama_protobuf::protobuf::llm::ToolCallRequest>>,
         usage: StreamUsage,

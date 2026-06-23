@@ -33,6 +33,8 @@ llama-cpp-2 = { workspace = true }
 # native-tls.
 openssl = { workspace = true }
 llama-cpp-sys-2 = { workspace = true }
+minijinja = { workspace = true }
+minijinja-contrib = { workspace = true }
 once_cell = { workspace = true }
 prost = { workspace = true }
 regex = { workspace = true }

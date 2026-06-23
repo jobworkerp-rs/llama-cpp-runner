@@ -1,0 +1,238 @@
+{
+  "fixture_version": 1,
+  "is_synthetic": false,
+  "model_family": "qwen3_tool_call",
+  "model_repo": "unsloth/Qwen3-0.6B-GGUF",
+  "model_file": "Qwen3-0.6B-Q4_K_M.gguf",
+  "scenario": "auto_tool_choice_enable_thinking_false",
+  "params": {
+    "messages_json": [
+      {
+        "role": "system",
+        "content": "You are a tool caller."
+      },
+      {
+        "role": "user",
+        "content": "What is the weather in Tokyo? Use get_weather."
+      }
+    ],
+    "tools_json": [
+      {
+        "type": "function",
+        "function": {
+          "name": "get_weather",
+          "description": "Get the current weather in a given city.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "city": {
+                "type": "string",
+                "description": "City name, e.g. Tokyo"
+              }
+            },
+            "required": [
+              "city"
+            ]
+          }
+        }
+      }
+    ],
+    "tool_choice": "auto",
+    "parallel_tool_calls": false,
+    "enable_thinking": false,
+    "chat_template_kwargs": {
+      "enable_thinking": false
+    }
+  },
+  "template": {
+    "prompt": "<|im_start|>system\nYou are a tool caller.\n\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Get the current weather in a given city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name, e.g. Tokyo\"}}, \"required\": [\"city\"]}}}\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call><|im_end|>\n<|im_start|>user\nWhat is the weather in Tokyo? Use get_weather.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+    "grammar": "char ::= [^\"\\\\\\x7F\\x00-\\x1F] | [\\\\] ([\"\\\\bfnrt] | \"u\" [0-9a-fA-F]{4})\njson-array ::= \"[\" space (\"]\" | json-value (\",\" space json-value)* space \"]\") space\njson-bool ::= (\"true\" | \"false\") space\njson-null ::= \"null\" space\njson-number ::= \"-\"? (\"0\" | [1-9] [0-9]*) (\".\" [0-9]+)? ((\"e\" | \"E\") [+-]? [0-9]+)? space\njson-object ::= \"{\" space (\"}\" | json-string space \":\" space json-value (space \",\" space json-string space \":\" space json-value)* space \"}\") space\njson-string ::= \"\\\"\" ( [^\"\\\\] | \"\\\\\" ( [\"\\\\/ bfnrt] | \"u\" [0-9a-fA-F]{4} ) )* \"\\\"\" space\njson-value ::= json-object | json-array | json-string | json-number | json-bool | json-null\nroot ::= tool-call\nspace ::= | \" \" | \"\\n\"{1,2} [ \\t]{0,20}\nstring ::= \"\\\"\" char* \"\\\"\" space\ntool-call ::= \"<tool_call>\\n\" space (tool-get-weather) space \"</tool_call>\"\ntool-get-weather ::= \"{\" space \"\\\"name\\\"\" space \":\" space \"\\\"\" \"get_weather\" \"\\\"\" space \",\" space \"\\\"arguments\\\"\" space \":\" space tool-get-weather-schema space \"}\"\ntool-get-weather-schema ::= \"{\" space tool-get-weather-schema-city-kv \"}\" space\ntool-get-weather-schema-city-kv ::= \"\\\"city\\\"\" space \":\" space string\n",
+    "grammar_lazy": true,
+    "grammar_triggers": [
+      {
+        "trigger_type": "Word",
+        "value": "<tool_call>\n",
+        "token": null
+      }
+    ],
+    "preserved_tokens": [
+      "<think>",
+      "</think>",
+      "<tool_call>",
+      "</tool_call>"
+    ],
+    "additional_stops": [],
+    "generation_prompt": "<|im_start|>assistant\n<think>\n\n</think>\n\n",
+    "chat_format": 2,
+    "parser": "{\"parsers\":[{\"type\":\"epsilon\"},{\"type\":\"epsilon\"},{\"type\":\"epsilon\"},{\"type\":\"epsilon\"},{\"children\":[],\"type\":\"choice\"},{\"literal\":\"\\\"name\\\"\",\"type\":\"literal\"},{\"literal\":\"\\\"arguments\\\"\",\"type\":\"literal\"},{\"literal\":\"\\\"\",\"type\":\"literal\"},{\"literal\":\"get_weather\",\"type\":\"literal\"},{\"child\":8,\"tag\":\"tool-name\",\"type\":\"tag\"},{\"child\":9,\"type\":\"atomic\"},{\"literal\":\"\\\"\",\"type\":\"literal\"},{\"type\":\"space\"},{\"literal\":\":\",\"type\":\"literal\"},{\"type\":\"space\"},{\"children\":[5,14],\"type\":\"sequence\"},{\"children\":[5,14,13],\"type\":\"sequence\"},{\"children\":[5,14,13,12],\"type\":\"sequence\"},{\"children\":[5,14,13,12,11],\"type\":\"sequence\"},{\"children\":[5,14,13,12,11,10],\"type\":\"sequence\"},{\"children\":[5,14,13,12,11,10,7],\"type\":\"sequence\"},{\"type\":\"any\"},{\"child\":21,\"name\":\"json-value\",\"trigger\":false,\"type\":\"rule\"},{\"type\":\"any\"},{\"child\":23,\"name\":\"json-object\",\"trigger\":false,\"type\":\"rule\"},{\"type\":\"space\"},{\"type\":\"any\"},{\"child\":26,\"name\":\"json-string\",\"trigger\":false,\"type\":\"rule\"},{\"literal\":\"\\\"\",\"type\":\"literal\"},{\"delimiter\":\"\\\"\",\"type\":\"string\"},{\"literal\":\"\\\"\",\"type\":\"literal\"},{\"type\":\"space\"},{\"children\":[28,29,30,31],\"type\":\"sequence\"},{\"child\":32,\"name\":\"json-string\",\"trigger\":false,\"type\":\"rule\"},{\"name\":\"json-string\",\"type\":\"ref\"},{\"literal\":\":\",\"type\":\"literal\"},{\"name\":\"json-value\",\"type\":\"ref\"},{\"children\":[33,25,35,25,111],\"type\":\"sequence\"},{\"literal\":\",\",\"type\":\"literal\"},{\"children\":[25,38,25,33,25,35,25,111],\"type\":\"sequence\"},{\"child\":39,\"max_count\":-1,\"min_count\":0,\"type\":\"repetition\"},{\"children\":[33,25,35,25,111,40],\"type\":\"sequence\"},{\"literal\":\"{\",\"type\":\"literal\"},{\"literal\":\"}\",\"type\":\"literal\"},{\"literal\":\"}\",\"type\":\"literal\"},{\"children\":[33,25,35,25,111,40,25,44],\"type\":\"sequence\"},{\"children\":[43,45],\"type\":\"choice\"},{\"children\":[42,25,46,25],\"type\":\"sequence\"},{\"child\":47,\"name\":\"json-object\",\"trigger\":false,\"type\":\"rule\"},{\"name\":\"json-object\",\"type\":\"ref\"},{\"type\":\"any\"},{\"child\":50,\"name\":\"json-array\",\"trigger\":false,\"type\":\"rule\"},{\"type\":\"space\"},{\"name\":\"json-value\",\"type\":\"ref\"},{\"literal\":\",\",\"type\":\"literal\"},{\"name\":\"json-value\",\"type\":\"ref\"},{\"children\":[54,52,111],\"type\":\"sequence\"},{\"child\":56,\"max_count\":-1,\"min_count\":0,\"type\":\"repetition\"},{\"children\":[111,57],\"type\":\"sequence\"},{\"literal\":\"[\",\"type\":\"literal\"},{\"literal\":\"]\",\"type\":\"literal\"},{\"literal\":\"]\",\"type\":\"literal\"},{\"children\":[111,57,52,61],\"type\":\"sequence\"},{\"children\":[60,62],\"type\":\"choice\"},{\"children\":[59,52,63,52],\"type\":\"sequence\"},{\"child\":64,\"name\":\"json-array\",\"trigger\":false,\"type\":\"rule\"},{\"name\":\"json-array\",\"type\":\"ref\"},{\"name\":\"json-string\",\"type\":\"ref\"},{\"type\":\"any\"},{\"child\":68,\"name\":\"json-number\",\"trigger\":false,\"type\":\"rule\"},{\"max_count\":1,\"min_count\":1,\"negated\":false,\"pattern\":\"[1-9]\",\"ranges\":[{\"end\":57,\"start\":49}],\"type\":\"chars\"},{\"max_count\":-1,\"min_count\":1,\"negated\":false,\"pattern\":\"[0-9]\",\"ranges\":[{\"end\":57,\"start\":48}],\"type\":\"chars\"},{\"literal\":\"0\",\"type\":\"literal\"},{\"max_count\":-1,\"min_count\":0,\"negated\":false,\"pattern\":\"[0-9]\",\"ranges\":[{\"end\":57,\"start\":48}],\"type\":\"chars\"},{\"children\":[70,73],\"type\":\"sequence\"},{\"children\":[72,74],\"type\":\"choice\"},{\"literal\":\".\",\"type\":\"literal\"},{\"children\":[76,71],\"type\":\"sequence\"},{\"literal\":\"e\",\"type\":\"literal\"},{\"literal\":\"E\",\"type\":\"literal\"},{\"children\":[78,79],\"type\":\"choice\"},{\"max_count\":1,\"min_count\":1,\"negated\":false,\"pattern\":\"[+-]\",\"ranges\":[{\"end\":43,\"start\":43},{\"end\":45,\"start\":45}],\"type\":\"chars\"},{\"child\":81,\"max_count\":1,\"min_count\":0,\"type\":\"repetition\"},{\"children\":[80,82,71],\"type\":\"sequence\"},{\"max_count\":1,\"min_count\":1,\"negated\":false,\"pattern\":\"[0-9.eE+-]\",\"ranges\":[{\"end\":57,\"start\":48},{\"end\":46,\"start\":46},{\"end\":101,\"start\":101},{\"end\":69,\"start\":69},{\"end\":43,\"start\":43},{\"end\":45,\"start\":45}],\"type\":\"chars\"},{\"child\":84,\"type\":\"not\"},{\"literal\":\"-\",\"type\":\"literal\"},{\"child\":86,\"max_count\":1,\"min_count\":0,\"type\":\"repetition\"},{\"child\":77,\"max_count\":1,\"min_count\":0,\"type\":\"repetition\"},{\"child\":83,\"max_count\":1,\"min_count\":0,\"type\":\"repetition\"},{\"type\":\"space\"},{\"children\":[87,75,88,89,85,90],\"type\":\"sequence\"},{\"child\":91,\"name\":\"json-number\",\"trigger\":false,\"type\":\"rule\"},{\"name\":\"json-number\",\"type\":\"ref\"},{\"type\":\"any\"},{\"child\":94,\"name\":\"json-bool\",\"trigger\":false,\"type\":\"rule\"},{\"literal\":\"true\",\"type\":\"literal\"},{\"literal\":\"false\",\"type\":\"literal\"},{\"children\":[96,97],\"type\":\"choice\"},{\"type\":\"space\"},{\"children\":[98,99],\"type\":\"sequence\"},{\"child\":100,\"name\":\"json-bool\",\"trigger\":false,\"type\":\"rule\"},{\"name\":\"json-bool\",\"type\":\"ref\"},{\"type\":\"any\"},{\"child\":103,\"name\":\"json-null\",\"trigger\":false,\"type\":\"rule\"},{\"literal\":\"null\",\"type\":\"literal\"},{\"type\":\"space\"},{\"children\":[105,106],\"type\":\"sequence\"},{\"child\":107,\"name\":\"json-null\",\"trigger\":false,\"type\":\"rule\"},{\"name\":\"json-null\",\"type\":\"ref\"},{\"children\":[48,65,33,92,101,108],\"type\":\"choice\"},{\"child\":110,\"name\":\"json-value\",\"trigger\":false,\"type\":\"rule\"},{\"name\":\"json-value\",\"type\":\"ref\"},{\"child\":111,\"name\":\"tool-get_weather-schema\",\"raw\":false,\"schema\":{\"properties\":{\"city\":{\"description\":\"City name, e.g. Tokyo\",\"type\":\"string\"}},\"required\":[\"city\"],\"type\":\"object\"},\"type\":\"schema\"},{\"child\":113,\"tag\":\"tool-args\",\"type\":\"tag\"},{\"type\":\"space\"},{\"literal\":\":\",\"type\":\"literal\"},{\"type\":\"space\"},{\"children\":[6,117],\"type\":\"sequence\"},{\"children\":[6,117,116],\"type\":\"sequence\"},{\"children\":[6,117,116,115],\"type\":\"sequence\"},{\"children\":[6,117,116,115,114],\"type\":\"sequence\"},{\"type\":\"epsilon\"},{\"type\":\"epsilon\"},{\"type\":\"space\"},{\"literal\":\"{\",\"type\":\"literal\"},{\"child\":125,\"tag\":\"tool-open\",\"type\":\"tag\"},{\"child\":126,\"type\":\"atomic\"},{\"children\":[127,124],\"type\":\"sequence\"},{\"children\":[127,124,5,14,13,12,11,10,7],\"type\":\"sequence\"},{\"type\":\"space\"},{\"literal\":\",\",\"type\":\"literal\"},{\"type\":\"space\"},{\"children\":[127,124,5,14,13,12,11,10,7,132],\"type\":\"sequence\"},{\"children\":[127,124,5,14,13,12,11,10,7,132,131],\"type\":\"sequence\"},{\"children\":[127,124,5,14,13,12,11,10,7,132,131,130],\"type\":\"sequence\"},{\"children\":[127,124,5,14,13,12,11,10,7,132,131,130,6,117,116,115,114],\"type\":\"sequence\"},{\"literal\":\"}\",\"type\":\"literal\"},{\"child\":137,\"tag\":\"tool-close\",\"type\":\"tag\"},{\"child\":138,\"type\":\"atomic\"},{\"type\":\"space\"},{\"children\":[127,124,5,14,13,12,11,10,7,132,131,130,6,117,116,115,114,140],\"type\":\"sequence\"},{\"children\":[127,124,5,14,13,12,11,10,7,132,131,130,6,117,116,115,114,140,139],\"type\":\"sequence\"},{\"child\":142,\"tag\":\"tool\",\"type\":\"tag\"},{\"child\":143,\"name\":\"tool-get-weather\",\"trigger\":false,\"type\":\"rule\"},{\"name\":\"tool-get-weather\",\"type\":\"ref\"},{\"children\":[144],\"type\":\"choice\"},{\"literal\":\"</tool_call>\",\"type\":\"literal\"},{\"type\":\"space\"},{\"type\":\"space\"},{\"literal\":\"<tool_call>\\n\",\"type\":\"literal\"},{\"children\":[150,149],\"type\":\"sequence\"},{\"children\":[150,149,146],\"type\":\"sequence\"},{\"children\":[150,149,146,148],\"type\":\"sequence\"},{\"children\":[150,149,146,148,147],\"type\":\"sequence\"},{\"child\":154,\"name\":\"tool-call\",\"trigger\":true,\"type\":\"rule\"},{\"name\":\"tool-call\",\"type\":\"ref\"},{\"child\":155,\"max_count\":1,\"min_count\":0,\"type\":\"repetition\"},{\"type\":\"end\"},{\"delimiters\":[\"<tool_call>\\n\"],\"type\":\"until\"},{\"child\":159,\"tag\":\"content\",\"type\":\"tag\"},{\"child\":160,\"max_count\":1,\"min_count\":0,\"type\":\"repetition\"},{\"children\":[1,161],\"type\":\"sequence\"},{\"children\":[1,161,157],\"type\":\"sequence\"},{\"children\":[1,161,157,158],\"type\":\"sequence\"},{\"literal\":\"<|im_start|>assistant\\n\",\"type\":\"literal\"},{\"type\":\"space\"},{\"children\":[165,166,1,161,157,158],\"type\":\"sequence\"}],\"root\":167,\"rules\":{\"json-array\":65,\"json-bool\":101,\"json-null\":108,\"json-number\":92,\"json-object\":48,\"json-string\":33,\"json-value\":111,\"tool-call\":155,\"tool-get-weather\":144}}",
+    "parse_tool_calls": true
+  },
+  "parse": [
+    {
+      "name": "generated_tool_call",
+      "raw_response": "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Tokyo\"}}\n</tool_call>",
+      "parsed_json": {
+        "role": "assistant",
+        "content": "<think>\n\n</think>\n\n",
+        "tool_calls": [
+          {
+            "type": "function",
+            "function": {
+              "name": "get_weather",
+              "arguments": "{\"city\": \"Tokyo\"}"
+            },
+            "id": "aAQEwaWtDbtcW4RDXBSWEVf5j8fKIN5O"
+          }
+        ]
+      }
+    }
+  ],
+  "streaming": [
+    {
+      "name": "split_tool_call_tags",
+      "chunks": [
+        "",
+        "<tool_call>",
+        "\n",
+        "{\"",
+        "name",
+        "\":",
+        " \"",
+        "get",
+        "_weather",
+        "\",",
+        " \"",
+        "arguments",
+        "\":",
+        " {\"",
+        "city",
+        "\":",
+        " \"",
+        "Tok",
+        "yo",
+        "\"}}\n",
+        "</tool_call>",
+        ""
+      ],
+      "deltas": [
+        [
+          {
+            "content": "<think>\n\n</think>\n\n"
+          }
+        ],
+        [],
+        [],
+        [],
+        [],
+        [],
+        [],
+        [],
+        [
+          {
+            "tool_calls": [
+              {
+                "index": 0,
+                "id": "4aRhRIMuuW8n7q6CvniejUbn6TMJgw6D",
+                "type": "function",
+                "function": {
+                  "name": "get_weather",
+                  "arguments": "{"
+                }
+              }
+            ]
+          }
+        ],
+        [],
+        [],
+        [],
+        [],
+        [
+          {
+            "tool_calls": [
+              {
+                "index": 0,
+                "function": {
+                  "arguments": "\""
+                }
+              }
+            ]
+          }
+        ],
+        [
+          {
+            "tool_calls": [
+              {
+                "index": 0,
+                "function": {
+                  "arguments": "city"
+                }
+              }
+            ]
+          }
+        ],
+        [
+          {
+            "tool_calls": [
+              {
+                "index": 0,
+                "function": {
+                  "arguments": "\":"
+                }
+              }
+            ]
+          }
+        ],
+        [
+          {
+            "tool_calls": [
+              {
+                "index": 0,
+                "function": {
+                  "arguments": " \""
+                }
+              }
+            ]
+          }
+        ],
+        [
+          {
+            "tool_calls": [
+              {
+                "index": 0,
+                "function": {
+                  "arguments": "Tok"
+                }
+              }
+            ]
+          }
+        ],
+        [
+          {
+            "tool_calls": [
+              {
+                "index": 0,
+                "function": {
+                  "arguments": "yo"
+                }
+              }
+            ]
+          }
+        ],
+        [
+          {
+            "tool_calls": [
+              {
+                "index": 0,
+                "function": {
+                  "arguments": "\"}"
+                }
+              }
+            ]
+          }
+        ],
+        [],
+        []
+      ]
+    }
+  ]
+}

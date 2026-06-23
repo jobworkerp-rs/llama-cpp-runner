@@ -39,13 +39,7 @@ impl MtmdRuntime {
             .unwrap_or(llama_cpp_2::mtmd::mtmd_default_marker())
             .to_owned();
 
-        let params = MtmdContextParams {
-            use_gpu,
-            print_timings: false,
-            n_threads: 0, // auto-detect
-            media_marker: CString::new(marker.as_str())
-                .map_err(|e| MtmdError::MtmdInit(format!("invalid media_marker: {e}")))?,
-        };
+        let params = build_mtmd_context_params(use_gpu, &marker)?;
 
         let ctx = MtmdContext::init_from_file(mmproj_path, model, &params)
             .map_err(|e| MtmdError::MtmdInit(e.to_string()))?;
@@ -168,7 +162,7 @@ impl MtmdRuntime {
 
                 media_input::Source::Encoded(bytes) => {
                     self.check_encoded_size(i, bytes.len() as u64, limits)?;
-                    let bitmap = MtmdBitmap::from_buffer(&self.ctx, bytes)
+                    let bitmap = MtmdBitmap::from_buffer(&self.ctx, bytes, false)
                         .map_err(|e| self.decode_error(i, kind, &e))?;
                     self.verify_kind_matches_decoded(i, kind, &bitmap)?;
                     self.check_decoded_size(i, &bitmap, limits)?;
@@ -206,7 +200,7 @@ impl MtmdRuntime {
                     std::io::Read::read_to_end(&mut &file, &mut bytes)
                         .map_err(|e| io_err(format!("cannot read {}: {e}", canonical.display())))?;
 
-                    let bitmap = MtmdBitmap::from_buffer(&self.ctx, &bytes)
+                    let bitmap = MtmdBitmap::from_buffer(&self.ctx, &bytes, false)
                         .map_err(|e| self.decode_error(i, kind, &e))?;
                     self.verify_kind_matches_decoded(i, kind, &bitmap)?;
                     self.check_decoded_size(i, &bitmap, limits)?;
@@ -427,5 +421,41 @@ impl MtmdRuntime {
                 reason: err.to_string(),
             }
         }
+    }
+}
+
+fn build_mtmd_context_params(use_gpu: bool, marker: &str) -> Result<MtmdContextParams, MtmdError> {
+    Ok(MtmdContextParams {
+        use_gpu,
+        print_timings: false,
+        n_threads: 0, // auto-detect
+        media_marker: CString::new(marker)
+            .map_err(|e| MtmdError::MtmdInit(format!("invalid media_marker: {e}")))?,
+        image_min_tokens: -1,
+        image_max_tokens: -1,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_build_mtmd_context_params_uses_model_image_token_defaults() {
+        let params = build_mtmd_context_params(true, "<media>")
+            .expect("valid marker should build mtmd params");
+
+        assert!(params.use_gpu);
+        assert_eq!(params.n_threads, 0);
+        assert_eq!(params.image_min_tokens, -1);
+        assert_eq!(params.image_max_tokens, -1);
+        assert_eq!(params.media_marker.to_str().unwrap(), "<media>");
+    }
+
+    #[test]
+    fn test_build_mtmd_context_params_rejects_nul_marker() {
+        let err = build_mtmd_context_params(false, "bad\0marker").unwrap_err();
+
+        assert!(err.to_string().contains("invalid media_marker"));
     }
 }
