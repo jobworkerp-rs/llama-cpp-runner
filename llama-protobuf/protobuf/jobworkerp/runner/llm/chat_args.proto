@@ -26,6 +26,12 @@ message LLMChatArgs {
 
     // extract reasoning content from the response
     optional bool extract_reasoning_content = 7;
+
+    // Reuse the KV cache across requests on this worker for this request
+    // (keep the longest common prompt prefix). Effective ONLY when the
+    // runner settings omit reuse_kv_prefix; an explicit runner-level value
+    // always wins. Default when both are omitted: false.
+    optional bool reuse_kv_prefix = 8;
   }
 
   message FunctionOptions {

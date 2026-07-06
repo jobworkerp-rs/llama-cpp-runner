@@ -167,6 +167,7 @@ mod binary_compat_tests {
                 )),
                 id: Some("audio-1".into()),
             }],
+            reuse_kv_prefix: Some(true),
         };
         let bytes = arg.encode_to_vec();
 

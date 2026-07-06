@@ -19,6 +19,21 @@ impl LlamaModelWrapper {
         }
     }
 
+    /// Resolve the effective KV-prefix-reuse policy for this request, warning
+    /// once when an explicit runner value overrides a conflicting request value.
+    /// Keeps the warn wording single-sourced across both decode paths.
+    fn resolve_reuse_kv_prefix(&self, args: &InferenceArgs) -> bool {
+        let resolved = resolve_reuse_kv_prefix(self.runner_reuse_kv_prefix, args.reuse_kv_prefix);
+        if resolved.conflict {
+            tracing::warn!(
+                runner = self.runner_reuse_kv_prefix,
+                request = args.reuse_kv_prefix,
+                "request reuse_kv_prefix ignored because runner settings are explicit"
+            );
+        }
+        resolved.value
+    }
+
     /// Legacy entry point: wraps the user prompt in a system+user chat template
     /// (or falls back to plain concatenation) before delegating to the core
     /// generation loop. Used by the `run` (LlamaArg) path.
@@ -116,7 +131,7 @@ impl LlamaModelWrapper {
         // use; the guard restores it on every exit path (incl. `?`/panic) so the
         // reused context survives a failed request.
         self.ensure_context()?;
-        let reuse_kv_prefix = self.reuse_kv_prefix;
+        let reuse_kv_prefix = self.resolve_reuse_kv_prefix(args);
         let mut ctx_guard = RestoreOnDrop::new(&mut self.context);
         let sync_ctx = ctx_guard.as_mut().expect("context ensured above");
 
@@ -483,7 +498,7 @@ impl LlamaModelWrapper {
         let model = self.model;
         let mut sampler = self.build_sampler(args)?;
 
-        let reuse_kv_prefix = self.reuse_kv_prefix;
+        let reuse_kv_prefix = self.resolve_reuse_kv_prefix(args);
         self.ensure_context()?;
         let mtmd = self
             .mtmd
@@ -807,7 +822,7 @@ mod tests {
         let prompt_b = format!("{shared}what is two plus two?");
 
         let reuse_cfg = || LlamaModelConfig {
-            reuse_kv_prefix: true,
+            reuse_kv_prefix: Some(true),
             ..LlamaModelConfig::default()
         };
 
@@ -843,6 +858,98 @@ mod tests {
         assert!(wrapper.run(bad).is_err(), "oversized request should fail");
         let after_err = wrapper.run(args(&prompt_b)).expect("recovers after error");
         assert_eq!(after_err, baseline_b, "must recover after a failed request");
+    }
+
+    /// Request-level `reuse_kv_prefix=true` must behave like runner-level reuse
+    /// when the runner setting is omitted.
+    ///
+    /// ```bash
+    /// cargo test -p jobworkerp-llama-cpp-plugin test_request_reuse_kv_prefix_matches_full_clear \
+    ///     --release -- --ignored --test-threads=1 --nocapture
+    /// ```
+    #[test]
+    #[ignore]
+    fn test_request_reuse_kv_prefix_matches_full_clear() {
+        fn args(prompt: &str, reuse_kv_prefix: Option<bool>) -> InferenceArgs {
+            InferenceArgs {
+                prompt: prompt.to_string(),
+                sample_len: Some(48),
+                seed: Some(1234),
+                reuse_kv_prefix,
+                ..Default::default()
+            }
+        }
+
+        let shared = "You are a helpful assistant. The user asks: ";
+        let prompt_a = format!("{shared}what is the capital of France?");
+        let prompt_b = format!("{shared}what is two plus two?");
+
+        let baseline_b = LlamaModelWrapper::new(LlamaModelConfig::default())
+            .expect("load")
+            .run(args(&prompt_b, None))
+            .expect("baseline b");
+
+        let mut wrapper = LlamaModelWrapper::new(LlamaModelConfig::default()).expect("load");
+        wrapper
+            .run(args(&prompt_a, Some(true)))
+            .expect("request reuse a");
+        let reuse_b = wrapper
+            .run(args(&prompt_b, Some(true)))
+            .expect("request reuse b");
+        assert_eq!(
+            reuse_b, baseline_b,
+            "request-level prefix reuse changed prompt B output"
+        );
+    }
+
+    /// Alternating request-level reuse must never reuse a stale cache record.
+    ///
+    /// ```bash
+    /// cargo test -p jobworkerp-llama-cpp-plugin test_request_reuse_kv_prefix_alternates_safely \
+    ///     --release -- --ignored --test-threads=1 --nocapture
+    /// ```
+    #[test]
+    #[ignore]
+    fn test_request_reuse_kv_prefix_alternates_safely() {
+        fn args(prompt: &str, reuse_kv_prefix: Option<bool>) -> InferenceArgs {
+            InferenceArgs {
+                prompt: prompt.to_string(),
+                sample_len: Some(48),
+                seed: Some(1234),
+                reuse_kv_prefix,
+                ..Default::default()
+            }
+        }
+
+        let shared = "You are a helpful assistant. The user asks: ";
+        let prompt_a = format!("{shared}what is the capital of France?");
+        let prompt_b = format!("{shared}what is two plus two?");
+        let prompt_c = format!("{shared}name one primary color.");
+
+        let baseline_b = LlamaModelWrapper::new(LlamaModelConfig::default())
+            .expect("load")
+            .run(args(&prompt_b, None))
+            .expect("baseline b");
+        let baseline_c = LlamaModelWrapper::new(LlamaModelConfig::default())
+            .expect("load")
+            .run(args(&prompt_c, None))
+            .expect("baseline c");
+
+        let mut wrapper = LlamaModelWrapper::new(LlamaModelConfig::default()).expect("load");
+        wrapper.run(args(&prompt_a, Some(true))).expect("reuse a");
+        let no_reuse_b = wrapper
+            .run(args(&prompt_b, Some(false)))
+            .expect("no reuse b");
+        let reuse_c = wrapper.run(args(&prompt_c, Some(true))).expect("reuse c");
+
+        assert_eq!(
+            no_reuse_b, baseline_b,
+            "reuse=false request must full-clear"
+        );
+        assert_eq!(
+            reuse_c, baseline_c,
+            "reuse=true after reuse=false must not use stale cache"
+        );
     }
 
     /// A sink that requests cancellation on its very first invocation must
@@ -966,7 +1073,7 @@ mod tests {
             n_ubatch: None,
             type_k: None,
             type_v: None,
-            reuse_kv_prefix: false,
+            reuse_kv_prefix: Some(false),
             use_flash_attention: Some(true),
             system_prompt: Some("You are a helpful assistant.".to_string()),
             mtmd: Some(jobworkerp_llama_protobuf::MtmdSettings {
@@ -1024,7 +1131,7 @@ mod tests {
             model: "gemma-4-E4B-it-Q4_K_M.gguf".to_string(),
             hf_repo: Some("unsloth/gemma-4-E4B-it-GGUF".to_string()),
             ctx_size: std::num::NonZeroU32::new(2048),
-            reuse_kv_prefix: true,
+            reuse_kv_prefix: Some(true),
             use_flash_attention: Some(true),
             system_prompt: Some("You are a helpful assistant.".to_string()),
             mtmd: Some(jobworkerp_llama_protobuf::MtmdSettings {
@@ -1097,7 +1204,7 @@ mod tests {
             model: "gemma-4-E4B-it-Q4_K_M.gguf".to_string(),
             hf_repo: Some("unsloth/gemma-4-E4B-it-GGUF".to_string()),
             ctx_size: std::num::NonZeroU32::new(2048),
-            reuse_kv_prefix: true,
+            reuse_kv_prefix: Some(true),
             use_flash_attention: Some(true),
             system_prompt: Some("You are a helpful assistant.".to_string()),
             mtmd: Some(jobworkerp_llama_protobuf::MtmdSettings {
@@ -1167,7 +1274,7 @@ mod tests {
             model: "gemma-4-E4B-it-Q4_K_M.gguf".to_string(),
             hf_repo: Some("unsloth/gemma-4-E4B-it-GGUF".to_string()),
             ctx_size: std::num::NonZeroU32::new(2048),
-            reuse_kv_prefix: true,
+            reuse_kv_prefix: Some(true),
             use_flash_attention: Some(true),
             system_prompt: Some("You are a helpful assistant.".to_string()),
             mtmd: Some(jobworkerp_llama_protobuf::MtmdSettings {
@@ -1251,7 +1358,7 @@ mod tests {
             n_ubatch: None,
             type_k: None,
             type_v: None,
-            reuse_kv_prefix: false,
+            reuse_kv_prefix: Some(false),
             use_flash_attention: Some(true),
             system_prompt: Some("You are a helpful assistant.".to_string()),
             mtmd: Some(jobworkerp_llama_protobuf::MtmdSettings {

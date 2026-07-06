@@ -20,9 +20,8 @@ pub struct LlamaModelWrapper {
     /// No Mutex needed: all access is through `&mut self` on `run()`, which
     /// provides exclusive access at the Rust borrow-checker level.
     pub(in crate::model) context: Option<SyncContext>,
-    /// When true, keep the longest common prompt prefix in the KV cache across
-    /// requests (text-only) instead of clearing it each time. See [`SyncContext`].
-    pub(in crate::model) reuse_kv_prefix: bool,
+    /// Runner-level KV prefix reuse policy. None lets each request decide.
+    pub(in crate::model) runner_reuse_kv_prefix: Option<bool>,
     pub(in crate::model) mtmd: Option<MtmdRuntime>,
     pub(in crate::model) media_limits: MediaLimits,
 }
@@ -153,7 +152,7 @@ impl LlamaModelWrapper {
             ctx_params,
             system_prompt: config.system_prompt.unwrap_or_default(),
             context: None,
-            reuse_kv_prefix: config.reuse_kv_prefix,
+            runner_reuse_kv_prefix: config.reuse_kv_prefix,
             mtmd,
             media_limits,
         })

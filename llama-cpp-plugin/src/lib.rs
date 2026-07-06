@@ -1284,6 +1284,7 @@ Good luck in the competition and in advancing AI research!
             seed: Some(30),
             need_print: true,
             medias: vec![],
+            reuse_kv_prefix: None,
         };
         let mut buf = Vec::with_capacity(request.encoded_len());
         request.encode(&mut buf).unwrap();
@@ -1376,6 +1377,11 @@ Good luck in the competition and in advancing AI research!
         );
         assert!(run_schema.args_proto.contains("message LlamaArg"));
         assert!(run_schema.args_proto.contains("message MediaInput"));
+        assert!(
+            run_schema
+                .args_proto
+                .contains("optional bool reuse_kv_prefix = 10")
+        );
         assert!(run_schema.result_proto.contains("message LlamaArg"));
 
         let chat_schema = decode_method_schema(&schemas, METHOD_CHAT);
@@ -1387,7 +1393,19 @@ Good luck in the competition and in advancing AI research!
             "chat args_proto must not contain import statements"
         );
         assert!(chat_schema.args_proto.contains("message LLMChatArgs"));
+        assert!(
+            chat_schema
+                .args_proto
+                .contains("optional bool reuse_kv_prefix = 8")
+        );
         assert!(chat_schema.result_proto.contains("message LLMChatResult"));
+
+        let completion_schema = decode_method_schema(&schemas, METHOD_COMPLETION);
+        assert!(
+            completion_schema
+                .args_proto
+                .contains("optional bool reuse_kv_prefix = 8")
+        );
     }
 
     #[test]
@@ -1399,8 +1417,9 @@ Good luck in the competition and in advancing AI research!
         assert!(schemas.contains_key(METHOD_CHAT), "chat schema must exist");
 
         let run_schema = decode_method_json_schema(&schemas, METHOD_RUN);
-        serde_json::from_str::<serde_json::Value>(&run_schema.args_schema)
+        let run_args = serde_json::from_str::<serde_json::Value>(&run_schema.args_schema)
             .expect("run args_schema must be valid JSON");
+        assert!(run_args.to_string().contains("reuse_kv_prefix"));
         serde_json::from_str::<serde_json::Value>(
             run_schema
                 .result_schema
@@ -1410,8 +1429,9 @@ Good luck in the competition and in advancing AI research!
         .expect("run result_schema must be valid JSON");
 
         let chat_schema = decode_method_json_schema(&schemas, METHOD_CHAT);
-        serde_json::from_str::<serde_json::Value>(&chat_schema.args_schema)
+        let chat_args = serde_json::from_str::<serde_json::Value>(&chat_schema.args_schema)
             .expect("chat args_schema must be valid JSON");
+        assert!(chat_args.to_string().contains("reuse_kv_prefix"));
         serde_json::from_str::<serde_json::Value>(
             chat_schema
                 .result_schema
@@ -1419,6 +1439,12 @@ Good luck in the competition and in advancing AI research!
                 .expect("chat result_schema"),
         )
         .expect("chat result_schema must be valid JSON");
+
+        let completion_schema = decode_method_json_schema(&schemas, METHOD_COMPLETION);
+        let completion_args =
+            serde_json::from_str::<serde_json::Value>(&completion_schema.args_schema)
+                .expect("completion args_schema must be valid JSON");
+        assert!(completion_args.to_string().contains("reuse_kv_prefix"));
     }
 
     #[test]

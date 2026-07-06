@@ -45,4 +45,10 @@ message LlamaArg {
     // non-empty, the runner appends one marker per media at the tail of
     // `prompt` — still before chat template application.
     repeated MediaInput medias = 9;
+
+    // Reuse the KV cache across requests on this worker for this request
+    // (keep the longest common prompt prefix). Effective ONLY when the
+    // runner settings omit reuse_kv_prefix; an explicit runner-level value
+    // always wins. Default when both are omitted: false.
+    optional bool reuse_kv_prefix = 10;
 }

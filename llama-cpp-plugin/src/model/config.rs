@@ -181,9 +181,9 @@ pub struct LlamaModelConfig {
     pub(in crate::model) type_k: Option<i32>,
     pub(in crate::model) type_v: Option<i32>,
     // Reuse the KV cache across requests by keeping the longest common prompt
-    // prefix (text-only). Default false keeps requests independent/deterministic.
+    // prefix. None lets each request decide; explicit values win over requests.
     #[serde(default)]
-    pub(in crate::model) reuse_kv_prefix: bool,
+    pub(in crate::model) reuse_kv_prefix: Option<bool>,
     // use flash attention (default true)
     pub(in crate::model) use_flash_attention: Option<bool>,
     // system prompt before the user prompt
@@ -210,7 +210,7 @@ impl From<LlamaRunnerSettings> for LlamaModelConfig {
             n_ubatch: op.n_ubatch,
             type_k: op.type_k,
             type_v: op.type_v,
-            reuse_kv_prefix: op.reuse_kv_prefix.unwrap_or(false),
+            reuse_kv_prefix: op.reuse_kv_prefix,
             use_flash_attention: op.use_flash_attention,
             system_prompt: op.system_prompt,
             mtmd: op.mtmd,
@@ -256,7 +256,7 @@ impl Default for LlamaModelConfig {
             n_ubatch: None,
             type_k: None,
             type_v: None,
-            reuse_kv_prefix: false,
+            reuse_kv_prefix: None,
             use_flash_attention: None,
             system_prompt: None,
             mtmd: None,
@@ -293,6 +293,9 @@ pub struct InferenceArgs {
     pub(in crate::model) repeat_last_n: Option<u32>,
     /// RNG seed for sampling. None uses the default (1234).
     pub(in crate::model) seed: Option<u32>,
+    /// Per-request KV prefix reuse override. Ignored when runner settings are explicit.
+    #[serde(default)]
+    pub(in crate::model) reuse_kv_prefix: Option<bool>,
     /// JSON Schema for structured output (llguidance constraint).
     #[serde(default, skip_serializing)]
     pub(in crate::model) json_schema: Option<String>,
@@ -325,6 +328,23 @@ pub(in crate::model) fn cancel_flag_requested(cancel_flag: &Option<Arc<AtomicBoo
         .is_some_and(|flag| flag.load(Ordering::Relaxed))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::model) struct ResolvedReuse {
+    pub(in crate::model) value: bool,
+    pub(in crate::model) conflict: bool,
+}
+
+pub(in crate::model) fn resolve_reuse_kv_prefix(
+    runner: Option<bool>,
+    request: Option<bool>,
+) -> ResolvedReuse {
+    // Precedence: an explicit runner value wins, else the request decides,
+    // else default off. Conflict only when both are set and disagree.
+    let value = runner.or(request).unwrap_or(false);
+    let conflict = matches!((runner, request), (Some(r), Some(q)) if r != q);
+    ResolvedReuse { value, conflict }
+}
+
 impl std::fmt::Debug for InferenceArgs {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("InferenceArgs")
@@ -336,6 +356,7 @@ impl std::fmt::Debug for InferenceArgs {
             .field("repeat_penalty", &self.repeat_penalty)
             .field("repeat_last_n", &self.repeat_last_n)
             .field("seed", &self.seed)
+            .field("reuse_kv_prefix", &self.reuse_kv_prefix)
             .field(
                 "json_schema",
                 &self.json_schema.as_deref().map(|s| &s[..s.len().min(80)]),
@@ -359,6 +380,7 @@ pub(in crate::model) fn chat_inference_args(
         repeat_penalty: options.repeat_penalty,
         repeat_last_n: options.repeat_last_n.map(|v| v as u32),
         seed: options.seed.map(|s| s as u32),
+        reuse_kv_prefix: options.reuse_kv_prefix,
         json_schema,
         medias: Vec::new(),
         grammar_spec: None,
@@ -380,6 +402,7 @@ pub(in crate::model) fn completion_inference_args(
         repeat_penalty: options.repeat_penalty,
         repeat_last_n: options.repeat_last_n.map(|v| v as u32),
         seed: options.seed.map(|s| s as u32),
+        reuse_kv_prefix: options.reuse_kv_prefix,
         json_schema,
         medias: Vec::new(),
         grammar_spec: None,
@@ -588,6 +611,7 @@ impl From<LlamaArg> for InferenceArgs {
             repeat_penalty: req.repeat_penalty,
             repeat_last_n: req.repeat_last_n,
             seed: req.seed.map(|s| s as u32),
+            reuse_kv_prefix: req.reuse_kv_prefix,
             json_schema: None,
             medias: req.medias,
             grammar_spec: None,
@@ -708,10 +732,75 @@ mod tests {
             seed: None,
             need_print: false,
             medias: vec![dummy_media(), dummy_media()],
+            reuse_kv_prefix: Some(true),
         };
         let args: InferenceArgs = arg.into();
         assert!(args.prompt.is_empty());
         assert_eq!(args.medias.len(), 2);
+        assert_eq!(args.reuse_kv_prefix, Some(true));
+    }
+
+    #[test]
+    fn test_resolve_reuse_kv_prefix_precedence() {
+        let cases = [
+            (Some(true), Some(false), true, true),
+            (Some(false), Some(true), false, true),
+            (Some(true), Some(true), true, false),
+            (Some(false), Some(false), false, false),
+            (Some(true), None, true, false),
+            (None, Some(true), true, false),
+            (None, Some(false), false, false),
+            (None, None, false, false),
+        ];
+
+        for (settings, request, value, conflict) in cases {
+            let resolved = resolve_reuse_kv_prefix(settings, request);
+            assert_eq!(
+                (resolved.value, resolved.conflict),
+                (value, conflict),
+                "settings={settings:?}, request={request:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_chat_completion_and_legacy_args_propagate_reuse_kv_prefix() {
+        for value in [Some(true), Some(false), None] {
+            let chat = chat_inference_args(
+                llm_chat_args::LlmOptions {
+                    reuse_kv_prefix: value,
+                    ..Default::default()
+                },
+                None,
+                None,
+            );
+            assert_eq!(chat.reuse_kv_prefix, value);
+
+            let completion = completion_inference_args(
+                llm_completion_args::LlmOptions {
+                    reuse_kv_prefix: value,
+                    ..Default::default()
+                },
+                None,
+                None,
+            );
+            assert_eq!(completion.reuse_kv_prefix, value);
+
+            let legacy: InferenceArgs = LlamaArg {
+                prompt: String::new(),
+                sample_len: 100,
+                temperature: None,
+                top_p: None,
+                repeat_penalty: None,
+                repeat_last_n: None,
+                seed: None,
+                need_print: false,
+                medias: vec![],
+                reuse_kv_prefix: value,
+            }
+            .into();
+            assert_eq!(legacy.reuse_kv_prefix, value);
+        }
     }
 
     #[test]
@@ -809,14 +898,28 @@ mod tests {
             system_prompt: None,
             mtmd: None,
         };
-        let config: LlamaModelConfig = settings.into();
+        let config: LlamaModelConfig = settings.clone().into();
         assert_eq!(config.n_batch, Some(2048));
         assert_eq!(config.n_ubatch, Some(512));
         assert_eq!(config.type_k, Some(ProtoKv::Q80 as i32));
         assert_eq!(config.type_v, Some(ProtoKv::Q80 as i32));
-        assert!(config.reuse_kv_prefix);
-        // Default keeps reuse off so requests stay independent.
-        assert!(!LlamaModelConfig::default().reuse_kv_prefix);
+        assert_eq!(config.reuse_kv_prefix, Some(true));
+        // Default leaves reuse unspecified so requests can opt in.
+        assert_eq!(LlamaModelConfig::default().reuse_kv_prefix, None);
+
+        let omitted: LlamaModelConfig = LlamaRunnerSettings {
+            reuse_kv_prefix: None,
+            ..settings.clone()
+        }
+        .into();
+        assert_eq!(omitted.reuse_kv_prefix, None);
+
+        let explicit_false: LlamaModelConfig = LlamaRunnerSettings {
+            reuse_kv_prefix: Some(false),
+            ..settings
+        }
+        .into();
+        assert_eq!(explicit_false.reuse_kv_prefix, Some(false));
     }
 
     #[test]
