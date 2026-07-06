@@ -148,6 +148,7 @@ impl PluginRunner for EmbeddingLlmRunnerPlugin {
 
    - GGUF ファイルのパスを確認
    - `model_files`配列にファイル名が正しく指定されているか確認
+   - HuggingFace Hub の既存 snapshot cache はネットワーク確認なしで再利用されます。cache miss 時は途中 `.part` が再開され、download 結果の size 不一致は拒否されます
 
 2. **トークナイザーエラー**
 

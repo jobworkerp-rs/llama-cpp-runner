@@ -23,6 +23,7 @@ command-utils = { path = "../modules/command-utils" }
 dotenvy = { workspace = true }
 encoding_rs = { workspace = true }
 hf-hub = { workspace = true }
+hf-hub-utils = { workspace = true }
 itertools = { workspace = true }
 # Pulls in vendored OpenSSL (configured in workspace) so the produced .so
 # does not depend on the host's libssl/libcrypto. Required because hf-hub's

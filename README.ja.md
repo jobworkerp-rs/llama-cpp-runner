@@ -70,6 +70,7 @@ cargo clippy --workspace --all-targets
 - ハードウェアアクセラレーションは、対応crateで `cuda`、`metal`、`openmp` などの feature として提供しています。
 - 共有処理はプラグインcrateへ複製せず、`modules/` または専用補助crateへ集約してください。
 - protobuf 契約や公開プラグイン挙動を変更する場合は、関連するcrate単位のドキュメントも更新してください。
+- `modules/llama-cpp-rs` は `llama-cpp-rs` `0.1.151` ベースです。`llama-cpp-plugin` は `llama_cpp.LlamaRunnerSettings.mtp` で runner-level の MTP speculative decoding 設定を公開しています。text-only 制限と Gemma 4 検証手順は [llama-cpp-plugin/README.ja.md](llama-cpp-plugin/README.ja.md) を参照してください。
 - **CUDA ビルド時の NCCL 依存問題**: ビルドホストに `libnccl` と `nccl.h` がインストールされている場合、`llama.cpp` の CMake が `find_package(NCCL)` で自動検出し、ggml-cuda に NCCL サポートをコンパイルします。これにより生成された `.so` は `libnccl.so.2` をロード時依存として持つため、NCCL がインストールされていない実行環境（例: `ghcr.io/jobworkerp-rs/grpc-front` イメージ）で `dlopen()` が失敗します。
 
   本プロジェクトは現状 NCCL を使用しない（複数 GPU の集団通信を行わない）ため、以下のいずれかでビルド時に NCCL を検出させないことを推奨します:

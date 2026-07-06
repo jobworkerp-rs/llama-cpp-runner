@@ -96,7 +96,24 @@ message LlamaRunnerSettings {
     // independent and deterministic.
     optional bool reuse_kv_prefix = 15;
 
+    // Same-model MTP speculative decoding settings. MTP is fixed when the
+    // runner creates its llama.cpp context, so it is configured at runner load
+    // time rather than per request. When omitted or enabled=false, generation
+    // uses the existing non-speculative path.
+    optional MtpSpeculativeSettings mtp = 16;
+
     // TODO
     // override some parameters of the model
     //key_value_overrides: Option<Vec<(String, ParamOverrideValueWrapper)>>,
+}
+
+message MtpSpeculativeSettings {
+    bool enabled = 1;
+    optional uint32 n_max = 2;
+    optional uint32 n_min = 3;
+    optional float p_min = 4;
+    optional KvCacheType draft_type_k = 5;
+    optional KvCacheType draft_type_v = 6;
+    optional string draft_model = 7;
+    optional string draft_hf_repo = 8;
 }

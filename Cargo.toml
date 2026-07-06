@@ -2,6 +2,7 @@
 
 members = [
     "modules/command-utils",
+    "hf-hub-utils",
     "llama-protobuf",
     "mtmd-support",              # Shared multimodal projector runtime
     "llama-cpp-plugin",
@@ -40,6 +41,7 @@ encoding_rs = "0.8"
 envy = { version = "0.4" }
 futures = { version = "0.3" }
 hf-hub = { version = "0.5" }
+hf-hub-utils = { path = "hf-hub-utils" }
 itertools = { version = "0.14" }
 minijinja = { version = "2", features = ["json"] }
 minijinja-contrib = { version = "2", features = ["pycompat"] }

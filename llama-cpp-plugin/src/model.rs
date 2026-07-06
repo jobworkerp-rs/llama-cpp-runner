@@ -1,5 +1,4 @@
 use anyhow::{Context, Result, anyhow, bail};
-use hf_hub::api::sync::ApiBuilder;
 use jobworkerp_llama_protobuf::protobuf::llm::{
     LlmChatArgs, LlmChatResult, LlmCompletionArgs, LlmCompletionResult, llm_chat_args,
     llm_chat_result, llm_completion_result,
@@ -11,6 +10,7 @@ use llama_cpp_2::{
     llama_batch::LlamaBatch,
     model::{AddBos, LlamaChatMessage, LlamaModel, params::LlamaModelParams},
     sampling::LlamaSampler,
+    speculative::MtpSpeculative,
     token::LlamaToken,
 };
 use llama_cpp_sys_2::{LLAMA_FLASH_ATTN_TYPE_DISABLED, LLAMA_FLASH_ATTN_TYPE_ENABLED};

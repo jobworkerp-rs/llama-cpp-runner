@@ -9,7 +9,6 @@
 //! `pub(in crate::model)` only where `wrapper`/`decode` reference these items.
 
 use anyhow::{Context, Result, bail};
-use hf_hub::api::sync::ApiBuilder;
 use jobworkerp_llama_protobuf::protobuf::llama_cpp::{LlamaArg, LlamaRunnerSettings, MediaInput};
 use jobworkerp_llama_protobuf::protobuf::llm::{
     LlmCompletionResult, llm_chat_args, llm_completion_args, llm_completion_result,
@@ -17,6 +16,7 @@ use jobworkerp_llama_protobuf::protobuf::llm::{
 use llama_cpp_2::context::{LlamaContext, params::KvCacheType};
 use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::model::{LlamaChatMessage, LlamaModel, params::kv_overrides::ParamOverrideValue};
+use llama_cpp_2::speculative::{MtpSpeculative, MtpSpeculativeParams};
 use llama_cpp_2::token::LlamaToken;
 use serde::{Deserialize, Serialize};
 use std::ffi::CString;
@@ -38,6 +38,8 @@ pub(crate) const ERR_CLIENT_TOOLS_WITH_MULTIMODAL: &str =
     "multimodal input combined with client_tools_json is not supported yet";
 pub(crate) const ERR_TOOL_EXECUTION_REQUESTS_REJECTED: &str =
     "ToolExecutionRequests is no longer accepted; use ToolResults on a TOOL message";
+pub(crate) const ERR_MTP_WITH_MULTIMODAL: &str =
+    "MTP speculative decoding is not supported with multimodal input yet";
 
 /// for deserialization.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -152,6 +154,59 @@ pub(in crate::model) fn resolve_n_ubatch(
     explicit_n_ubatch.or_else(|| gpu_default.then(|| effective_n_batch.min(MAX_AUTO_N_UBATCH)))
 }
 
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub(in crate::model) struct MtpSpeculativeConfig {
+    #[serde(default = "default_mtp_n_max")]
+    pub(in crate::model) n_max: i32,
+    #[serde(default)]
+    pub(in crate::model) n_min: i32,
+    #[serde(default)]
+    pub(in crate::model) p_min: f32,
+    #[serde(default)]
+    pub(in crate::model) draft_type_k: Option<i32>,
+    #[serde(default)]
+    pub(in crate::model) draft_type_v: Option<i32>,
+    #[serde(default)]
+    pub(in crate::model) draft_model: Option<String>,
+    #[serde(default)]
+    pub(in crate::model) draft_hf_repo: Option<String>,
+}
+
+impl MtpSpeculativeConfig {
+    pub(in crate::model) fn params(&self) -> MtpSpeculativeParams {
+        MtpSpeculativeParams {
+            n_max: self.n_max,
+            n_min: self.n_min,
+            p_min: self.p_min,
+        }
+    }
+
+    pub(in crate::model) fn from_runner_settings(
+        settings: Option<jobworkerp_llama_protobuf::MtpSpeculativeSettings>,
+        target_type_k: Option<i32>,
+        target_type_v: Option<i32>,
+    ) -> Option<Self> {
+        let settings = settings?;
+        if !settings.enabled {
+            return None;
+        }
+        let defaults = MtpSpeculativeParams::default();
+        Some(Self {
+            n_max: settings.n_max.map_or(defaults.n_max, |v| v as i32),
+            n_min: settings.n_min.map_or(defaults.n_min, |v| v as i32),
+            p_min: settings.p_min.unwrap_or(defaults.p_min),
+            draft_type_k: settings.draft_type_k.or(target_type_k),
+            draft_type_v: settings.draft_type_v.or(target_type_v),
+            draft_model: settings.draft_model,
+            draft_hf_repo: settings.draft_hf_repo,
+        })
+    }
+}
+
+fn default_mtp_n_max() -> i32 {
+    MtpSpeculativeParams::default().n_max
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct LlamaModelConfig {
     /// The path or name to the model
@@ -194,9 +249,12 @@ pub struct LlamaModelConfig {
     /// Multimodal projector settings. When None the runner is text-only.
     #[serde(default)]
     pub(in crate::model) mtmd: Option<jobworkerp_llama_protobuf::MtmdSettings>,
+    #[serde(default)]
+    pub(in crate::model) mtp: Option<MtpSpeculativeConfig>,
 }
 impl From<LlamaRunnerSettings> for LlamaModelConfig {
     fn from(op: LlamaRunnerSettings) -> Self {
+        let mtp = MtpSpeculativeConfig::from_runner_settings(op.mtp, op.type_k, op.type_v);
         Self {
             model: op.model,
             hf_repo: op.hf_repo,
@@ -214,6 +272,7 @@ impl From<LlamaRunnerSettings> for LlamaModelConfig {
             use_flash_attention: op.use_flash_attention,
             system_prompt: op.system_prompt,
             mtmd: op.mtmd,
+            mtp,
         }
     }
 }
@@ -221,26 +280,36 @@ impl From<LlamaRunnerSettings> for LlamaModelConfig {
 impl LlamaModelConfig {
     /// Convert the model to a path - may download from huggingface
     pub(in crate::model) fn get_or_load_model(&self) -> Result<Vec<PathBuf>> {
-        let modelfiles = self.model.split(',').map(PathBuf::from).collect::<Vec<_>>();
-        match self.hf_repo.clone() {
-            None => Ok(modelfiles),
-            Some(repo) => {
-                let api = ApiBuilder::from_env()
-                    .with_progress(false)
-                    .build()
-                    .with_context(|| "unable to create huggingface api")?
-                    .model(repo);
-                modelfiles
-                    .iter()
-                    .map(|model| {
-                        api.get(model.to_string_lossy().as_ref())
-                            .with_context(|| "unable to download model")
-                    })
-                    .collect()
-            }
-        }
+        resolve_model_files(&self.model, self.hf_repo.as_deref())
+    }
+
+    /// Convert the MTP draft model to a path - may download from huggingface.
+    pub(in crate::model) fn get_or_load_mtp_draft_model(&self) -> Result<Option<Vec<PathBuf>>> {
+        let Some(mtp) = &self.mtp else {
+            return Ok(None);
+        };
+        let Some(model) = mtp.draft_model.as_deref() else {
+            return Ok(None);
+        };
+        let repo = mtp.draft_hf_repo.as_deref().or(self.hf_repo.as_deref());
+        resolve_model_files(model, repo).map(Some)
     }
 }
+
+fn resolve_model_files(model: &str, hf_repo: Option<&str>) -> Result<Vec<PathBuf>> {
+    let modelfiles = model.split(',').map(PathBuf::from).collect::<Vec<_>>();
+    match hf_repo {
+        None => Ok(modelfiles),
+        Some(repo) => modelfiles
+            .iter()
+            .map(|model| {
+                hf_hub_utils::download_hf_file(repo, model.to_string_lossy().as_ref())
+                    .with_context(|| "unable to download model")
+            })
+            .collect(),
+    }
+}
+
 impl Default for LlamaModelConfig {
     fn default() -> Self {
         Self {
@@ -260,6 +329,7 @@ impl Default for LlamaModelConfig {
             use_flash_attention: None,
             system_prompt: None,
             mtmd: None,
+            mtp: None,
         }
     }
 }
@@ -444,7 +514,7 @@ pub(in crate::model) enum CachedChunk {
 }
 
 pub(in crate::model) struct SyncContext {
-    ctx: LlamaContext<'static>,
+    inner: SyncContextInner,
     /// Tokens whose KV is currently present in `ctx` (the previous text
     /// request's prompt). Used for text prefix reuse. Empty when the KV cache is
     /// empty or its contents are unknown (e.g. after an error). Bound to the
@@ -457,6 +527,11 @@ pub(in crate::model) struct SyncContext {
     pub(in crate::model) cached_chunks: Vec<CachedChunk>,
 }
 
+pub(in crate::model) enum SyncContextInner {
+    Plain(LlamaContext<'static>),
+    Mtp(MtpSpeculative<'static>),
+}
+
 // SAFETY: see the type-level comment — exclusive `&mut self` access plus
 // jobworkerp's one-execution-at-a-time guarantee preclude concurrent use.
 unsafe impl Send for SyncContext {}
@@ -465,14 +540,32 @@ unsafe impl Sync for SyncContext {}
 impl SyncContext {
     pub(in crate::model) fn new(ctx: LlamaContext<'static>) -> Self {
         Self {
-            ctx,
+            inner: SyncContextInner::Plain(ctx),
             cached_tokens: Vec::new(),
             cached_chunks: Vec::new(),
         }
     }
 
+    pub(in crate::model) fn new_mtp(mtp: MtpSpeculative<'static>) -> Self {
+        Self {
+            inner: SyncContextInner::Mtp(mtp),
+            cached_tokens: Vec::new(),
+            cached_chunks: Vec::new(),
+        }
+    }
+
+    pub(in crate::model) fn ctx(&self) -> &LlamaContext<'static> {
+        match &self.inner {
+            SyncContextInner::Plain(ctx) => ctx,
+            SyncContextInner::Mtp(mtp) => mtp.target_context(),
+        }
+    }
+
     pub(in crate::model) fn ctx_mut(&mut self) -> &mut LlamaContext<'static> {
-        &mut self.ctx
+        match &mut self.inner {
+            SyncContextInner::Plain(ctx) => ctx,
+            SyncContextInner::Mtp(mtp) => mtp.target_context_mut(),
+        }
     }
 
     /// Take the text prefix-reuse record (leaving it empty) and forget the
@@ -644,21 +737,45 @@ pub(in crate::model) fn shared_model(
     build: impl FnOnce() -> Result<LlamaModel>,
 ) -> Result<&'static LlamaModel> {
     static MODEL: OnceLock<(LlamaModel, String)> = OnceLock::new();
+    shared_model_in(&MODEL, "model", identity, build)
+}
 
-    if MODEL.get().is_none() {
+/// MTP draft models are loaded independently from the target model. Keeping a
+/// separate slot prevents the target-model singleton from rejecting the
+/// expected target/draft pair while still catching accidental draft reloads.
+/// The load-once/`'static`/identity contract is the same as [`shared_model`].
+pub(in crate::model) fn shared_mtp_draft_model(
+    identity: &str,
+    build: impl FnOnce() -> Result<LlamaModel>,
+) -> Result<&'static LlamaModel> {
+    static MODEL: OnceLock<(LlamaModel, String)> = OnceLock::new();
+    shared_model_in(&MODEL, "MTP draft model", identity, build)
+}
+
+/// Shared body for the per-process model singletons: load once into `slot`, then
+/// reject any later load whose `identity` differs. `kind` labels the model in the
+/// rejection message ("model" / "MTP draft model"). Each caller owns a distinct
+/// `slot` so the target and draft models never collide.
+fn shared_model_in(
+    slot: &'static OnceLock<(LlamaModel, String)>,
+    kind: &str,
+    identity: &str,
+    build: impl FnOnce() -> Result<LlamaModel>,
+) -> Result<&'static LlamaModel> {
+    if slot.get().is_none() {
         // Build is fallible, so it can't run inside `get_or_init`.
         let model = build()?;
         // A racing thread may have stored first; ignore the loser's `set` — the
         // identity check below validates every caller against whatever won.
-        let _ = MODEL.set((model, identity.to_string()));
+        let _ = slot.set((model, identity.to_string()));
     }
 
-    let (stored_model, stored_identity) = MODEL.get().expect("model stored above");
+    let (stored_model, stored_identity) = slot.get().expect("model stored above");
     if stored_identity != identity {
         bail!(
-            "a different model is already loaded in this process \
+            "a different {kind} is already loaded in this process \
              (loaded: {stored_identity}, requested: {identity}). \
-             This plugin supports a single model per process."
+             This plugin supports a single {kind} per process."
         );
     }
     Ok(stored_model)
@@ -808,6 +925,7 @@ mod tests {
             use_flash_attention: None,
             system_prompt: None,
             mtmd: None,
+            mtp: None,
         };
         let config: LlamaModelConfig = settings.into();
         assert_eq!(config.n_batch, Some(2048));
@@ -869,6 +987,95 @@ mod tests {
         let default = LlamaContextParams::default();
         assert_eq!(default.n_batch(), 2048);
         assert_eq!(default.n_ubatch(), 512);
+    }
+
+    #[test]
+    fn test_runner_settings_maps_mtp_defaults_to_config() {
+        use jobworkerp_llama_protobuf::protobuf::llama_cpp::{
+            KvCacheType as ProtoKv, MtpSpeculativeSettings,
+        };
+
+        let config: LlamaModelConfig = LlamaRunnerSettings {
+            model: "m.gguf".to_string(),
+            type_k: Some(ProtoKv::Q80 as i32),
+            type_v: Some(ProtoKv::F16 as i32),
+            mtp: Some(MtpSpeculativeSettings {
+                enabled: true,
+                n_max: None,
+                n_min: None,
+                p_min: None,
+                draft_type_k: None,
+                draft_type_v: None,
+                draft_model: None,
+                draft_hf_repo: None,
+            }),
+            ..Default::default()
+        }
+        .into();
+
+        let mtp = config.mtp.expect("enabled mtp should map to config");
+        assert_eq!(mtp.n_max, 3);
+        assert_eq!(mtp.n_min, 0);
+        assert_eq!(mtp.p_min, 0.0);
+        assert_eq!(mtp.draft_type_k, Some(ProtoKv::Q80 as i32));
+        assert_eq!(mtp.draft_type_v, Some(ProtoKv::F16 as i32));
+        assert_eq!(mtp.draft_model, None);
+        assert_eq!(mtp.draft_hf_repo, None);
+    }
+
+    #[test]
+    fn test_runner_settings_maps_mtp_disabled_to_none() {
+        use jobworkerp_llama_protobuf::protobuf::llama_cpp::MtpSpeculativeSettings;
+
+        let absent: LlamaModelConfig = LlamaRunnerSettings::default().into();
+        assert!(absent.mtp.is_none());
+
+        let disabled: LlamaModelConfig = LlamaRunnerSettings {
+            mtp: Some(MtpSpeculativeSettings {
+                enabled: false,
+                n_max: Some(4),
+                n_min: Some(1),
+                p_min: Some(0.5),
+                draft_type_k: None,
+                draft_type_v: None,
+                draft_model: None,
+                draft_hf_repo: None,
+            }),
+            ..Default::default()
+        }
+        .into();
+        assert!(disabled.mtp.is_none());
+    }
+
+    #[test]
+    fn test_runner_settings_maps_explicit_mtp_values_to_config() {
+        use jobworkerp_llama_protobuf::protobuf::llama_cpp::{
+            KvCacheType as ProtoKv, MtpSpeculativeSettings,
+        };
+
+        let config: LlamaModelConfig = LlamaRunnerSettings {
+            mtp: Some(MtpSpeculativeSettings {
+                enabled: true,
+                n_max: Some(4),
+                n_min: Some(1),
+                p_min: Some(0.25),
+                draft_type_k: Some(ProtoKv::Q80 as i32),
+                draft_type_v: Some(ProtoKv::Q80 as i32),
+                draft_model: Some("mtp-model.gguf".to_string()),
+                draft_hf_repo: Some("org/mtp".to_string()),
+            }),
+            ..Default::default()
+        }
+        .into();
+
+        let mtp = config.mtp.expect("enabled mtp should map to config");
+        assert_eq!(mtp.n_max, 4);
+        assert_eq!(mtp.n_min, 1);
+        assert_eq!(mtp.p_min, 0.25);
+        assert_eq!(mtp.draft_type_k, Some(ProtoKv::Q80 as i32));
+        assert_eq!(mtp.draft_type_v, Some(ProtoKv::Q80 as i32));
+        assert_eq!(mtp.draft_model, Some("mtp-model.gguf".to_string()));
+        assert_eq!(mtp.draft_hf_repo, Some("org/mtp".to_string()));
     }
 
     #[test]

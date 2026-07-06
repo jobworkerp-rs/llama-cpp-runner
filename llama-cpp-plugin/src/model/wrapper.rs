@@ -10,6 +10,7 @@ use super::*;
 
 pub struct LlamaModelWrapper {
     pub(in crate::model) model: &'static LlamaModel,
+    pub(in crate::model) mtp_draft_model: Option<&'static LlamaModel>,
     pub(in crate::model) backend: &'static LlamaBackend,
     pub(in crate::model) ctx_params: LlamaContextParams,
     pub(in crate::model) system_prompt: String,
@@ -23,6 +24,7 @@ pub struct LlamaModelWrapper {
     /// When true, keep the longest common prompt prefix in the KV cache across
     /// requests (text-only) instead of clearing it each time. See [`SyncContext`].
     pub(in crate::model) reuse_kv_prefix: bool,
+    pub(in crate::model) mtp: Option<MtpSpeculativeConfig>,
     pub(in crate::model) mtmd: Option<MtmdRuntime>,
     pub(in crate::model) media_limits: MediaLimits,
 }
@@ -69,6 +71,25 @@ impl LlamaModelWrapper {
             )
             .with_context(|| "unable to load model")
         })?;
+        let draft_model_paths = config
+            .get_or_load_mtp_draft_model()
+            .with_context(|| "failed to get MTP draft model from args")?;
+        // The draft model reuses the target's `model_params` (GPU layers +
+        // KV overrides): MTP speculation pairs a draft with the same offload
+        // profile as the target it drafts for.
+        let mtp_draft_model = draft_model_paths
+            .map(|paths| {
+                let draft_identity = model_load_identity(&paths, &config);
+                shared_mtp_draft_model(&draft_identity, || {
+                    LlamaModel::load_from_file(
+                        backend,
+                        paths[0].as_ref() as &std::path::Path,
+                        &model_params,
+                    )
+                    .with_context(|| "unable to load MTP draft model")
+                })
+            })
+            .transpose()?;
 
         // initialize the context
         let mut ctx_params = LlamaContextParams::default()
@@ -149,11 +170,13 @@ impl LlamaModelWrapper {
 
         Ok(Self {
             model,
+            mtp_draft_model,
             backend,
             ctx_params,
             system_prompt: config.system_prompt.unwrap_or_default(),
             context: None,
             reuse_kv_prefix: config.reuse_kv_prefix,
+            mtp: config.mtp,
             mtmd,
             media_limits,
         })
@@ -162,15 +185,8 @@ impl LlamaModelWrapper {
     /// Resolve mmproj file path — download from HF if hf_repo is provided.
     fn resolve_mmproj_path(mmproj: &str, hf_repo: Option<&str>) -> Result<PathBuf> {
         match hf_repo {
-            Some(repo) => {
-                let api = ApiBuilder::from_env()
-                    .with_progress(false)
-                    .build()
-                    .with_context(|| "unable to create huggingface api for mmproj")?
-                    .model(repo.to_string());
-                api.get(mmproj)
-                    .with_context(|| format!("unable to download mmproj: {mmproj}"))
-            }
+            Some(repo) => hf_hub_utils::download_hf_file(repo, mmproj)
+                .with_context(|| format!("unable to download mmproj: {mmproj}")),
             None => Ok(PathBuf::from(mmproj)),
         }
     }
@@ -270,17 +286,35 @@ impl LlamaModelWrapper {
             return Ok(());
         }
         let t_ctx_start = ggml_time_us();
-        let ctx = self
+        let mut ctx = self
             .model
             .new_context(self.backend, self.ctx_params.clone())
             .with_context(|| "unable to create the llama_context")?;
+        let context = if let Some(mtp) = &self.mtp {
+            let mut draft_params = self.ctx_params.clone();
+            if let Some(type_k) = mtp.draft_type_k.and_then(proto_kv_cache_type) {
+                draft_params = draft_params.with_type_k(type_k);
+            }
+            if let Some(type_v) = mtp.draft_type_v.and_then(proto_kv_cache_type) {
+                draft_params = draft_params.with_type_v(type_v);
+            }
+            let draft_model = self.mtp_draft_model.unwrap_or(self.model);
+            let draft_ctx = draft_model
+                .new_mtp_context(self.backend, draft_params, &mut ctx)
+                .with_context(|| "unable to create the MTP draft llama_context")?;
+            let spec = MtpSpeculative::new(ctx, draft_ctx, mtp.params())
+                .map_err(|e| anyhow!("unable to initialize MTP speculative decoding: {e}"))?;
+            SyncContext::new_mtp(spec)
+        } else {
+            SyncContext::new(ctx)
+        };
         tracing::info!(
             "context created in {:.3} s (n_batch={}, n_ubatch={}); reused for subsequent requests",
             Duration::from_micros((ggml_time_us() - t_ctx_start) as u64).as_secs_f32(),
-            ctx.n_batch(),
-            ctx.n_ubatch(),
+            context.ctx().n_batch(),
+            context.ctx().n_ubatch(),
         );
-        self.context = Some(SyncContext::new(ctx));
+        self.context = Some(context);
         Ok(())
     }
 

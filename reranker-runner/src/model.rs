@@ -114,17 +114,9 @@ impl LlamaRerankerModel {
             return Err(RerankerError::config_error("HF repo not specified"));
         }
 
-        let api = hf_hub::api::sync::ApiBuilder::from_env()
-            .with_progress(false)
-            .build()
-            .map_err(|e| RerankerError::HfHubError(format!("API init failed: {:?}", e)))?;
-
-        let repo_api = api.model(config.hf_repo.clone());
-
         // Download the model file (assumes model_id is the filename)
-        let local_path = repo_api
-            .get(&config.model_id)
-            .map_err(|e| RerankerError::HfHubError(format!("Download failed: {:?}", e)))?;
+        let local_path = hf_hub_utils::download_hf_file(&config.hf_repo, &config.model_id)
+            .map_err(|e| RerankerError::HfHubError(format!("Download failed: {e:#}")))?;
 
         Ok(local_path.to_string_lossy().to_string())
     }

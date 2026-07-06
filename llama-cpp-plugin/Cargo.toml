@@ -27,6 +27,7 @@ encoding_rs = { workspace = true }
 envy = { workspace = true }
 futures = { workspace = true }
 hf-hub = { workspace = true }
+hf-hub-utils = { workspace = true }
 llama-cpp-2 = { workspace = true }
 # Vendored OpenSSL (configured in workspace) keeps libssl/libcrypto out of
 # runtime dependencies. Required because hf-hub's default features select

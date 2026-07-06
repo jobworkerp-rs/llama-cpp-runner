@@ -204,6 +204,16 @@ mod binary_compat_tests {
             "typeV": "KV_CACHE_TYPE_F16",
             "useFlashAttention": true,
             "systemPrompt": "You are helpful.",
+            "mtp": {
+                "enabled": true,
+                "nMax": 4,
+                "nMin": 1,
+                "pMin": 0.125,
+                "draftTypeK": "KV_CACHE_TYPE_Q8_0",
+                "draftTypeV": "KV_CACHE_TYPE_F16",
+                "draftModel": "mtp-model.gguf",
+                "draftHfRepo": "org/mtp"
+            },
             "mtmd": {
                 "mmproj": "mmproj.gguf",
                 "mmprojHfRepo": "org/mmproj",
@@ -234,6 +244,21 @@ mod binary_compat_tests {
             Some(crate::protobuf::llama_cpp::KvCacheType::F16 as i32)
         );
         assert_eq!(decoded.use_flash_attention, Some(true));
+        let mtp = decoded.mtp.expect("mtp present");
+        assert!(mtp.enabled);
+        assert_eq!(mtp.n_max, Some(4));
+        assert_eq!(mtp.n_min, Some(1));
+        assert_eq!(mtp.p_min, Some(0.125));
+        assert_eq!(
+            mtp.draft_type_k,
+            Some(crate::protobuf::llama_cpp::KvCacheType::Q80 as i32)
+        );
+        assert_eq!(
+            mtp.draft_type_v,
+            Some(crate::protobuf::llama_cpp::KvCacheType::F16 as i32)
+        );
+        assert_eq!(mtp.draft_model, Some("mtp-model.gguf".into()));
+        assert_eq!(mtp.draft_hf_repo, Some("org/mtp".into()));
 
         let mtmd = decoded.mtmd.expect("mtmd present");
         assert_eq!(mtmd.mmproj, "mmproj.gguf");
@@ -273,6 +298,16 @@ mod binary_compat_tests {
             reuse_kv_prefix: Some(true),
             use_flash_attention: Some(false),
             system_prompt: Some("Be concise.".into()),
+            mtp: Some(crate::protobuf::llama_cpp::MtpSpeculativeSettings {
+                enabled: true,
+                n_max: Some(4),
+                n_min: Some(0),
+                p_min: Some(0.0),
+                draft_type_k: Some(crate::protobuf::llama_cpp::KvCacheType::Q80 as i32),
+                draft_type_v: Some(crate::protobuf::llama_cpp::KvCacheType::Q80 as i32),
+                draft_model: Some("mtp-model.gguf".into()),
+                draft_hf_repo: Some("user/model".into()),
+            }),
             mtmd: Some(crate::protobuf::llama_cpp::MtmdSettings {
                 mmproj: "proj.gguf".into(),
                 mmproj_hf_repo: None,
@@ -298,6 +333,11 @@ mod binary_compat_tests {
         assert_eq!(json["typeK"], "KV_CACHE_TYPE_Q8_0");
         assert_eq!(json["typeV"], "KV_CACHE_TYPE_Q8_0");
         assert_eq!(json["reuseKvPrefix"], true);
+        assert_eq!(json["mtp"]["enabled"], true);
+        assert_eq!(json["mtp"]["nMax"], 4);
+        assert_eq!(json["mtp"]["draftTypeK"], "KV_CACHE_TYPE_Q8_0");
+        assert_eq!(json["mtp"]["draftModel"], "mtp-model.gguf");
+        assert_eq!(json["mtp"]["draftHfRepo"], "user/model");
         assert_eq!(json["mtmd"]["mmproj"], "proj.gguf");
         assert_eq!(json["mtmd"]["allowUrlFetch"], true);
         assert_eq!(json["mtmd"]["maxMediaBytes"], 5000);
