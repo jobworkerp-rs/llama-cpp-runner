@@ -1,5 +1,4 @@
 use crate::error::{EmbeddingLlmError, Result};
-use hf_hub::api::sync::ApiBuilder;
 use llama_cpp_2::{
     context::params::LlamaContextParams,
     llama_backend::LlamaBackend,
@@ -550,15 +549,8 @@ impl LlamaCppModel {
         media_marker: Option<&str>,
     ) -> Result<()> {
         let resolved = match mmproj_hf_repo {
-            Some(repo) => {
-                let api = ApiBuilder::from_env()
-                    .with_progress(false)
-                    .build()
-                    .map_err(|e| EmbeddingLlmError::hf_hub(format!("HF API for mmproj: {e}")))?
-                    .model(repo.to_string());
-                api.get(mmproj_path)
-                    .map_err(|e| EmbeddingLlmError::hf_hub(format!("download mmproj: {e}")))?
-            }
+            Some(repo) => hf_hub_utils::download_hf_file(repo, mmproj_path)
+                .map_err(|e| EmbeddingLlmError::hf_hub(format!("download mmproj: {e:#}")))?,
             None => PathBuf::from(mmproj_path),
         };
 
@@ -742,17 +734,10 @@ pub mod helpers {
 
                 info!("Downloading model from HuggingFace: {}/{}", repo, filename);
 
-                let api = ApiBuilder::from_env()
-                    .with_progress(false)
-                    .build()
-                    .map_err(|e| {
-                        EmbeddingLlmError::hf_hub(format!("Failed to create HF API: {e}"))
-                    })?
-                    .model(repo.to_string());
-
-                let downloaded_path = api.get(filename).map_err(|e| {
-                    EmbeddingLlmError::hf_hub(format!("Failed to download model: {e}"))
-                })?;
+                let downloaded_path =
+                    hf_hub_utils::download_hf_file(repo, filename).map_err(|e| {
+                        EmbeddingLlmError::hf_hub(format!("Failed to download model: {e:#}"))
+                    })?;
 
                 info!("Downloaded model to: {}", downloaded_path.display());
                 return Ok(downloaded_path);

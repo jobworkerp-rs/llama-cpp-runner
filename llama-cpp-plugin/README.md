@@ -93,11 +93,54 @@ Key fields:
 - `type_k`: KV cache data type for K. Defaults to the llama.cpp default (F16) when omitted. Quantizing (e.g. `KV_CACHE_TYPE_Q8_0`) reduces KV cache memory for long contexts.
 - `type_v`: KV cache data type for V. Defaults to the llama.cpp default (F16) when omitted. **V-cache quantization typically requires flash attention** (a warning is logged if `use_flash_attention` is disabled).
 - `reuse_kv_prefix`: keep the KV of the longest common prefix (shared system prompt / document, or the same image) across requests and prefill only the differing suffix. Text is matched per token; images are matched by a content hash, so the same image followed by a different question reuses the image's KV (skipping its encode/decode). Cuts time-to-first-token for workloads that update a shared context across consecutive requests. Defaults to false, which clears the KV cache before each request so requests stay fully independent and deterministic.
+- `mtp`: MTP speculative decoding settings. This is a runner-level setting because the draft context is created with the model context. Omit it or set `enabled=false` to keep the existing decode path. `n_max` defaults to 3, `n_min` to 0, and `p_min` to 0.0. `draft_model` selects a separate MTP draft GGUF; when `draft_hf_repo` is omitted it uses the runner `hf_repo`. `draft_type_k` / `draft_type_v` default to `type_k` / `type_v` when omitted.
 - `use_flash_attention`: enables flash attention when supported
 - `system_prompt`: default system prompt applied by the runner
 - `mtmd`: multimodal projector settings
 
-If `hf_repo` is omitted, `model` is treated as a local path. If `hf_repo` is set, the plugin downloads or reuses cached model files from Hugging Face.
+If `hf_repo` is omitted, `model` is treated as a local path. If `hf_repo` is set, the plugin downloads or reuses cached model files from Hugging Face. Existing snapshot cache entries are reused without a metadata network round-trip, so offline warm starts return immediately. On cache misses, partial `.part` downloads are left resumable and size-mismatched download results are rejected.
+
+### MTP speculative decoding
+
+MTP is currently supported for text-only generation. Requests that include media are rejected with `MTP speculative decoding is not supported with multimodal input yet`; disable `mtp` for multimodal runners.
+
+Example Gemma 4 runner settings:
+
+```json
+{
+  "hfRepo": "unsloth/gemma-4-12B-it-qat-GGUF",
+  "model": "gemma-4-12B-it-qat-UD-Q4_K_XL.gguf",
+  "useFlashAttention": true,
+  "mtp": {
+    "enabled": true,
+    "nMax": 4,
+    "draftModel": "mtp-gemma-4-12B-it.gguf"
+  }
+}
+```
+
+Example Qwen 3.6 MTP runner settings:
+
+```json
+{
+  "hfRepo": "unsloth/Qwen3.6-27B-MTP-GGUF",
+  "model": "Qwen3.6-27B-UD-Q4_K_XL.gguf",
+  "useFlashAttention": true,
+  "mtp": {
+    "enabled": true,
+    "nMax": 4
+  }
+}
+```
+
+Operational procedure:
+
+1. Load the target and draft GGUF files from the same repo. For Gemma 4, use `unsloth/gemma-4-12B-it-qat-GGUF` with target `gemma-4-12B-it-qat-UD-Q4_K_XL.gguf` and draft `mtp-gemma-4-12B-it.gguf`.
+2. For same-file MTP models such as `unsloth/Qwen3.6-27B-MTP-GGUF`, load `Qwen3.6-27B-UD-Q4_K_XL.gguf` and omit `mtp.draftModel`.
+3. Enable flash attention unless you have a backend-specific reason not to.
+4. Set `mtp.enabled=true`; set `mtp.draftModel` only when the model repo provides a separate MTP draft GGUF. Use `nMax=4` for smoke tests, or omit it to use the default `3`.
+5. Run text-only `chat` / `completion` / `run` requests and compare output quality against the same runner with `mtp.enabled=false`.
+6. Keep multimodal workloads on a separate runner with `mtp` omitted until multimodal+MTP is validated.
 
 ## Diagnosing Inference Speed
 

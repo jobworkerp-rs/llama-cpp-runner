@@ -70,6 +70,7 @@ For iterative work, prefer validating the target crate first before running the 
 - Hardware acceleration is exposed through crate features such as `cuda`, `metal`, and `openmp` where supported.
 - Shared code should stay in `modules/` or dedicated helper crates instead of being copied into plugin crates.
 - If you change protobuf contracts or public plugin behavior, update the relevant crate-level documentation as well.
+- `modules/llama-cpp-rs` is based on `llama-cpp-rs` `0.1.151`. `llama-cpp-plugin` exposes runner-level MTP speculative decoding settings through `llama_cpp.LlamaRunnerSettings.mtp`; see [llama-cpp-plugin/README.md](llama-cpp-plugin/README.md) for the text-only limitation and Gemma 4 validation procedure.
 - **CUDA build / NCCL runtime dependency**: When `libnccl` and `nccl.h` are installed on the build host, `llama.cpp`'s CMake auto-detects NCCL via `find_package(NCCL)` and compiles NCCL support into ggml-cuda. The resulting `.so` then has `libnccl.so.2` as a load-time dependency, so `dlopen()` will fail at plugin load on runtime images that do not ship NCCL (for example `ghcr.io/jobworkerp-rs/grpc-front`).
 
   This project does not currently use NCCL (no multi-GPU collective operations), so we recommend hiding NCCL from CMake at build time with one of the following:

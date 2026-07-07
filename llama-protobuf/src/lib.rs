@@ -11,5 +11,7 @@ pub mod protobuf {
 
 // Convenience re-exports so downstream crates can `use jobworkerp_llama_protobuf::MediaInput;`
 // instead of the full protobuf path.
-pub use protobuf::llama_cpp::{MediaInput, MediaKind, MtmdSettings, RawAudio, RawImage};
+pub use protobuf::llama_cpp::{
+    MediaInput, MediaKind, MtmdSettings, MtpSpeculativeSettings, RawAudio, RawImage,
+};
 pub use protobuf::llm::{LlmChatArgs, LlmChatResult, LlmCompletionArgs, LlmCompletionResult};

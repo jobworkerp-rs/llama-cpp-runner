@@ -93,11 +93,54 @@ jobworkerp 標準 completion runner (Ollama / GenAI) との互換性差分:
 - `type_k`: KV キャッシュの K 側データ型。未指定時は llama.cpp 既定値 (F16)。`KV_CACHE_TYPE_Q8_0` 等に量子化すると長コンテキストの KV キャッシュ使用量を削減できます。
 - `type_v`: KV キャッシュの V 側データ型。未指定時は llama.cpp 既定値 (F16)。**V 側の量子化は通常 flash attention が必須**です(`use_flash_attention` が無効だと warn を出します)。
 - `reuse_kv_prefix`: リクエスト間で共通する先頭(システムプロンプト+文書、または同一画像など)の KV を残し、差分だけ prefill します。テキストはトークン単位、画像は内容ハッシュで同一性を判定し、共通する chunk を再利用します(同一画像+異なる質問の連続では画像の encode/decode もスキップ)。共通文脈を更新しながら連続リクエストするワークロードで TTFT を大幅短縮できます。デフォルト false では毎回 KV を全消去し、リクエストは完全独立・決定的です。
+- `mtp`: MTP speculative decoding 設定。draft context は model context と同時に作るため runner-level 設定です。省略または `enabled=false` の場合は既存の decode path のままです。`n_max` は既定 3、`n_min` は 0、`p_min` は 0.0 です。`draft_model` で別 MTP draft GGUF を指定できます。`draft_hf_repo` を省略すると runner の `hf_repo` を使います。`draft_type_k` / `draft_type_v` を省略すると `type_k` / `type_v` と同じ値を使います。
 - `use_flash_attention`: 対応環境で flash attention を有効化
 - `system_prompt`: ランナー既定の system prompt
 - `mtmd`: マルチモーダル projector 設定
 
-`hf_repo` を省略した場合、`model` はローカルパスとして扱います。`hf_repo` を指定した場合は、Hugging Face からモデルを取得するか、既存キャッシュを再利用します。
+`hf_repo` を省略した場合、`model` はローカルパスとして扱います。`hf_repo` を指定した場合は、Hugging Face からモデルを取得するか、既存キャッシュを再利用します。既存 snapshot cache がある場合は metadata のネットワーク往復を行わずに再利用するため、オフラインの warm start は即座に返ります。cache miss 時は途中までの `.part` ダウンロードを再開用に残し、download 結果の size 不一致は拒否します。
+
+### MTP speculative decoding
+
+MTP は現在 text-only 生成で対応しています。media を含むリクエストは `MTP speculative decoding is not supported with multimodal input yet` で拒否します。multimodal 用 runner では `mtp` を省略してください。
+
+Gemma 4 の runner settings 例:
+
+```json
+{
+  "hfRepo": "unsloth/gemma-4-12B-it-qat-GGUF",
+  "model": "gemma-4-12B-it-qat-UD-Q4_K_XL.gguf",
+  "useFlashAttention": true,
+  "mtp": {
+    "enabled": true,
+    "nMax": 4,
+    "draftModel": "mtp-gemma-4-12B-it.gguf"
+  }
+}
+```
+
+Qwen 3.6 MTP の runner settings 例:
+
+```json
+{
+  "hfRepo": "unsloth/Qwen3.6-27B-MTP-GGUF",
+  "model": "Qwen3.6-27B-UD-Q4_K_XL.gguf",
+  "useFlashAttention": true,
+  "mtp": {
+    "enabled": true,
+    "nMax": 4
+  }
+}
+```
+
+運用手順:
+
+1. target と draft の GGUF を同じ repo からロードします。Gemma 4 では `unsloth/gemma-4-12B-it-qat-GGUF` の target `gemma-4-12B-it-qat-UD-Q4_K_XL.gguf` と draft `mtp-gemma-4-12B-it.gguf` を使います。
+2. `unsloth/Qwen3.6-27B-MTP-GGUF` のような same-file MTP モデルでは `Qwen3.6-27B-UD-Q4_K_XL.gguf` をロードし、`mtp.draftModel` は省略します。
+3. backend 固有の理由がなければ flash attention を有効にします。
+4. `mtp.enabled=true` を設定します。別 MTP draft GGUF がある repo だけ `mtp.draftModel` を設定します。smoke test では `nMax=4`、未指定時は既定値 `3` です。
+5. text-only の `chat` / `completion` / `run` を実行し、`mtp.enabled=false` の runner と出力品質を比較します。
+6. multimodal workload は、multimodal+MTP の検証が終わるまで `mtp` 省略の別 runner で運用します。
 
 ## 推論速度の計測と切り分け
 

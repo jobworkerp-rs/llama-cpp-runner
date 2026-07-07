@@ -12,6 +12,9 @@ use super::*;
 
 impl LlamaModelWrapper {
     pub(in crate::model) fn decode(&mut self, args: InferenceArgs) -> Result<DecodeOutput> {
+        if self.mtp.is_some() && !args.medias.is_empty() {
+            bail!(ERR_MTP_WITH_MULTIMODAL);
+        }
         match (args.medias.is_empty(), self.mtmd.is_some()) {
             (true, _) => self.decode_text_only(args),
             (false, false) => bail!("multimodal input given but mmproj is not configured"),
@@ -688,6 +691,20 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_mtp_with_multimodal_is_rejected_before_decode_routing() {
+        let source = include_str!("decode.rs");
+
+        assert!(
+            source.contains("self.mtp.is_some() && !args.medias.is_empty()"),
+            "MTP must reject multimodal input before entering the multimodal decode path"
+        );
+        assert!(
+            source.contains("ERR_MTP_WITH_MULTIMODAL"),
+            "MTP multimodal rejection must use the shared error string"
+        );
+    }
+
     /// Regression test: a prompt longer than the configured `n_batch` must be
     /// prefilled in chunks. Before chunking, the single-batch decode tripped
     /// `llama_decode`'s `n_tokens <= n_batch` assertion and aborted. Uses a
@@ -726,6 +743,108 @@ mod tests {
             .expect("chunked-prefill generation failed");
         assert!(!output.is_empty(), "Output should not be empty");
         println!("chunked-prefill output: {output}");
+    }
+
+    /// MTP smoke test with a real Gemma 4 GGUF model from Hugging Face.
+    ///
+    /// ```bash
+    /// cargo test -p jobworkerp-llama-cpp-plugin test_mtp_text_generation_with_real_gemma4_model \
+    ///     --release -- --ignored --test-threads=1 --nocapture
+    /// ```
+    #[test]
+    #[ignore]
+    fn test_mtp_text_generation_with_real_gemma4_model() {
+        let config = LlamaModelConfig {
+            model: "gemma-4-12B-it-qat-UD-Q4_K_XL.gguf".to_string(),
+            hf_repo: Some("unsloth/gemma-4-12B-it-qat-GGUF".to_string()),
+            key_value_overrides: None,
+            disable_gpu: false,
+            seed: Some(1234),
+            threads: Some(8),
+            threads_batch: Some(8),
+            ctx_size: std::num::NonZeroU32::new(2048),
+            n_batch: Some(512),
+            n_ubatch: Some(512),
+            type_k: None,
+            type_v: None,
+            reuse_kv_prefix: false,
+            use_flash_attention: Some(true),
+            system_prompt: Some("You are a concise assistant.".to_string()),
+            mtmd: None,
+            mtp: Some(MtpSpeculativeConfig {
+                n_max: 2,
+                n_min: 0,
+                p_min: 0.0,
+                draft_type_k: None,
+                draft_type_v: None,
+                draft_model: Some("mtp-gemma-4-12B-it.gguf".to_string()),
+                draft_hf_repo: Some("unsloth/gemma-4-12B-it-qat-GGUF".to_string()),
+            }),
+        };
+
+        let mut wrapper = LlamaModelWrapper::new(config).expect("load Gemma 4 with MTP");
+        let output = wrapper
+            .run(InferenceArgs {
+                prompt: "Write one short sentence about Rust.".to_string(),
+                max_new_tokens: Some(16),
+                seed: Some(1234),
+                ..Default::default()
+            })
+            .expect("MTP text generation should complete");
+
+        assert!(!output.trim().is_empty(), "MTP output must not be empty");
+        println!("Gemma 4 MTP smoke output: {output}");
+    }
+
+    /// MTP smoke test with a real Qwen 3.6 MTP GGUF model from Hugging Face.
+    ///
+    /// ```bash
+    /// cargo test -p jobworkerp-llama-cpp-plugin test_mtp_text_generation_with_real_qwen36_model \
+    ///     --release -- --ignored --test-threads=1 --nocapture
+    /// ```
+    #[test]
+    #[ignore]
+    fn test_mtp_text_generation_with_real_qwen36_model() {
+        let config = LlamaModelConfig {
+            model: "Qwen3.6-27B-UD-Q4_K_XL.gguf".to_string(),
+            hf_repo: Some("unsloth/Qwen3.6-27B-MTP-GGUF".to_string()),
+            key_value_overrides: None,
+            disable_gpu: false,
+            seed: Some(1234),
+            threads: Some(8),
+            threads_batch: Some(8),
+            ctx_size: std::num::NonZeroU32::new(2048),
+            n_batch: Some(512),
+            n_ubatch: Some(512),
+            type_k: None,
+            type_v: None,
+            reuse_kv_prefix: false,
+            use_flash_attention: Some(true),
+            system_prompt: Some("You are a concise assistant.".to_string()),
+            mtmd: None,
+            mtp: Some(MtpSpeculativeConfig {
+                n_max: 2,
+                n_min: 0,
+                p_min: 0.0,
+                draft_type_k: None,
+                draft_type_v: None,
+                draft_model: None,
+                draft_hf_repo: None,
+            }),
+        };
+
+        let mut wrapper = LlamaModelWrapper::new(config).expect("load Qwen 3.6 with MTP");
+        let output = wrapper
+            .run(InferenceArgs {
+                prompt: "Write one short sentence about Rust.".to_string(),
+                max_new_tokens: Some(16),
+                seed: Some(1234),
+                ..Default::default()
+            })
+            .expect("Qwen 3.6 MTP text generation should complete");
+
+        assert!(!output.trim().is_empty(), "MTP output must not be empty");
+        println!("Qwen 3.6 MTP smoke output: {output}");
     }
 
     /// Context reuse across requests must be transparent: the reused context is
@@ -979,6 +1098,7 @@ mod tests {
                 max_decoded_media_bytes: 100_000_000,
                 allowed_media_dirs: vec![],
             }),
+            mtp: None,
         };
 
         let mut wrapper = LlamaModelWrapper::new(config).expect("Failed to load model");
@@ -1264,6 +1384,7 @@ mod tests {
                 max_decoded_media_bytes: 100_000_000,
                 allowed_media_dirs: vec![],
             }),
+            mtp: None,
         };
 
         let mut wrapper = LlamaModelWrapper::new(config).expect("Failed to load model");

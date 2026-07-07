@@ -55,14 +55,10 @@ impl TokenizationProcessor {
         info!("Creating fallback tokenizer from: {}", model_id);
 
         // HuggingFace Hubからtokenizer.jsonファイルをダウンロード
-        let api = hf_hub::api::sync::ApiBuilder::from_env()
-            .with_progress(false)
-            .build()
-            .map_err(|e| EmbeddingLlmError::hf_hub(format!("Failed to create HF API: {e}")))?;
-        let repo = api.model(model_id.to_string());
-        let tokenizer_file = repo.get("tokenizer.json").map_err(|e| {
-            EmbeddingLlmError::hf_hub(format!("Failed to download tokenizer.json: {e}"))
-        })?;
+        let tokenizer_file =
+            hf_hub_utils::download_hf_file(model_id, "tokenizer.json").map_err(|e| {
+                EmbeddingLlmError::hf_hub(format!("Failed to download tokenizer.json: {e:#}"))
+            })?;
 
         // Tokenizerファイルから初期化
         let tokenizer = tokenizers::Tokenizer::from_file(tokenizer_file).map_err(|e| {
