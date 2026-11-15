@@ -11,6 +11,8 @@ fn main() {
         "jobworkerp/runner/llm/chat_result.proto",
         "jobworkerp/runner/llm/completion_args.proto",
         "jobworkerp/runner/llm/completion_result.proto",
+        "jobworkerp/runner/llm/token_count_args.proto",
+        "jobworkerp/runner/llm/token_count_result.proto",
     ];
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=protobuf");

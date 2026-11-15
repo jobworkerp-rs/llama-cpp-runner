@@ -31,11 +31,13 @@ Release build:
 cargo build --release
 ```
 
-CUDA-enabled release build:
+CUDA-enabled release build (see the CUDA build notes below):
 
 ```bash
 cargo build --release --features cuda
 ```
+
+llama.cpp's CPU kernels follow rustc's target CPU, and the default `x86_64` target has no AVX. Build with an explicit CPU level for usable CPU inference, for example `RUSTFLAGS=-Ctarget-cpu=x86-64-v3` (the level of the released binaries) or `-Ctarget-cpu=native` for the build machine only.
 
 ## Test And Lint
 
@@ -70,20 +72,12 @@ For iterative work, prefer validating the target crate first before running the 
 - Hardware acceleration is exposed through crate features such as `cuda`, `metal`, and `openmp` where supported.
 - Shared code should stay in `modules/` or dedicated helper crates instead of being copied into plugin crates.
 - If you change protobuf contracts or public plugin behavior, update the relevant crate-level documentation as well.
-- `modules/llama-cpp-rs` is based on `llama-cpp-rs` `0.1.151`. `llama-cpp-plugin` exposes runner-level MTP speculative decoding settings through `llama_cpp.LlamaRunnerSettings.mtp`; see [llama-cpp-plugin/README.md](llama-cpp-plugin/README.md) for the text-only limitation and Gemma 4 validation procedure.
-- **CUDA build / NCCL runtime dependency**: When `libnccl` and `nccl.h` are installed on the build host, `llama.cpp`'s CMake auto-detects NCCL via `find_package(NCCL)` and compiles NCCL support into ggml-cuda. The resulting `.so` then has `libnccl.so.2` as a load-time dependency, so `dlopen()` will fail at plugin load on runtime images that do not ship NCCL (for example `ghcr.io/jobworkerp-rs/grpc-front`).
-
-  This project does not currently use NCCL (no multi-GPU collective operations), so we recommend hiding NCCL from CMake at build time with one of the following:
-
-  1. Temporarily move `libnccl*` and `nccl.h` out of the way on the build host (this is what CI does):
-     ```bash
-     sudo find /usr /opt/cuda /usr/local/cuda \( -name 'nccl.h' -o -name 'libnccl*' \) \
-       -exec mv {} {}.disabled-for-build \;
-     cargo build --release --features cuda
-     ```
-  2. Or simply do not install NCCL on the build host.
-
-  Note: `llama-cpp-sys-2` exposes no Cargo feature to disable NCCL and provides no way to forward an external CMake option (`-DGGML_CUDA_NCCL=OFF`) to the underlying build, so the approaches above are the practical workarounds today.
+- `modules/llama-cpp-rs` is based on `llama-cpp-rs` `0.1.154`. `llama-cpp-plugin` exposes runner-level MTP speculative decoding settings through `llama_cpp.LlamaRunnerSettings.mtp`; see [llama-cpp-plugin/README.md](llama-cpp-plugin/README.md) for the text-only limitation and Gemma 4 validation procedure.
+- **CUDA build notes**: `llama-cpp-sys-2` forwards `CMAKE_*` and `GGML_*` environment variables to llama.cpp's CMake build, and always builds ggml-cuda without NCCL (`GGML_CUDA_NCCL=OFF`), so the plugins never depend on `libnccl.so.2`. Set `CMAKE_POSITION_INDEPENDENT_CODE=ON` (CUDA objects must be position independent to link into the plugin shared libraries) and, to avoid building every GPU architecture, `CMAKE_CUDA_ARCHITECTURES` (for example `89`):
+  ```bash
+  CMAKE_POSITION_INDEPENDENT_CODE=ON CMAKE_CUDA_ARCHITECTURES=89 cargo build --release --features cuda
+  ```
+- Prebuilt plugins are attached to the [GitHub Releases](https://github.com/jobworkerp-rs/llama-cpp-runner/releases) with their runtime requirements.
 
 ## License
 

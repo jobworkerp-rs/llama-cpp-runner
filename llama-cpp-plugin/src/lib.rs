@@ -5,8 +5,8 @@ pub mod reasoning_splitter;
 use anyhow::{Context, Result, anyhow};
 use jobworkerp_llama_protobuf::protobuf::llama_cpp::{LlamaArg, LlamaRunnerSettings};
 use jobworkerp_llama_protobuf::protobuf::llm::{
-    LlmChatArgs, LlmChatResult, LlmCompletionArgs, LlmCompletionResult, llm_chat_result,
-    llm_completion_result,
+    LlmChatArgs, LlmChatResult, LlmCompletionArgs, LlmCompletionResult, TokenCountArgs,
+    TokenCountResult, llm_chat_result, llm_completion_result,
 };
 use jobworkerp_plugin_abi::v2::{CancelToken, HighLevelSink, PluginV2};
 use jobworkerp_plugin_abi_macros::register_plugin_v2;
@@ -40,6 +40,7 @@ fn json_schema_string<T: schemars::JsonSchema>(label: &str) -> String {
 const METHOD_RUN: &str = "run";
 const METHOD_CHAT: &str = "chat";
 const METHOD_COMPLETION: &str = "completion";
+const METHOD_TOKEN_COUNT: &str = "token_count";
 
 /// Error-string surface for cooperative cancellation, shared with the host's
 /// cancellation contract. Callers may match against this exact string.
@@ -309,6 +310,28 @@ fn dispatch_completion(
         return DispatchOutcome::Cancelled;
     }
     tracing::debug!("END OF LLMRunner {METHOD_COMPLETION}: {result:?}");
+    DispatchOutcome::Done(result.encode_to_vec())
+}
+
+fn dispatch_token_count(
+    wrapper: &mut LlamaModelWrapper,
+    arg: Vec<u8>,
+    cancel: &Arc<AtomicBool>,
+) -> DispatchOutcome {
+    let args = match TokenCountArgs::decode(&mut Cursor::new(arg)) {
+        Ok(args) => args,
+        Err(error) => return DispatchOutcome::Err(anyhow!("decode error: {error}")),
+    };
+    if cancel.load(Ordering::Relaxed) {
+        return DispatchOutcome::Cancelled;
+    }
+    let result = match wrapper.token_count(args) {
+        Ok(result) => result,
+        Err(error) => return DispatchOutcome::Err(error),
+    };
+    if cancel.load(Ordering::Relaxed) {
+        return DispatchOutcome::Cancelled;
+    }
     DispatchOutcome::Done(result.encode_to_vec())
 }
 
@@ -777,6 +800,48 @@ impl PluginV2 for LlamaCppPlugin {
                     }
                     .encode_to_vec(),
                 );
+                static RESOLVED_TOKEN_COUNT_ARGS: std::sync::OnceLock<String> =
+                    std::sync::OnceLock::new();
+                let token_count_args = RESOLVED_TOKEN_COUNT_ARGS
+                    .get_or_init(|| {
+                        jobworkerp_llama_protobuf::proto_resolve::resolve_proto_imports(
+                            include_str!(
+                                "../../llama-protobuf/protobuf/jobworkerp/runner/llm/token_count_args.proto"
+                            ),
+                            &[
+                                (
+                                    "jobworkerp/runner/llm/completion_args.proto",
+                                    include_str!(
+                                        "../../llama-protobuf/protobuf/jobworkerp/runner/llm/completion_args.proto"
+                                    ),
+                                ),
+                                (
+                                    "jobworkerp/runner/llm/chat_args.proto",
+                                    include_str!(
+                                        "../../llama-protobuf/protobuf/jobworkerp/runner/llm/chat_args.proto"
+                                    ),
+                                ),
+                            ],
+                        )
+                        .expect("LlamaCppPlugin: token count args proto resolution failed")
+                    })
+                    .clone();
+                schemas.insert(
+                    METHOD_TOKEN_COUNT.to_string(),
+                    MethodSchema {
+                        args_proto: token_count_args,
+                        result_proto: include_str!(
+                            "../../llama-protobuf/protobuf/jobworkerp/runner/llm/token_count_result.proto"
+                        )
+                        .to_string(),
+                        description: Some(
+                            "Exact token count for the loaded llama.cpp model input".to_string(),
+                        ),
+                        output_type: StreamingOutputType::NonStreaming as i32,
+                        ..Default::default()
+                    }
+                    .encode_to_vec(),
+                );
                 schemas
             })
             .clone()
@@ -820,6 +885,19 @@ impl PluginV2 for LlamaCppPlugin {
                                 jobworkerp_llama_protobuf::protobuf::llm::LlmCompletionResult,
                             >(
                                 "completion_result_schema"
+                            )),
+                            ..Default::default()
+                        }
+                        .encode_to_vec(),
+                    );
+                    schemas.insert(
+                        METHOD_TOKEN_COUNT.to_string(),
+                        MethodJsonSchema {
+                            args_schema: json_schema_string::<TokenCountArgs>(
+                                "token_count_args_schema",
+                            ),
+                            result_schema: Some(json_schema_string::<TokenCountResult>(
+                                "token_count_result_schema",
                             )),
                             ..Default::default()
                         }
@@ -899,6 +977,9 @@ impl PluginV2 for LlamaCppPlugin {
             match using.as_deref() {
                 Some(METHOD_CHAT) => dispatch_chat(wrapper, args, &cancel_for_blocking),
                 Some(METHOD_COMPLETION) => dispatch_completion(wrapper, args, &cancel_for_blocking),
+                Some(METHOD_TOKEN_COUNT) => {
+                    dispatch_token_count(wrapper, args, &cancel_for_blocking)
+                }
                 _ => dispatch_legacy(wrapper, args),
             }
         });
@@ -1350,6 +1431,41 @@ Good luck in the competition and in advancing AI research!
                 .expect("completion result_schema"),
         )
         .expect("completion result_schema must be valid JSON");
+    }
+
+    #[test]
+    fn test_token_count_method_registered_with_resolved_args_schema() {
+        let plugin = LlamaCppPlugin::new();
+        let schemas = plugin.method_proto_map();
+        let schema = decode_method_schema(&schemas, METHOD_TOKEN_COUNT);
+
+        assert_eq!(schema.output_type, StreamingOutputType::NonStreaming as i32);
+        assert!(schema.args_proto.contains("message TokenCountArgs"));
+        assert!(schema.args_proto.contains("message LLMCompletionArgs"));
+        assert!(schema.args_proto.contains("message LLMChatArgs"));
+        assert!(
+            !schema
+                .args_proto
+                .lines()
+                .any(|line| line.trim().starts_with("import "))
+        );
+        assert!(schema.result_proto.contains("message TokenCountResult"));
+    }
+
+    #[test]
+    fn test_token_count_json_schema_is_valid() {
+        let plugin = LlamaCppPlugin::new();
+        let schemas = plugin.method_json_schema_map().expect("json schemas");
+        let schema = decode_method_json_schema(&schemas, METHOD_TOKEN_COUNT);
+        serde_json::from_str::<serde_json::Value>(&schema.args_schema)
+            .expect("token count args schema must be valid JSON");
+        serde_json::from_str::<serde_json::Value>(
+            schema
+                .result_schema
+                .as_ref()
+                .expect("token count result schema"),
+        )
+        .expect("token count result schema must be valid JSON");
     }
 
     #[test]

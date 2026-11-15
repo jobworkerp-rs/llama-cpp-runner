@@ -1,7 +1,8 @@
 use anyhow::{Context, Result, anyhow, bail};
 use jobworkerp_llama_protobuf::protobuf::llm::{
-    LlmChatArgs, LlmChatResult, LlmCompletionArgs, LlmCompletionResult, llm_chat_args,
-    llm_chat_result, llm_completion_result,
+    LlmChatArgs, LlmChatResult, LlmCompletionArgs, LlmCompletionResult, TokenCountArgs,
+    TokenCountResult, llm_chat_args, llm_chat_result, llm_completion_result, token_count_args,
+    token_count_result,
 };
 use llama_cpp_2::{
     context::params::LlamaContextParams,
@@ -29,6 +30,7 @@ mod decode;
 mod helpers;
 #[cfg(test)]
 mod test_support;
+mod token_count;
 mod wrapper;
 
 // Re-glob so sibling submodules (`use super::*`) see the extracted items unqualified.

@@ -7,9 +7,62 @@
 //! pre-split single-file layout — this is a pure move.
 
 use super::*;
+use llguidance::api::TopLevelGrammar;
+use llguidance::{Matcher, ParserFactory};
+
+fn mtp_primary_context_params(params: LlamaContextParams) -> LlamaContextParams {
+    params
+        .with_context_type(llama_cpp_2::context::params::LlamaContextType::Mtp)
+        .with_n_rs_seq(0)
+        .with_n_outputs_max(1)
+}
+
+fn mtp_fallback_context_params(params: LlamaContextParams) -> LlamaContextParams {
+    params.with_n_rs_seq(0).with_n_outputs_max(1)
+}
+
+fn new_mtp_draft_context<'a>(
+    draft_model: &'a LlamaModel,
+    backend: &LlamaBackend,
+    params: LlamaContextParams,
+    target_context: &llama_cpp_2::context::LlamaContext<'_>,
+) -> std::result::Result<llama_cpp_2::context::LlamaContext<'a>, llama_cpp_2::LlamaContextLoadError>
+{
+    let primary_params = mtp_primary_context_params(params.clone());
+    match draft_model.new_context_with_ctx_other(backend, primary_params, target_context) {
+        Ok(context) => Ok(context),
+        // Some older MTP model variants reject the explicit MTP context type.
+        Err(error) => {
+            tracing::debug!(
+                ?error,
+                "MTP context type rejected; retrying with default context type"
+            );
+            draft_model.new_context_with_ctx_other(
+                backend,
+                mtp_fallback_context_params(params),
+                target_context,
+            )
+        }
+    }
+}
+
+fn json_schema_sampler(model: &LlamaModel, schema: &str) -> Result<LlamaSampler> {
+    let grammar = TopLevelGrammar::from_tagged_str(GRAMMAR_TYPE_JSON, schema)
+        .map_err(|error| anyhow!("llguidance grammar init failed: {error}"))?;
+    let tok_env = LlamaSampler::llguidance_tok_env(model);
+    let factory = ParserFactory::new_simple(&tok_env)
+        .map_err(|error| anyhow!("llguidance parser factory init failed: {error}"))?;
+    let parser = factory
+        .create_parser(grammar)
+        .map_err(|error| anyhow!("llguidance parser init failed: {error}"))?;
+
+    Ok(LlamaSampler::from(Matcher::new(Ok(parser))))
+}
 
 pub struct LlamaModelWrapper {
     pub(in crate::model) model: &'static LlamaModel,
+    pub(in crate::model) resolved_model: String,
+    pub(in crate::model) context_window_tokens: u64,
     pub(in crate::model) mtp_draft_model: Option<&'static LlamaModel>,
     pub(in crate::model) backend: &'static LlamaBackend,
     pub(in crate::model) ctx_params: LlamaContextParams,
@@ -29,9 +82,16 @@ pub struct LlamaModelWrapper {
     pub(in crate::model) media_limits: MediaLimits,
 }
 
+/// Tools-aware prompt prepared once for generation and token counting.
+pub(in crate::model) struct PreparedToolsPrompt {
+    pub(in crate::model) template: crate::oai_chat::ToolChatTemplateResult,
+    pub(in crate::model) effective_tools_json: String,
+}
+
 impl LlamaModelWrapper {
     pub fn new(config: LlamaModelConfig) -> Result<Self> {
         let backend = shared_backend();
+        let resolved_model = config.model.clone();
 
         let model_paths = config
             .get_or_load_model()
@@ -74,9 +134,6 @@ impl LlamaModelWrapper {
         let draft_model_paths = config
             .get_or_load_mtp_draft_model()
             .with_context(|| "failed to get MTP draft model from args")?;
-        // The draft model reuses the target's `model_params` (GPU layers +
-        // KV overrides): MTP speculation pairs a draft with the same offload
-        // profile as the target it drafts for.
         let mtp_draft_model = draft_model_paths
             .map(|paths| {
                 let draft_identity = model_load_identity(&paths, &config);
@@ -90,7 +147,6 @@ impl LlamaModelWrapper {
                 })
             })
             .transpose()?;
-
         // initialize the context
         let mut ctx_params = LlamaContextParams::default()
             .with_n_ctx(config.ctx_size)
@@ -170,6 +226,8 @@ impl LlamaModelWrapper {
 
         Ok(Self {
             model,
+            resolved_model,
+            context_window_tokens: u64::from(effective_n_ctx),
             mtp_draft_model,
             backend,
             ctx_params,
@@ -179,6 +237,59 @@ impl LlamaModelWrapper {
             mtp: config.mtp,
             mtmd,
             media_limits,
+        })
+    }
+
+    /// Build the exact tools-aware prompt used by both generation and count.
+    pub(in crate::model) fn prepare_tools_chat_template(
+        &self,
+        args: &LlmChatArgs,
+        tools_json: &str,
+    ) -> Result<PreparedToolsPrompt> {
+        if args
+            .function_options
+            .as_ref()
+            .is_some_and(|options| options.use_function_calling)
+        {
+            bail!(ERR_CLIENT_TOOLS_WITH_FUNCTION_CALLING);
+        }
+        if args.json_schema.is_some() {
+            bail!(ERR_CLIENT_TOOLS_WITH_JSON_SCHEMA);
+        }
+        if args.messages.iter().any(|message| {
+            matches!(
+                message
+                    .content
+                    .as_ref()
+                    .and_then(|content| content.content.as_ref()),
+                Some(llm_chat_args::message_content::Content::Image(_))
+            )
+        }) {
+            bail!(ERR_CLIENT_TOOLS_WITH_MULTIMODAL);
+        }
+        let messages_json =
+            crate::oai_chat::build_oai_messages_json(&self.system_prompt, &args.messages)?;
+        let function_options = args.function_options.as_ref();
+        let resolved = crate::oai_chat::resolve_tool_choice(
+            tools_json,
+            function_options.and_then(|options| options.tool_choice.as_deref()),
+        )?;
+        let (effective_tools_json, tool_choice_override) = match &resolved {
+            crate::oai_chat::ResolvedToolChoice::Passthrough => (tools_json.to_string(), None),
+            crate::oai_chat::ResolvedToolChoice::FunctionSpecific {
+                tools_json,
+                tool_choice,
+            } => (tools_json.clone(), Some(tool_choice.as_str())),
+        };
+        let template = self.apply_oai_template_with_tools(
+            &messages_json,
+            &effective_tools_json,
+            function_options,
+            tool_choice_override,
+        )?;
+        Ok(PreparedToolsPrompt {
+            template,
+            effective_tools_json,
         })
     }
 
@@ -246,13 +357,17 @@ impl LlamaModelWrapper {
             };
             samplers.push(sampler);
         } else if let Some(schema) = &args.json_schema {
-            let llg = LlamaSampler::llguidance(self.model, GRAMMAR_TYPE_JSON, schema)
-                .map_err(|e| anyhow!("llguidance init failed: {e:?}"))?;
-            samplers.push(llg);
+            samplers.push(json_schema_sampler(self.model, schema)?);
         }
         if let Some(penalty) = args.repeat_penalty {
             let last_n = args.repeat_last_n.map_or(64, |n| n as i32);
-            samplers.push(LlamaSampler::penalties(last_n, penalty, 0.0, 0.0));
+            samplers.push(LlamaSampler::penalties(
+                self.model.n_vocab(),
+                last_n,
+                penalty,
+                0.0,
+                0.0,
+            ));
         }
 
         // Terminal selector (exactly one). A positive temperature means the user
@@ -286,7 +401,7 @@ impl LlamaModelWrapper {
             return Ok(());
         }
         let t_ctx_start = ggml_time_us();
-        let mut ctx = self
+        let ctx = self
             .model
             .new_context(self.backend, self.ctx_params.clone())
             .with_context(|| "unable to create the llama_context")?;
@@ -299,12 +414,26 @@ impl LlamaModelWrapper {
                 draft_params = draft_params.with_type_v(type_v);
             }
             let draft_model = self.mtp_draft_model.unwrap_or(self.model);
-            let draft_ctx = draft_model
-                .new_mtp_context(self.backend, draft_params, &mut ctx)
-                .with_context(|| "unable to create the MTP draft llama_context")?;
-            let spec = MtpSpeculative::new(ctx, draft_ctx, mtp.params())
-                .map_err(|e| anyhow!("unable to initialize MTP speculative decoding: {e}"))?;
-            SyncContext::new_mtp(spec)
+            let speculative = (|| -> Result<MtpSpeculative<'static>> {
+                let draft_ctx =
+                    new_mtp_draft_context(draft_model, self.backend, draft_params, &ctx)
+                        .map_err(anyhow::Error::new)?;
+                MtpSpeculative::new(ctx, draft_ctx, mtp.params()).map_err(anyhow::Error::new)
+            })();
+            match speculative {
+                Ok(spec) => SyncContext::new_mtp(spec),
+                Err(error) => {
+                    tracing::warn!(
+                        ?error,
+                        "MTP initialization failed; falling back to ordinary decoding"
+                    );
+                    let fallback = self
+                        .model
+                        .new_context(self.backend, self.ctx_params.clone())
+                        .with_context(|| "unable to create fallback llama_context")?;
+                    SyncContext::new(fallback)
+                }
+            }
         } else {
             SyncContext::new(ctx)
         };
@@ -496,58 +625,9 @@ impl LlamaModelWrapper {
         sink: &mut dyn FnMut(&str) -> ControlFlow<()>,
         oai_sink: &mut dyn FnMut(crate::oai_chat::OaiStreamUpdate),
     ) -> Result<LlmChatResult> {
-        // Validate up front: this is the single chokepoint for both the
-        // non-streaming entry (`run_chat_with_sink`) and the streaming
-        // entry (`spawn_chat_stream_with_tools`), so all client-tools
-        // preconditions belong here.
-        if args
-            .function_options
-            .as_ref()
-            .is_some_and(|fo| fo.use_function_calling)
-        {
-            bail!(ERR_CLIENT_TOOLS_WITH_FUNCTION_CALLING);
-        }
-        if args.json_schema.is_some() {
-            bail!(ERR_CLIENT_TOOLS_WITH_JSON_SCHEMA);
-        }
-        // Reject multimodal input up front so we never spend cycles building
-        // the OAI messages JSON for a request we can't fulfil.
-        if args.messages.iter().any(|m| {
-            matches!(
-                m.content.as_ref().and_then(|c| c.content.as_ref()),
-                Some(llm_chat_args::message_content::Content::Image(_))
-            )
-        }) {
-            bail!(ERR_CLIENT_TOOLS_WITH_MULTIMODAL);
-        }
-
         let options = args.options.take().unwrap_or_default();
-        let messages_json =
-            crate::oai_chat::build_oai_messages_json(&self.system_prompt, &args.messages)?;
-
-        // Translate OpenAI's `{"type":"function","function":{"name":"..."}}`
-        // tool_choice into the (tools-filter + "required") pair llama.cpp
-        // accepts. Bare "auto"/"none"/"required" or None come back as
-        // `Passthrough` so the originals are forwarded verbatim.
-        let function_options = args.function_options.as_ref();
-        let resolved = crate::oai_chat::resolve_tool_choice(
-            tools_json,
-            function_options.and_then(|fo| fo.tool_choice.as_deref()),
-        )?;
-        let (effective_tools_json, tool_choice_override) = match &resolved {
-            crate::oai_chat::ResolvedToolChoice::Passthrough => (tools_json, None),
-            crate::oai_chat::ResolvedToolChoice::FunctionSpecific {
-                tools_json,
-                tool_choice,
-            } => (tools_json.as_str(), Some(tool_choice.as_str())),
-        };
-
-        let tmpl_result = self.apply_oai_template_with_tools(
-            &messages_json,
-            effective_tools_json,
-            function_options,
-            tool_choice_override,
-        )?;
+        let prepared = self.prepare_tools_chat_template(&args, tools_json)?;
+        let tmpl_result = prepared.template;
 
         let preserved_tokens =
             crate::oai_chat::compute_preserved_token_set(self.model, &tmpl_result.preserved_tokens);
@@ -570,8 +650,10 @@ impl LlamaModelWrapper {
         // assistant output. Borrowing `state` and `oai_sink` here is fine
         // because the wrapped closure lives only for the duration of the
         // `decode_text_only_core_with_sink_and_stops` call.
-        let mut stream_parser =
-            crate::oai_chat::OaiStreamParser::for_template(&tmpl_result, effective_tools_json)?;
+        let mut stream_parser = crate::oai_chat::OaiStreamParser::for_template(
+            &tmpl_result,
+            &prepared.effective_tools_json,
+        )?;
         let output = {
             let mut wrapped_sink = |chunk: &str| -> ControlFlow<()> {
                 // Always forward the raw chunk first; the legacy receiver
@@ -619,8 +701,11 @@ impl LlamaModelWrapper {
             }
         }
 
-        let parsed_json =
-            parse_tool_response_with_recovery(&tmpl_result, effective_tools_json, &output.text)?;
+        let parsed_json = parse_tool_response_with_recovery(
+            &tmpl_result,
+            &prepared.effective_tools_json,
+            &output.text,
+        )?;
         crate::oai_chat::build_chat_result_from_oai_json(
             &parsed_json,
             output.prompt_tokens,
@@ -705,7 +790,7 @@ impl LlamaModelWrapper {
 
     /// Media is only committed after the corresponding `LlamaChatMessage` is
     /// successfully created, to avoid marker/media count mismatch in multimodal paths.
-    fn build_chat_messages(
+    pub(in crate::model) fn build_chat_messages(
         &self,
         messages: &[llm_chat_args::ChatMessage],
     ) -> Result<ChatBuildResult> {
@@ -811,7 +896,11 @@ impl LlamaModelWrapper {
     /// `system` is treated as "no system message" — common in completion
     /// requests where the caller wants raw user continuation without the
     /// runner's default system message.
-    fn format_single_turn_inner(&self, system: &str, user_prompt: &str) -> Result<String> {
+    pub(in crate::model) fn format_single_turn_inner(
+        &self,
+        system: &str,
+        user_prompt: &str,
+    ) -> Result<String> {
         let mut chat_msgs: Vec<LlamaChatMessage> = Vec::with_capacity(2);
         let mut raw_msgs: Vec<(String, String)> = Vec::with_capacity(2);
         if !system.is_empty() {
@@ -831,7 +920,7 @@ impl LlamaModelWrapper {
         self.apply_chat_template_multi(&chat_msgs, &raw_msgs)
     }
 
-    fn apply_chat_template_multi(
+    pub(in crate::model) fn apply_chat_template_multi(
         &self,
         messages: &[LlamaChatMessage],
         raw_messages: &[(String, String)],
@@ -955,7 +1044,26 @@ impl LlamaModelWrapper {
 mod tests {
     use super::*;
     use crate::model::test_support::*;
+
     use jobworkerp_llama_protobuf::protobuf::llm::llm_chat_args;
+    use llama_cpp_2::context::params::{LlamaContextParams, LlamaContextType};
+
+    #[test]
+    fn mtp_draft_context_params_preserve_the_required_context_constraints() {
+        let base = LlamaContextParams::default()
+            .with_n_rs_seq(9)
+            .with_n_outputs_max(7);
+
+        let primary = mtp_primary_context_params(base.clone());
+        assert_eq!(primary.context_type(), LlamaContextType::Mtp);
+        assert_eq!(primary.n_rs_seq(), 0);
+        assert_eq!(primary.n_outputs_max(), 1);
+
+        let fallback = mtp_fallback_context_params(base);
+        assert_eq!(fallback.context_type(), LlamaContextType::Default);
+        assert_eq!(fallback.n_rs_seq(), 0);
+        assert_eq!(fallback.n_outputs_max(), 1);
+    }
 
     #[test]
     fn test_build_chat_messages_basic() {

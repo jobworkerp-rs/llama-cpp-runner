@@ -1,6 +1,6 @@
 [package]
 name = "hf-hub-utils"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 authors.workspace = true
 description = "Shared Hugging Face Hub cache repair utilities"

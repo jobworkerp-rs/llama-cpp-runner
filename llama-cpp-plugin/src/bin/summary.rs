@@ -30,7 +30,7 @@ fn main() -> Result<()> {
         .context("Failed to process markdown files")?;
 
     let content_len = combined_content.len();
-    println!("combined_content length: {}", &content_len);
+    println!("combined_content length: {}", content_len);
     let mut plugin = LlamaCppPlugin::new();
     plugin
         .load_model_from_env()

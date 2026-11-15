@@ -22,7 +22,7 @@ version = "0.1.0"
 edition = "2024"
 authors = ["sutr"]
 description = "Job-Worker plugin using llama"
-repository = "https://github.com/jobworkerp-rs/llama-plugins"
+repository = "https://github.com/jobworkerp-rs/llama-cpp-runner"
 license = "MIT"
 
 [workspace.dependencies]
@@ -55,6 +55,7 @@ jobworkerp-plugin-abi-macros = { git = "https://github.com/jobworkerp-rs/jobwork
 # multimodal KV-cache prefix reuse, not available upstream.
 llama-cpp-2 = { path = "modules/llama-cpp-rs/llama-cpp-2", features = ["mtmd", "llguidance"] }
 llama-cpp-sys-2 = { path = "modules/llama-cpp-rs/llama-cpp-sys-2" }
+llguidance = "1.7.5"
 once_cell = { version = "1" }
 # Force OpenSSL to be statically linked (vendored) so the resulting plugin .so
 # does not depend on the host's libssl/libcrypto versions. Without this, the

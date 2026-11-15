@@ -6,11 +6,12 @@
 
 ## Overview
 
-This crate loads GGUF models through `llama.cpp` and exposes three execution methods through the JobworkerP plugin interface:
+This crate loads GGUF models through `llama.cpp` and exposes four methods through the JobworkerP plugin interface:
 
 - `run`: prompt-based text generation using the crate-specific `llama_cpp.LlamaArg`
 - `chat`: conversation-based generation using `jobworkerp.runner.llm.LLMChatArgs`
 - `completion`: single-turn text completion using `jobworkerp.runner.llm.LLMCompletionArgs`
+- `token_count`: exact input token counting using `jobworkerp.runner.llm.TokenCountArgs`
 
 The protobuf definitions used by this crate live in `llama-protobuf/`, and shared support code lives in sibling crates such as `mtmd-support/` and `modules/jobworkerp-client/`.
 
@@ -72,6 +73,15 @@ Relevant protobuf:
 - args: `llama-protobuf/protobuf/jobworkerp/runner/llm/completion_args.proto`
 - result: `llama-protobuf/protobuf/jobworkerp/runner/llm/completion_result.proto`
 
+### `token_count`
+
+The non-streaming `token_count` method returns exact counts from the loaded model tokenizer. It supports independent raw-text counts plus rendered `completion` and `chat` request counts. Chat counts use the same template and image tokenizer as generation, without decoding or updating the KV cache.
+
+Relevant protobuf:
+
+- args: `llama-protobuf/protobuf/jobworkerp/runner/llm/token_count_args.proto`
+- result: `llama-protobuf/protobuf/jobworkerp/runner/llm/token_count_result.proto`
+
 ## Cancellation
 
 For streaming `chat` / `completion`, the JobworkerP cancel token is converted into a shared cancel flag and observed by both the output sink and the `llama.cpp` abort callback. The sink stops at token boundaries; the abort callback can interrupt long prompt prefill and in-flight `llama_decode` calls at the granularity supported by the active backend. If cancellation is observed, the plugin exits as cancellation without writing back partial KV-cache metadata.
@@ -93,54 +103,18 @@ Key fields:
 - `type_k`: KV cache data type for K. Defaults to the llama.cpp default (F16) when omitted. Quantizing (e.g. `KV_CACHE_TYPE_Q8_0`) reduces KV cache memory for long contexts.
 - `type_v`: KV cache data type for V. Defaults to the llama.cpp default (F16) when omitted. **V-cache quantization typically requires flash attention** (a warning is logged if `use_flash_attention` is disabled).
 - `reuse_kv_prefix`: keep the KV of the longest common prefix (shared system prompt / document, or the same image) across requests and prefill only the differing suffix. Text is matched per token; images are matched by a content hash, so the same image followed by a different question reuses the image's KV (skipping its encode/decode). Cuts time-to-first-token for workloads that update a shared context across consecutive requests. Defaults to false, which clears the KV cache before each request so requests stay fully independent and deterministic.
-- `mtp`: MTP speculative decoding settings. This is a runner-level setting because the draft context is created with the model context. Omit it or set `enabled=false` to keep the existing decode path. `n_max` defaults to 3, `n_min` to 0, and `p_min` to 0.0. `draft_model` selects a separate MTP draft GGUF; when `draft_hf_repo` is omitted it uses the runner `hf_repo`. `draft_type_k` / `draft_type_v` default to `type_k` / `type_v` when omitted.
+- `mtp`: text-only MTP speculative decoding settings. `n_max` defaults to 3; `draft_model` optionally selects a separate draft GGUF, and `draft_hf_repo` otherwise inherits `hf_repo`.
 - `use_flash_attention`: enables flash attention when supported
 - `system_prompt`: default system prompt applied by the runner
 - `mtmd`: multimodal projector settings
 
-If `hf_repo` is omitted, `model` is treated as a local path. If `hf_repo` is set, the plugin downloads or reuses cached model files from Hugging Face. Existing snapshot cache entries are reused without a metadata network round-trip, so offline warm starts return immediately. On cache misses, partial `.part` downloads are left resumable and size-mismatched download results are rejected.
+If `hf_repo` is omitted, `model` is treated as a local path. If `hf_repo` is set, the plugin immediately reuses an existing regular Hugging Face snapshot-cache file without a metadata request; other cache entries are rejected. On a cache miss, it obtains remote metadata to validate the downloaded file size; if metadata is unavailable, it falls back to the Hugging Face cache lookup for offline compatibility. Partial `.part` downloads are left resumable and size-mismatched download results are removed and rejected.
 
 ### MTP speculative decoding
 
-MTP is currently supported for text-only generation. Requests that include media are rejected with `MTP speculative decoding is not supported with multimodal input yet`; disable `mtp` for multimodal runners.
+MTP is supported for text-only `run`, `chat`, and `completion`. Each step drafts up to `min(n_max, n_batch - 1, remaining output)` tokens, verifies them with the target model, accepts the matching prefix, and rolls both KV caches back to the confirmed position. For requests with media, the plugin logs a warning and uses ordinary multimodal decoding instead.
 
-Example Gemma 4 runner settings:
-
-```json
-{
-  "hfRepo": "unsloth/gemma-4-12B-it-qat-GGUF",
-  "model": "gemma-4-12B-it-qat-UD-Q4_K_XL.gguf",
-  "useFlashAttention": true,
-  "mtp": {
-    "enabled": true,
-    "nMax": 4,
-    "draftModel": "mtp-gemma-4-12B-it.gguf"
-  }
-}
-```
-
-Example Qwen 3.6 MTP runner settings:
-
-```json
-{
-  "hfRepo": "unsloth/Qwen3.6-27B-MTP-GGUF",
-  "model": "Qwen3.6-27B-UD-Q4_K_XL.gguf",
-  "useFlashAttention": true,
-  "mtp": {
-    "enabled": true,
-    "nMax": 4
-  }
-}
-```
-
-Operational procedure:
-
-1. Load the target and draft GGUF files from the same repo. For Gemma 4, use `unsloth/gemma-4-12B-it-qat-GGUF` with target `gemma-4-12B-it-qat-UD-Q4_K_XL.gguf` and draft `mtp-gemma-4-12B-it.gguf`.
-2. For same-file MTP models such as `unsloth/Qwen3.6-27B-MTP-GGUF`, load `Qwen3.6-27B-UD-Q4_K_XL.gguf` and omit `mtp.draftModel`.
-3. Enable flash attention unless you have a backend-specific reason not to.
-4. Set `mtp.enabled=true`; set `mtp.draftModel` only when the model repo provides a separate MTP draft GGUF. Use `nMax=4` for smoke tests, or omit it to use the default `3`.
-5. Run text-only `chat` / `completion` / `run` requests and compare output quality against the same runner with `mtp.enabled=false`.
-6. Keep multimodal workloads on a separate runner with `mtp` omitted until multimodal+MTP is validated.
+If MTP context initialization or execution fails before streaming output, the plugin logs a warning, discards speculative KV state, and retries the same request with ordinary decoding. A failure after output has already been streamed is returned as an error because retrying would duplicate client-visible text. Setting `reuse_kv_prefix=true` also logs a warning and selects ordinary text decoding for that request.
 
 ## Diagnosing Inference Speed
 

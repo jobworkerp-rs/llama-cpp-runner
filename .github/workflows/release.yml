@@ -1,0 +1,225 @@
+name: Release
+
+# Maintained in the private gitea source and published to this repository by
+# its release sync together with the rest of .github/; edit it there, not here.
+# The release sync pushes a vMAJOR.MINOR.PATCH tag, which builds every plugin
+# for every supported platform and attaches the binaries, SHA256SUMS and
+# build provenance attestations to the GitHub Release for the tag.
+#
+# Self-hosted runners are shared with other public repositories, so only a
+# tag push (which needs write access) may start this workflow, the build jobs
+# get a read-only token, and every job is limited to GitHub so that the
+# private source, which tracks this file, never runs it. The private source
+# checks these rules on every change.
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+# A re-pushed tag re-runs this; let a fresh run supersede an in-flight one
+# without cancelling (avoid a half-uploaded release).
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
+
+# `shell: bash` makes every step run as `bash -e -o pipefail`.
+defaults:
+  run:
+    shell: bash
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: '0'
+  RUST_BACKTRACE: '1'
+  # Released plugins as package:library pairs. One cargo invocation builds
+  # them all, so llama.cpp is compiled once per platform.
+  PLUGINS: >-
+    jobworkerp-llama-cpp-plugin:jobworkerp_llama_cpp_plugin
+    embedding-llm:embedding_llm
+    llama-cpp-reranker-runner:message_vectordb_reranker_runner
+
+jobs:
+  build:
+    name: Build ${{ matrix.name }}
+    if: github.server_url == 'https://github.com'
+    runs-on: ${{ matrix.runs_on }}
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # llama-cpp-sys-2 enables ggml's AVX2/FMA/F16C kernels only for the
+          # CPU features rustc targets, so x86-64-v3 is set explicitly (the
+          # default x86_64 target has no AVX) and named in the asset.
+          # Built on Ubuntu 24.04 like the CUDA plugin, so both Linux
+          # plugins share the glibc 2.39 / libstdc++ 3.4.33 floor.
+          - name: linux-x86_64-cpu
+            runs_on: ubuntu-24.04
+            features: ''
+            platform: linux-x86_64
+            lib_ext: so
+            asset_suffix: -x86_64_v3-linux
+            extra_env: MAX_GLIBC=2.39 MAX_GLIBCXX=3.4.33 RUSTFLAGS=-Ctarget-cpu=x86-64-v3
+          # The k8s runner image is Ubuntu 24.04 with CUDA 12.8. ggml kernels
+          # are built for sm_89 plus compute_89 PTX, which the driver
+          # JIT-compiles on newer GPUs. CUDA objects must be position
+          # independent to link into the shared library. cuBLAS is linked
+          # statically, so libcuda.so.1 is the only CUDA runtime dependency
+          # and its presence proves the CUDA backend is in the binary.
+          - name: linux-x86_64-cuda
+            runs_on: lookback-linux-cuda
+            features: cuda
+            platform: linux-x86_64
+            lib_ext: so
+            asset_suffix: _cuda-x86_64_v3-linux-cuda12.8-cc89
+            extra_env: MAX_GLIBC=2.39 MAX_GLIBCXX=3.4.33 RUSTFLAGS=-Ctarget-cpu=x86-64-v3 CMAKE_CUDA_ARCHITECTURES=89 CMAKE_POSITION_INDEPENDENT_CODE=ON REQUIRED_NEEDED=libcuda.so.1
+          # GitHub-hosted Apple Silicon: the self-hosted macOS runner of the
+          # organization is dedicated to another repository.
+          - name: darwin-arm64-metal
+            runs_on: macos-15
+            features: metal
+            platform: darwin-arm64
+            lib_ext: dylib
+            asset_suffix: _metal-aarch64-darwin
+            extra_env: MACOSX_DEPLOYMENT_TARGET=14.0
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Export platform settings
+        env:
+          EXTRA_ENV: ${{ matrix.extra_env }}
+        run: |
+          for kv in ${EXTRA_ENV}; do
+            echo "${kv}" >>"${GITHUB_ENV}"
+          done
+
+      - name: Install protoc
+        run: bash scripts/install-protoc.sh "${RUNNER_TEMP}/protoc"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+
+      # No Rust cache: GitHub scopes caches to the ref, and a tag-only
+      # workflow can never restore what a previous tag saved, so it would only
+      # spend runner time uploading target/.
+      # llama-cpp-sys-2 needs cmake and libclang (bindgen): a missing cmake
+      # fails here, before the long build, and the libclang line shows what
+      # bindgen will find.
+      - name: Show build environment
+        env:
+          EXTRA_ENV: ${{ matrix.extra_env }}
+        run: |
+          uname -a
+          if [ "$(uname -s)" = Darwin ]; then
+            sw_vers
+            xcrun --show-sdk-version || true
+          else
+            grep -E '^(NAME|VERSION)=' /etc/os-release
+            ldd --version | head -n 1
+            ldconfig -p | grep -E 'libclang(-[0-9.]+)?\.so' || echo "libclang: not in the linker cache"
+          fi
+          rustc --version --verbose
+          "${PROTOC}" --version
+          cmake --version | head -n 1
+          if command -v nvcc >/dev/null; then nvcc --version | tail -n 2; fi
+          df -h .
+          echo "platform settings: ${EXTRA_ENV}"
+
+      - name: Build plugins
+        env:
+          FEATURES: ${{ matrix.features }}
+        run: |
+          packages=()
+          for plugin in ${PLUGINS}; do
+            packages+=(-p "${plugin%%:*}")
+          done
+          cargo build --release --locked --lib "${packages[@]}" ${FEATURES:+--features "${FEATURES}"}
+
+      # Compressed in the publish job: neither macOS nor the k8s runner image
+      # is guaranteed to ship xz.
+      - name: Verify and stage plugins under their release names
+        env:
+          PLATFORM: ${{ matrix.platform }}
+          LIB_EXT: ${{ matrix.lib_ext }}
+          ASSET_SUFFIX: ${{ matrix.asset_suffix }}
+        run: |
+          mkdir -p dist
+          for plugin in ${PLUGINS}; do
+            lib=${plugin#*:}
+            built="target/release/lib${lib}.${LIB_EXT}"
+            bash scripts/verify-plugin-artifact.sh "${built}" "${PLATFORM}"
+            cp "${built}" "dist/${lib}${ASSET_SUFFIX}.${LIB_EXT}"
+          done
+          ls -l dist
+
+      # Stored uncompressed: the publish job compresses with xz anyway, and
+      # zipping the CUDA plugins (statically linked cuBLAS, over 1 GB each)
+      # would only cost time.
+      - name: Upload build artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ matrix.name }}
+          path: dist/
+          if-no-files-found: error
+          compression-level: 0
+
+  # Runs on a GitHub-hosted runner: the only job holding a write token, and
+  # the one that signs the provenance of what the build jobs produced.
+  publish:
+    name: Publish GitHub Release
+    if: github.server_url == 'https://github.com'
+    needs: build
+    runs-on: ubuntu-latest
+    # xz -9 over the CUDA plugins takes far longer than for a single small
+    # plugin.
+    timeout-minutes: 120
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Compress plugins and write checksums and release notes
+        run: |
+          df -h .
+          ls -l dist
+          xz -9 -T0 dist/*
+          (cd dist && sha256sum -- *.xz >SHA256SUMS && cat SHA256SUMS)
+          # The release sync commit lists the changes since the previous release.
+          git log -1 --format=%B >release-notes.md
+          cat release-notes.md
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/*.xz
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3 # v3.0.4
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          body_path: release-notes.md
+          fail_on_unmatched_files: true
+          files: |
+            dist/*.xz
+            dist/SHA256SUMS

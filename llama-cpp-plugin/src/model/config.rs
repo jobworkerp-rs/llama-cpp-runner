@@ -38,8 +38,6 @@ pub(crate) const ERR_CLIENT_TOOLS_WITH_MULTIMODAL: &str =
     "multimodal input combined with client_tools_json is not supported yet";
 pub(crate) const ERR_TOOL_EXECUTION_REQUESTS_REJECTED: &str =
     "ToolExecutionRequests is no longer accepted; use ToolResults on a TOOL message";
-pub(crate) const ERR_MTP_WITH_MULTIMODAL: &str =
-    "MTP speculative decoding is not supported with multimodal input yet";
 
 /// for deserialization.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -74,18 +72,6 @@ impl From<ParamOverrideValueWrapper> for ParamOverrideValue {
         }
     }
 }
-
-// #[derive(Debug, Clone, Serialize, Deserialize)]
-// struct Model {
-//     /// Use an already downloaded model
-//     /// The path to the model. e.g. `/home/marcus/.cache/huggingface/hub/models--TheBloke--Llama-2-7B-Chat-GGUF/blobs/08a5566d61d7cb6b420c3e4387a39e0078e1f2fe5f055f3a03887385304d4bfa`
-//     local_path: Option<PathBuf>,
-//     /// Download a model from huggingface (or use a cached version)
-//     /// the repo containing the model. e.g. `TheBloke/Llama-2-7B-Chat-GGUF`
-//     hf_repo: Option<String>,
-//     /// the model name. e.g. `llama-2-7b-chat.Q4_K_M.gguf`
-//     hf_model: Option<String>,
-// }
 
 /// Map a proto `KvCacheType` enum value to a `llama_cpp_2::KvCacheType`.
 /// Returns `None` for `UNSPECIFIED` (keep llama.cpp default F16) and for any
@@ -514,7 +500,7 @@ pub(in crate::model) enum CachedChunk {
 }
 
 pub(in crate::model) struct SyncContext {
-    inner: SyncContextInner,
+    pub(in crate::model) inner: SyncContextInner,
     /// Tokens whose KV is currently present in `ctx` (the previous text
     /// request's prompt). Used for text prefix reuse. Empty when the KV cache is
     /// empty or its contents are unknown (e.g. after an error). Bound to the
@@ -555,6 +541,11 @@ impl SyncContext {
     }
 
     pub(in crate::model) fn ctx(&self) -> &LlamaContext<'static> {
+        self.target_context()
+    }
+
+    /// Access the target context regardless of whether speculative decoding is enabled.
+    pub(in crate::model) fn target_context(&self) -> &LlamaContext<'static> {
         match &self.inner {
             SyncContextInner::Plain(ctx) => ctx,
             SyncContextInner::Mtp(mtp) => mtp.target_context(),
@@ -562,9 +553,30 @@ impl SyncContext {
     }
 
     pub(in crate::model) fn ctx_mut(&mut self) -> &mut LlamaContext<'static> {
+        self.target_context_mut()
+    }
+
+    /// Access the mutable target context while keeping MTP ownership internal.
+    pub(in crate::model) fn target_context_mut(&mut self) -> &mut LlamaContext<'static> {
         match &mut self.inner {
             SyncContextInner::Plain(ctx) => ctx,
             SyncContextInner::Mtp(mtp) => mtp.target_context_mut(),
+        }
+    }
+
+    /// Access the MTP state when this context owns speculative decoding.
+    pub(in crate::model) fn mtp(&self) -> Option<&MtpSpeculative<'static>> {
+        match &self.inner {
+            SyncContextInner::Plain(_) => None,
+            SyncContextInner::Mtp(mtp) => Some(mtp),
+        }
+    }
+
+    /// Access mutable MTP state without exposing `SyncContextInner` to callers.
+    pub(in crate::model) fn mtp_mut(&mut self) -> Option<&mut MtpSpeculative<'static>> {
+        match &mut self.inner {
+            SyncContextInner::Plain(_) => None,
+            SyncContextInner::Mtp(mtp) => Some(mtp),
         }
     }
 

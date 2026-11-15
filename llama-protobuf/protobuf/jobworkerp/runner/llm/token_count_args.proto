@@ -1,0 +1,21 @@
+syntax = "proto3";
+package jobworkerp.runner.llm;
+
+import "jobworkerp/runner/llm/completion_args.proto";
+import "jobworkerp/runner/llm/chat_args.proto";
+
+message TokenCountArgs {
+  message TextCountRequest {
+    repeated string texts = 1;
+  }
+
+  message ChatCountRequest {
+    LLMChatArgs request = 1;
+  }
+
+  oneof target {
+    TextCountRequest text = 1;
+    LLMCompletionArgs completion = 2;
+    ChatCountRequest chat = 3;
+  }
+}

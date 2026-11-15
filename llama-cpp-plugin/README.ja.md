@@ -6,11 +6,12 @@
 
 ## 概要
 
-このcrateは、GGUF モデルを `llama.cpp` 経由で読み込み、JobworkerP のプラグインインターフェースへ 3 つの実行メソッドを公開します。
+このcrateは、GGUF モデルを `llama.cpp` 経由で読み込み、JobworkerP のプラグインインターフェースへ 4 つのメソッドを公開します。
 
 - `run`: このプラグイン独自の `llama_cpp.LlamaArg` を使う prompt ベース生成
 - `chat`: `jobworkerp.runner.llm.LLMChatArgs` を使う chat completion 互換の生成
 - `completion`: `jobworkerp.runner.llm.LLMCompletionArgs` を使う単一プロンプトの text completion
+- `token_count`: `jobworkerp.runner.llm.TokenCountArgs` を使う正確な入力 token 数の計測
 
 このcrateが使う protobuf 定義は `llama-protobuf/` にあり、共通処理は `mtmd-support/` や `modules/jobworkerp-client/` などのcrateにあります。
 
@@ -72,6 +73,15 @@ jobworkerp 標準 completion runner (Ollama / GenAI) との互換性差分:
 - args: `llama-protobuf/protobuf/jobworkerp/runner/llm/completion_args.proto`
 - result: `llama-protobuf/protobuf/jobworkerp/runner/llm/completion_result.proto`
 
+### `token_count`
+
+non-streaming の `token_count` メソッドは、load 済みモデルの tokenizer による正確な token 数を返します。独立 text、render 済み `completion`、`chat` を扱います。chat は生成と同じ template と画像 tokenizer を使いますが、decode および KV cache の更新は行いません。
+
+関連 protobuf:
+
+- args: `llama-protobuf/protobuf/jobworkerp/runner/llm/token_count_args.proto`
+- result: `llama-protobuf/protobuf/jobworkerp/runner/llm/token_count_result.proto`
+
 ## キャンセル
 
 `chat` / `completion` の streaming 実行では、JobworkerP の cancel token を共有 cancel flag に変換し、sink と `llama.cpp` の abort callback の両方で監視します。sink はトークン境界で停止し、abort callback は長い prompt prefill や `llama_decode` 中のキャンセルを backend が対応する粒度で中断します。cancel が観測されると、プラグインは部分 KV キャッシュを書き戻さずにキャンセル扱いで終了します。
@@ -93,54 +103,18 @@ jobworkerp 標準 completion runner (Ollama / GenAI) との互換性差分:
 - `type_k`: KV キャッシュの K 側データ型。未指定時は llama.cpp 既定値 (F16)。`KV_CACHE_TYPE_Q8_0` 等に量子化すると長コンテキストの KV キャッシュ使用量を削減できます。
 - `type_v`: KV キャッシュの V 側データ型。未指定時は llama.cpp 既定値 (F16)。**V 側の量子化は通常 flash attention が必須**です(`use_flash_attention` が無効だと warn を出します)。
 - `reuse_kv_prefix`: リクエスト間で共通する先頭(システムプロンプト+文書、または同一画像など)の KV を残し、差分だけ prefill します。テキストはトークン単位、画像は内容ハッシュで同一性を判定し、共通する chunk を再利用します(同一画像+異なる質問の連続では画像の encode/decode もスキップ)。共通文脈を更新しながら連続リクエストするワークロードで TTFT を大幅短縮できます。デフォルト false では毎回 KV を全消去し、リクエストは完全独立・決定的です。
-- `mtp`: MTP speculative decoding 設定。draft context は model context と同時に作るため runner-level 設定です。省略または `enabled=false` の場合は既存の decode path のままです。`n_max` は既定 3、`n_min` は 0、`p_min` は 0.0 です。`draft_model` で別 MTP draft GGUF を指定できます。`draft_hf_repo` を省略すると runner の `hf_repo` を使います。`draft_type_k` / `draft_type_v` を省略すると `type_k` / `type_v` と同じ値を使います。
+- `mtp`: text-only MTP speculative decoding の設定です。`n_max` の既定値は 3 です。`draft_model` で別の draft GGUF を指定でき、`draft_hf_repo` を省略した場合は `hf_repo` を継承します。
 - `use_flash_attention`: 対応環境で flash attention を有効化
 - `system_prompt`: ランナー既定の system prompt
 - `mtmd`: マルチモーダル projector 設定
 
-`hf_repo` を省略した場合、`model` はローカルパスとして扱います。`hf_repo` を指定した場合は、Hugging Face からモデルを取得するか、既存キャッシュを再利用します。既存 snapshot cache がある場合は metadata のネットワーク往復を行わずに再利用するため、オフラインの warm start は即座に返ります。cache miss 時は途中までの `.part` ダウンロードを再開用に残し、download 結果の size 不一致は拒否します。
+`hf_repo` を省略した場合、`model` はローカルパスとして扱います。`hf_repo` を指定した場合は、通常ファイルである既存の Hugging Face snapshot cache を metadata リクエストなしで直ちに再利用し、それ以外の cache entry は拒否します。cache miss 時はリモート metadata を取得して download 結果のファイルサイズを検証し、metadata を取得できない場合はオフライン互換性のため Hugging Face cache lookup にフォールバックします。途中までの `.part` ダウンロードは再開用に残し、size 不一致の download 結果はキャッシュから削除して拒否します。
 
 ### MTP speculative decoding
 
-MTP は現在 text-only 生成で対応しています。media を含むリクエストは `MTP speculative decoding is not supported with multimodal input yet` で拒否します。multimodal 用 runner では `mtp` を省略してください。
+MTP は text-only の `run`、`chat`、`completion` で利用できます。各ステップは `min(n_max, n_batch - 1, 残り出力数)` 個まで draft し、target model で検証して一致した先頭列を accept した後、両方の KV cache を確定位置まで rollback します。media を含むリクエストでは warning を記録し、通常の multimodal decode にフォールバックします。
 
-Gemma 4 の runner settings 例:
-
-```json
-{
-  "hfRepo": "unsloth/gemma-4-12B-it-qat-GGUF",
-  "model": "gemma-4-12B-it-qat-UD-Q4_K_XL.gguf",
-  "useFlashAttention": true,
-  "mtp": {
-    "enabled": true,
-    "nMax": 4,
-    "draftModel": "mtp-gemma-4-12B-it.gguf"
-  }
-}
-```
-
-Qwen 3.6 MTP の runner settings 例:
-
-```json
-{
-  "hfRepo": "unsloth/Qwen3.6-27B-MTP-GGUF",
-  "model": "Qwen3.6-27B-UD-Q4_K_XL.gguf",
-  "useFlashAttention": true,
-  "mtp": {
-    "enabled": true,
-    "nMax": 4
-  }
-}
-```
-
-運用手順:
-
-1. target と draft の GGUF を同じ repo からロードします。Gemma 4 では `unsloth/gemma-4-12B-it-qat-GGUF` の target `gemma-4-12B-it-qat-UD-Q4_K_XL.gguf` と draft `mtp-gemma-4-12B-it.gguf` を使います。
-2. `unsloth/Qwen3.6-27B-MTP-GGUF` のような same-file MTP モデルでは `Qwen3.6-27B-UD-Q4_K_XL.gguf` をロードし、`mtp.draftModel` は省略します。
-3. backend 固有の理由がなければ flash attention を有効にします。
-4. `mtp.enabled=true` を設定します。別 MTP draft GGUF がある repo だけ `mtp.draftModel` を設定します。smoke test では `nMax=4`、未指定時は既定値 `3` です。
-5. text-only の `chat` / `completion` / `run` を実行し、`mtp.enabled=false` の runner と出力品質を比較します。
-6. multimodal workload は、multimodal+MTP の検証が終わるまで `mtp` 省略の別 runner で運用します。
+MTP context の初期化、または出力を stream する前の実行に失敗した場合は、warning を記録し speculative KV state を破棄して、同一リクエストを通常 decode で再試行します。すでに出力を stream した後の失敗では、クライアント可視のテキストを重複させないため error を返します。`reuse_kv_prefix=true` を指定した場合も warning を記録し、そのリクエストは通常 text decode を選択します。
 
 ## 推論速度の計測と切り分け
 

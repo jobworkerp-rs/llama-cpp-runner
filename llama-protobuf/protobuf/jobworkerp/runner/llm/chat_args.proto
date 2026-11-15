@@ -157,7 +157,8 @@ message LLMChatArgs {
     MessageContent content = 2;
   }
 
-  // The name of the model (override default in runner settings).
+  // Retained for wire compatibility. llama-cpp-plugin resolves the effective
+  // model from runner settings; token_count does not add an override rule.
   optional string model = 1;
 
   // The options to use for the model.

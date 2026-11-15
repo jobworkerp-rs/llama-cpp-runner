@@ -7,11 +7,12 @@ use anyhow::{Context, Result};
 use hf_hub::api::sync::ApiBuilder;
 use hf_hub::{Cache, CacheRepo};
 
-/// Download or reuse a Hugging Face Hub file after validating cached size.
+/// Download or reuse a Hugging Face Hub file.
 ///
-/// The `hf-hub` crate already resumes `<etag>.part` files. This helper adds a
-/// guard for corrupted cache misses while preserving `hf-hub`'s cache-first
-/// warm path.
+/// A warm cache reuses only a regular snapshot file without a network request.
+/// Other cache entries are rejected. On a cache miss, this helper validates the
+/// downloaded file size using remote metadata. The `hf-hub` crate already
+/// resumes `<etag>.part` files.
 pub fn download_hf_file(repo: &str, filename: &str) -> Result<PathBuf> {
     let repo_id = repo.to_string();
     let cache = Cache::from_env();
@@ -22,6 +23,7 @@ pub fn download_hf_file(repo: &str, filename: &str) -> Result<PathBuf> {
     let cache_repo = cache.model(repo_id);
 
     download_hf_file_with_ops(
+        &cache,
         &cache_repo,
         repo,
         filename,
@@ -55,6 +57,7 @@ struct RemoteMetadata {
 }
 
 fn download_hf_file_with_ops(
+    cache: &Cache,
     cache_repo: &CacheRepo,
     repo: &str,
     filename: &str,
@@ -62,8 +65,8 @@ fn download_hf_file_with_ops(
     mut get: impl FnMut() -> Result<PathBuf>,
     mut download: impl FnMut() -> Result<PathBuf>,
 ) -> Result<PathBuf> {
-    if let Some(path) = cache_repo.get(filename) {
-        return Ok(path);
+    if let Some(cached) = cache_repo.get(filename) {
+        return validate_warm_cache_file(cache, cache_repo, repo, filename, cached);
     }
 
     let metadata = match metadata() {
@@ -90,7 +93,15 @@ fn download_hf_file_with_ops(
 
     let downloaded = download()
         .with_context(|| format!("unable to download huggingface file: {repo}/{filename}"))?;
-    ensure_file_size(&downloaded, metadata.size)?;
+    if let Err(error) = ensure_file_size(&downloaded, metadata.size) {
+        remove_incomplete_cache_entries(
+            cache_repo,
+            &metadata.commit_hash,
+            &metadata.etag,
+            filename,
+        )?;
+        return Err(error);
+    }
     Ok(downloaded)
 }
 
@@ -106,9 +117,78 @@ fn blob_part_path(cache_repo: &CacheRepo, etag: &str) -> PathBuf {
     path
 }
 
+fn validate_warm_cache_file(
+    cache: &Cache,
+    cache_repo: &CacheRepo,
+    repo: &str,
+    filename: &str,
+    cached: PathBuf,
+) -> Result<PathBuf> {
+    let cache_root = cache
+        .path()
+        .canonicalize()
+        .context("unable to resolve huggingface cache root")?;
+    let resolved = cached.canonicalize().with_context(|| {
+        format!(
+            "unable to resolve warm huggingface cache entry for {repo}/{filename}: {}",
+            cached.display()
+        )
+    })?;
+
+    let snapshot_root = cache_repo
+        .pointer_path("")
+        .canonicalize()
+        .with_context(|| {
+            format!("unable to resolve huggingface snapshot root for {repo}/{filename}")
+        })?;
+    let blob_root = cache_repo.blob_path("").canonicalize().ok();
+
+    if !resolved.starts_with(&cache_root) {
+        anyhow::bail!(
+            "rejecting warm huggingface cache entry outside cache root for {repo}/{filename}: {}",
+            cached.display()
+        );
+    }
+    let belongs_to_repo = resolved.starts_with(&snapshot_root)
+        || blob_root
+            .as_ref()
+            .is_some_and(|blob_root| resolved.starts_with(blob_root));
+    if !belongs_to_repo {
+        anyhow::bail!(
+            "rejecting warm huggingface cache entry outside repository cache for {repo}/{filename}: {}",
+            cached.display()
+        );
+    }
+    if !resolved.is_file() {
+        anyhow::bail!(
+            "rejecting non-regular warm huggingface cache entry for {repo}/{filename}: {}",
+            cached.display()
+        );
+    }
+    Ok(cached)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum RegularFileSize {
+    Matches,
+    Mismatch { actual_size: u64 },
+}
+
+fn regular_file_size(path: &Path, expected_size: u64) -> std::io::Result<RegularFileSize> {
+    let metadata = fs::metadata(path)?;
+    if metadata.is_file() && metadata.len() == expected_size {
+        Ok(RegularFileSize::Matches)
+    } else {
+        Ok(RegularFileSize::Mismatch {
+            actual_size: metadata.len(),
+        })
+    }
+}
+
 fn cached_file_has_size(path: &Path, expected_size: u64) -> Result<bool> {
-    match fs::metadata(path) {
-        Ok(metadata) => Ok(metadata.is_file() && metadata.len() == expected_size),
+    match regular_file_size(path, expected_size) {
+        Ok(RegularFileSize::Matches) => Ok(true),
+        Ok(RegularFileSize::Mismatch { .. }) => Ok(false),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(err) => {
             Err(err).with_context(|| format!("unable to inspect cached file: {}", path.display()))
@@ -161,17 +241,18 @@ fn remove_file_or_symlink_if_present(path: &Path) -> Result<()> {
 }
 
 fn ensure_file_size(path: &Path, expected_size: u64) -> Result<()> {
-    let metadata = fs::metadata(path)
-        .with_context(|| format!("unable to inspect downloaded file: {}", path.display()))?;
-    if metadata.is_file() && metadata.len() == expected_size {
-        Ok(())
-    } else {
-        anyhow::bail!(
-            "downloaded file size mismatch for {}: expected {}, got {}",
-            path.display(),
-            expected_size,
-            metadata.len()
-        );
+    match regular_file_size(path, expected_size)
+        .with_context(|| format!("unable to inspect downloaded file: {}", path.display()))?
+    {
+        RegularFileSize::Matches => Ok(()),
+        RegularFileSize::Mismatch { actual_size } => {
+            anyhow::bail!(
+                "downloaded file size mismatch for {}: expected {}, got {}",
+                path.display(),
+                expected_size,
+                actual_size
+            );
+        }
     }
 }
 
@@ -183,8 +264,10 @@ mod tests {
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
-    fn cache_repo(tempdir: &tempfile::TempDir) -> CacheRepo {
-        Cache::new(tempdir.path().to_path_buf()).model("org/model".to_string())
+    fn cache_repo(tempdir: &tempfile::TempDir) -> (Cache, CacheRepo) {
+        let cache = Cache::new(tempdir.path().to_path_buf());
+        let repo = cache.model("org/model".to_string());
+        (cache, repo)
     }
 
     fn write_file(path: &Path, bytes: &[u8]) {
@@ -233,14 +316,15 @@ mod tests {
     }
 
     #[test]
-    fn download_hf_file_with_ops_returns_warm_cache_without_network_ops() {
+    fn download_hf_file_with_ops_returns_a_warm_cache_entry_without_remote_calls() {
         let tempdir = tempfile::tempdir().expect("tempdir");
-        let repo = cache_repo(&tempdir);
+        let (cache, repo) = cache_repo(&tempdir);
         let pointer = pointer_path(&repo, "commit", "model.gguf");
         write_file(&pointer, b"complete");
         repo.create_ref("commit").expect("create ref");
 
         let resolved = download_hf_file_with_ops(
+            &cache,
             &repo,
             "org/model",
             "model.gguf",
@@ -254,13 +338,159 @@ mod tests {
     }
 
     #[test]
+    fn download_hf_file_with_ops_rejects_a_directory_warm_cache_without_remote_calls() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let (cache, repo) = cache_repo(&tempdir);
+        let pointer = pointer_path(&repo, "commit", "model.gguf");
+        fs::create_dir_all(&pointer).expect("create directory pointer");
+        repo.create_ref("commit").expect("create ref");
+
+        let error = download_hf_file_with_ops(
+            &cache,
+            &repo,
+            "org/model",
+            "model.gguf",
+            || panic!("metadata must not be called for invalid warm cache"),
+            || panic!("get must not be called for invalid warm cache"),
+            || panic!("download must not be called for invalid warm cache"),
+        )
+        .expect_err("directory warm cache must be rejected");
+
+        assert!(format!("{error:#}").contains("non-regular"));
+        assert!(pointer.is_dir(), "directory pointer must not be removed");
+    }
+
+    #[test]
+    fn download_hf_file_with_ops_rejects_an_external_file_from_an_absolute_ref() {
+        let cache_tempdir = tempfile::tempdir().expect("cache tempdir");
+        let external_tempdir = tempfile::tempdir().expect("external tempdir");
+        let (cache, repo) = cache_repo(&cache_tempdir);
+        fs::create_dir_all(repo.pointer_path("")).expect("create snapshot root");
+        let external_file = external_tempdir.path().join("model.gguf");
+        write_file(&external_file, b"secret");
+        repo.create_ref(external_tempdir.path().to_str().expect("utf-8 path"))
+            .expect("create absolute ref");
+
+        let error = download_hf_file_with_ops(
+            &cache,
+            &repo,
+            "org/model",
+            "model.gguf",
+            || panic!("metadata must not be called for external warm cache"),
+            || panic!("get must not be called for external warm cache"),
+            || panic!("download must not be called for external warm cache"),
+        )
+        .expect_err("external warm cache must be rejected");
+
+        assert!(format!("{error:#}").contains("cache root"));
+        assert_eq!(
+            fs::read(&external_file).expect("read external file"),
+            b"secret"
+        );
+    }
+
+    #[test]
+    fn download_hf_file_with_ops_rejects_another_repositorys_file_from_an_absolute_ref() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let (cache, repo) = cache_repo(&tempdir);
+        fs::create_dir_all(repo.pointer_path("")).expect("create snapshot root");
+        let other_repo = cache.model("other/model".to_string());
+        let other_pointer = pointer_path(&other_repo, "commit", "model.gguf");
+        write_file(&other_pointer, b"other model");
+        let other_snapshot = other_repo.pointer_path("commit");
+        repo.create_ref(other_snapshot.to_str().expect("utf-8 path"))
+            .expect("create absolute ref");
+
+        let error = download_hf_file_with_ops(
+            &cache,
+            &repo,
+            "org/model",
+            "model.gguf",
+            || panic!("metadata must not be called for another repository cache"),
+            || panic!("get must not be called for another repository cache"),
+            || panic!("download must not be called for another repository cache"),
+        )
+        .expect_err("another repository cache must be rejected");
+
+        assert!(format!("{error:#}").contains("repository cache"));
+        assert_eq!(
+            fs::read(&other_pointer).expect("read other repository file"),
+            b"other model"
+        );
+    }
+
+    #[test]
+    fn download_hf_file_with_ops_rejects_an_external_directory_from_an_absolute_ref() {
+        let cache_tempdir = tempfile::tempdir().expect("cache tempdir");
+        let external_tempdir = tempfile::tempdir().expect("external tempdir");
+        let (cache, repo) = cache_repo(&cache_tempdir);
+        fs::create_dir_all(repo.pointer_path("")).expect("create snapshot root");
+        let external_directory = external_tempdir.path().join("model.gguf");
+        fs::create_dir(&external_directory).expect("create external directory");
+        repo.create_ref(external_tempdir.path().to_str().expect("utf-8 path"))
+            .expect("create absolute ref");
+
+        let error = download_hf_file_with_ops(
+            &cache,
+            &repo,
+            "org/model",
+            "model.gguf",
+            || panic!("metadata must not be called for external warm cache"),
+            || panic!("get must not be called for external warm cache"),
+            || panic!("download must not be called for external warm cache"),
+        )
+        .expect_err("external warm cache must be rejected");
+
+        assert!(format!("{error:#}").contains("cache root"));
+        assert!(
+            external_directory.is_dir(),
+            "external directory must not be removed"
+        );
+    }
+
+    #[test]
+    fn download_hf_file_with_ops_removes_an_invalid_download_from_the_cache() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let (cache, repo) = cache_repo(&tempdir);
+        let pointer = pointer_path(&repo, "commit", "model.gguf");
+        let blob = repo.blob_path("etag");
+
+        let error = download_hf_file_with_ops(
+            &cache,
+            &repo,
+            "org/model",
+            "model.gguf",
+            || {
+                Ok(RemoteMetadata {
+                    commit_hash: "commit".to_string(),
+                    etag: "etag".to_string(),
+                    size: 8,
+                })
+            },
+            || panic!("get fallback must not be called when metadata succeeds"),
+            || {
+                write_file(&pointer, b"short");
+                write_file(&blob, b"short");
+                repo.create_ref("commit").expect("create ref");
+                Ok(pointer.clone())
+            },
+        )
+        .expect_err("invalid download must fail");
+
+        assert!(error.to_string().contains("downloaded file size mismatch"));
+        assert!(!pointer.exists(), "invalid pointer must be removed");
+        assert!(!blob.exists(), "invalid blob must be removed");
+    }
+
+    #[test]
     fn download_hf_file_with_ops_downloads_when_pointer_absent() {
         let tempdir = tempfile::tempdir().expect("tempdir");
-        let repo = cache_repo(&tempdir);
+        let (cache, repo) = cache_repo(&tempdir);
         let downloaded = tempdir.path().join("downloaded.gguf");
         write_file(&downloaded, b"complete");
 
         let resolved = download_hf_file_with_ops(
+            &cache,
             &repo,
             "org/model",
             "model.gguf",
@@ -285,7 +515,7 @@ mod tests {
     #[test]
     fn download_hf_file_with_ops_repairs_size_mismatched_cache() {
         let tempdir = tempfile::tempdir().expect("tempdir");
-        let repo = cache_repo(&tempdir);
+        let (cache, repo) = cache_repo(&tempdir);
         // `create_ref` would make `cache_repo.get` short-circuit the warm path,
         // so leave the ref absent: the stale pointer must be reached through the
         // metadata/size-check branch, not the warm-cache lookup.
@@ -297,6 +527,7 @@ mod tests {
         write_file(&downloaded, b"complete"); // 8 bytes — matches remote size
 
         let resolved = download_hf_file_with_ops(
+            &cache,
             &repo,
             "org/model",
             "model.gguf",
@@ -323,11 +554,12 @@ mod tests {
     #[test]
     fn download_hf_file_with_ops_reuses_size_matched_pointer() {
         let tempdir = tempfile::tempdir().expect("tempdir");
-        let repo = cache_repo(&tempdir);
+        let (cache, repo) = cache_repo(&tempdir);
         let pointer = pointer_path(&repo, "commit", "model.gguf");
         write_file(&pointer, b"complete"); // 8 bytes — matches remote size
 
         let resolved = download_hf_file_with_ops(
+            &cache,
             &repo,
             "org/model",
             "model.gguf",
@@ -349,11 +581,12 @@ mod tests {
     #[test]
     fn download_hf_file_with_ops_falls_back_to_get_when_metadata_fails() {
         let tempdir = tempfile::tempdir().expect("tempdir");
-        let repo = cache_repo(&tempdir);
+        let (cache, repo) = cache_repo(&tempdir);
         let fallback = tempdir.path().join("fallback.gguf");
         write_file(&fallback, b"cached");
 
         let resolved = download_hf_file_with_ops(
+            &cache,
             &repo,
             "org/model",
             "model.gguf",
@@ -385,9 +618,63 @@ mod tests {
     }
 
     #[test]
+    fn cached_file_has_size_rejects_a_directory() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let path = tempdir.path().join("model.gguf");
+        fs::create_dir(&path).expect("create directory");
+
+        assert!(!cached_file_has_size(&path, 0).expect("inspect"));
+    }
+
+    #[test]
+    fn ensure_file_size_accepts_a_regular_file_of_the_expected_size() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let path = tempdir.path().join("model.gguf");
+        write_file(&path, b"abcd");
+
+        ensure_file_size(&path, 4).expect("validate");
+    }
+
+    #[test]
+    fn ensure_file_size_rejects_a_mismatched_regular_file() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let path = tempdir.path().join("model.gguf");
+        write_file(&path, b"abc");
+
+        let error = ensure_file_size(&path, 4).expect_err("size mismatch");
+
+        assert!(error.to_string().contains("expected 4, got 3"));
+    }
+
+    #[test]
+    fn ensure_file_size_rejects_a_directory() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let path = tempdir.path().join("model.gguf");
+        fs::create_dir(&path).expect("create directory");
+
+        let error = ensure_file_size(&path, 0).expect_err("directory mismatch");
+
+        assert!(error.to_string().contains("downloaded file size mismatch"));
+    }
+
+    #[test]
+    fn ensure_file_size_preserves_missing_file_context() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let path = tempdir.path().join("missing.gguf");
+
+        let error = ensure_file_size(&path, 4).expect_err("missing file");
+
+        assert!(
+            error
+                .to_string()
+                .contains("unable to inspect downloaded file")
+        );
+    }
+
+    #[test]
     fn remove_incomplete_cache_entries_removes_pointer_and_blob_but_keeps_part() {
         let tempdir = tempfile::tempdir().expect("tempdir");
-        let repo = cache_repo(&tempdir);
+        let (_cache, repo) = cache_repo(&tempdir);
         let pointer = pointer_path(&repo, "commit", "model.gguf");
         let blob = repo.blob_path("etag");
         let part = blob_part_path(&repo, "etag");
@@ -406,7 +693,7 @@ mod tests {
     #[test]
     fn remove_incomplete_cache_entries_removes_broken_pointer_symlink() {
         let tempdir = tempfile::tempdir().expect("tempdir");
-        let repo = cache_repo(&tempdir);
+        let (_cache, repo) = cache_repo(&tempdir);
         let pointer = pointer_path(&repo, "commit", "model.gguf");
         fs::create_dir_all(pointer.parent().expect("parent")).expect("create parent");
         std::os::unix::fs::symlink("missing-blob", &pointer).expect("symlink");

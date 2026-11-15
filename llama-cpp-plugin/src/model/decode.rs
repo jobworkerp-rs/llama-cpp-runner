@@ -10,11 +10,51 @@
 
 use super::*;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct MtpStepPlan {
+    draft_limit: Option<u16>,
+    supports_batch: bool,
+    target_only: bool,
+}
+
+impl MtpStepPlan {
+    fn new(n_max: u16, n_batch: usize, remaining_output: usize) -> Self {
+        let supports_batch = Self::supports_batch(n_batch);
+        let target_only = remaining_output == 1;
+        let draft_limit = usize::from(n_max)
+            .min(n_batch.saturating_sub(1))
+            .min(remaining_output.saturating_sub(1));
+
+        Self {
+            draft_limit: u16::try_from(draft_limit).ok().filter(|&limit| limit > 0),
+            supports_batch,
+            target_only,
+        }
+    }
+
+    fn supports_batch(n_batch: usize) -> bool {
+        n_batch >= 2
+    }
+
+    fn batch_capacity(n_batch: usize) -> usize {
+        n_batch.max(1)
+    }
+
+    fn should_process_target_batch(self) -> bool {
+        !self.target_only
+    }
+}
+
+fn mtp_can_retry_plain(emitted: bool) -> bool {
+    !emitted
+}
+
+fn mtp_completion_budget(n_len: i32, prompt_tokens: i32) -> u32 {
+    u32::try_from((n_len - prompt_tokens).max(0)).unwrap_or(0)
+}
+
 impl LlamaModelWrapper {
     pub(in crate::model) fn decode(&mut self, args: InferenceArgs) -> Result<DecodeOutput> {
-        if self.mtp.is_some() && !args.medias.is_empty() {
-            bail!(ERR_MTP_WITH_MULTIMODAL);
-        }
         match (args.medias.is_empty(), self.mtmd.is_some()) {
             (true, _) => self.decode_text_only(args),
             (false, false) => bail!("multimodal input given but mmproj is not configured"),
@@ -97,6 +137,65 @@ impl LlamaModelWrapper {
         preserved_tokens: &std::collections::HashSet<LlamaToken>,
         sink: &mut dyn FnMut(&str) -> ControlFlow<()>,
     ) -> Result<DecodeOutput> {
+        // MTP owns both target and draft KV state. Prefix reuse only tracks the
+        // target cache, so route it through the dedicated state machine rather
+        // than risking a partially rolled-back draft cache on the plain path.
+        self.ensure_context()?;
+        let mtp_n_batch = self
+            .context
+            .as_ref()
+            .and_then(SyncContext::mtp)
+            .map(|spec| spec.target_context().n_batch() as usize);
+        if self.mtp.is_some() && self.reuse_kv_prefix {
+            tracing::warn!(
+                "MTP speculative decoding does not support reuse_kv_prefix; falling back to ordinary text decoding"
+            );
+        } else if mtp_n_batch.is_some_and(|n_batch| !MtpStepPlan::supports_batch(n_batch)) {
+            tracing::warn!(
+                n_batch = mtp_n_batch.unwrap_or_default(),
+                "MTP speculative decoding requires n_batch >= 2; falling back to ordinary text decoding"
+            );
+        } else if mtp_n_batch.is_some() {
+            let mut emitted = false;
+            let mut mtp_sink = |piece: &str| {
+                emitted |= !piece.is_empty();
+                sink(piece)
+            };
+            let mtp_result = self.decode_mtp_text_only_core_with_sink_and_stops(
+                formatted_prompt,
+                args,
+                extra_stops,
+                preserved_tokens,
+                &mut mtp_sink,
+            );
+            if let Err(error) = mtp_result {
+                if !mtp_can_retry_plain(emitted) {
+                    return Err(error.context(
+                        "MTP failed after streaming output; ordinary retry would duplicate output",
+                    ));
+                }
+                // The speculative helper owns a second KV cache. Discard both
+                // contexts before retrying, so an unsupported backend cannot
+                // leak a partially verified draft into ordinary decoding.
+                tracing::warn!(
+                    ?error,
+                    "MTP execution failed; retrying with ordinary decoding"
+                );
+                self.context = None;
+                let mtp = self.mtp.take();
+                let fallback = self.decode_text_only_core_with_sink_and_stops(
+                    formatted_prompt,
+                    args,
+                    extra_stops,
+                    preserved_tokens,
+                    sink,
+                );
+                self.mtp = mtp;
+                return fallback;
+            }
+            return mtp_result;
+        }
+
         // Hoist all `&self`-dependent work before borrowing the context field:
         // a `&'static LlamaModel` is `Copy`, and `build_sampler`/`str_to_token`
         // need `&self`, which would conflict with the `&mut self.context` borrow
@@ -118,7 +217,6 @@ impl LlamaModelWrapper {
         // Build the context once (lazy) then take it out of `self` for exclusive
         // use; the guard restores it on every exit path (incl. `?`/panic) so the
         // reused context survives a failed request.
-        self.ensure_context()?;
         let reuse_kv_prefix = self.reuse_kv_prefix;
         let mut ctx_guard = RestoreOnDrop::new(&mut self.context);
         let sync_ctx = ctx_guard.as_mut().expect("context ensured above");
@@ -299,33 +397,7 @@ impl LlamaModelWrapper {
                 batch.clear();
                 batch.add(token, n_cur, &[0], true)?;
 
-                // let candidates = ctx.candidates_ith(batch.n_tokens() - 1);
-
-                // let mut candidates_p = LlamaTokenDataArray::from_iter(candidates, false);
-
-                // Self::setup_candidates(&mut ctx, &mut candidates_p, &history, &args)?;
-                // // sample the most likely token
-                // // candidates_p.sample_softmax(Some(&mut ctx));
-                // candidates_p.sample_token_greedy();
-                // let new_token = candidates_p.data[0];
-                // let new_token_id = new_token.id();
-                // // is it an end of stream?
-                // if self.model.is_eog_token(new_token_id) {
-                //     break;
-                // }
-                // history.push(new_token_id);
-
-                // let output_bytes = self.model.token_to_bytes(new_token_id, Special::Tokenize)?;
-                // // use `Decoder.decode_to_string()` to avoid the intermediate buffer
-                // let mut output_string = String::with_capacity(32);
-                // let _decode_result =
-                //     decoder.decode_to_string(&output_bytes, &mut output_string, false);
-                // // print!("{output_string}");
                 output_buffer.push_str(&output_string);
-                // // std::io::stdout().flush()?;
-
-                // batch.clear();
-                // batch.add(new_token_id, n_cur, &[0], true)?;
 
                 // Stream the just-decoded piece; Break → drop out of the
                 // loop *before* the next decode and skip KV write-back below.
@@ -418,6 +490,224 @@ impl LlamaModelWrapper {
         })
     }
 
+    /// Execute the MTP proposal/verification state machine for text-only
+    /// generation. A speculative step always evaluates `id_last` followed by
+    /// the draft, samples every target logit, commits the accepted prefix, and
+    /// rolls both KV caches back before the next step.
+    #[allow(clippy::too_many_lines)]
+    fn decode_mtp_text_only_core_with_sink_and_stops(
+        &mut self,
+        formatted_prompt: &str,
+        args: &InferenceArgs,
+        extra_stops: &[String],
+        preserved_tokens: &std::collections::HashSet<LlamaToken>,
+        sink: &mut dyn FnMut(&str) -> ControlFlow<()>,
+    ) -> Result<DecodeOutput> {
+        let model = self.model;
+        let mut sampler = self.build_sampler(args)?;
+        let max_draft_tokens = self
+            .mtp
+            .as_ref()
+            .and_then(|mtp| u16::try_from(mtp.n_max).ok())
+            .filter(|&n| n > 0)
+            .ok_or_else(|| anyhow!("MTP draft token limit is invalid"))?;
+        let tokens = model
+            .str_to_token(formatted_prompt, AddBos::Always)
+            .with_context(|| "failed to tokenize prompt")?;
+        let prompt_tokens = tokens.len() as i32;
+        if args.is_cancel_requested() {
+            return Ok(DecodeOutput {
+                text: String::new(),
+                prompt_tokens: prompt_tokens as u32,
+                completion_tokens: 0,
+            });
+        }
+        let Some((&id_last, prompt)) = tokens.split_last() else {
+            bail!("MTP requires a non-empty tokenized prompt");
+        };
+
+        let mut guard = RestoreOnDrop::new(&mut self.context);
+        let sync_context = guard.as_mut().expect("context ensured above");
+        // MTP's draft cache cannot be represented by the text-prefix record.
+        // Start from two empty caches and leave both records empty on every exit.
+        sync_context.cached_tokens.clear();
+        sync_context.cached_chunks.clear();
+        let spec = sync_context
+            .mtp_mut()
+            .ok_or_else(|| anyhow!("MTP context disappeared before generation"))?;
+        spec.target_context_mut().clear_kv_cache();
+        spec.draft_context_mut().clear_kv_cache();
+        let _abort_guard = AbortGuard::new(spec.target_context_mut(), args.cancel_flag.clone());
+        let n_ctx = spec.target_context().n_ctx() as i32;
+        let n_len = args
+            .max_new_tokens
+            .map_or_else(|| args.sample_len.unwrap_or(4096), |n| prompt_tokens + n)
+            .min(n_ctx);
+        check_token_length(&tokens, spec.target_context(), n_len)?;
+
+        let n_batch = spec.target_context().n_batch() as usize;
+        // Verification needs room for `id_last` plus the full draft even when
+        // the prompt itself is shorter than n_batch.
+        let mut batch = LlamaBatch::new(MtpStepPlan::batch_capacity(n_batch), 1);
+        let mut position = 0_i32;
+        spec.reset()
+            .map_err(|error| anyhow!("MTP failed to reset request state: {error}"))?;
+        for chunk in prompt.chunks(n_batch) {
+            if args.is_cancel_requested() || sink_requests_stop(sink, "") {
+                return Ok(DecodeOutput {
+                    text: String::new(),
+                    prompt_tokens: prompt_tokens as u32,
+                    completion_tokens: 0,
+                });
+            }
+            batch.clear();
+            for &token in chunk {
+                // MTP's drafter consumes the target hidden state for every
+                // prompt position, so logits must be requested throughout
+                // prefill rather than only at the final prompt token.
+                batch.add(token, position, &[0], true)?;
+                position += 1;
+            }
+            spec.target_context_mut()
+                .decode(&mut batch)
+                .map_err(anyhow::Error::new)
+                .context("llama_decode() failed during MTP prompt prefill")?;
+            spec.process(&batch)
+                .map_err(|error| anyhow!("MTP failed to process prompt batch: {error}"))?;
+        }
+        // The draft context has caught up with the target prefill. Begin only
+        // now so the speculative helper starts from the synchronized prompt.
+        spec.begin(prompt)
+            .map_err(|error| anyhow!("MTP failed to begin generation: {error}"))?;
+
+        let mut id_last = id_last;
+        let mut history = prompt.to_vec();
+        let mut n_past = prompt_tokens - 1;
+        let mut n_decode = 0_u32;
+        let completion_budget = mtp_completion_budget(n_len, prompt_tokens);
+        let mut output = String::with_capacity((n_len * 4) as usize);
+        let mut decoder = encoding_rs::UTF_8.new_decoder();
+        let started = ggml_time_us();
+
+        while n_decode < completion_budget {
+            if args.is_cancel_requested() {
+                break;
+            }
+            let remaining = (completion_budget - n_decode) as usize;
+            let plan = MtpStepPlan::new(max_draft_tokens, n_batch, remaining);
+            debug_assert!(
+                plan.supports_batch,
+                "MTP core must only receive a batch that can hold target and draft tokens"
+            );
+            let draft = if let Some(draft_cap) = plan.draft_limit {
+                spec.draft(n_past, id_last, &history, draft_cap)
+                    .map_err(|error| anyhow!("MTP drafting failed: {error}"))?
+            } else {
+                Vec::new()
+            };
+            batch.clear();
+            batch.add(id_last, n_past, &[0], true)?;
+            n_past += 1;
+            for (offset, &token) in draft.iter().enumerate() {
+                batch.add(token, n_past + offset as i32, &[0], true)?;
+            }
+            if let Err(error) = spec.target_context_mut().decode(&mut batch) {
+                if args.is_cancel_requested() {
+                    break;
+                }
+                return Err(anyhow::Error::new(error).context("MTP target verification failed"));
+            }
+            if plan.should_process_target_batch() {
+                spec.process(&batch)
+                    .map_err(|error| anyhow!("MTP draft synchronization failed: {error}"))?;
+            }
+
+            let mut accepted = Vec::with_capacity(draft.len() + 1);
+            for index in 0..=draft.len() {
+                let token = sampler.sample(spec.target_context(), index as i32);
+                accepted.push(token);
+                if index == draft.len() || token != draft[index] {
+                    break;
+                }
+            }
+            let accepted_draft = accepted.len().saturating_sub(1);
+            if !draft.is_empty() {
+                spec.accept(accepted_draft as u16)
+                    .map_err(|error| anyhow!("MTP acceptance failed: {error}"))?;
+            }
+            n_past += accepted_draft as i32;
+            // The final sampled token is not in the KV cache yet. Removing the
+            // rejected draft suffix makes the next iteration decode exactly it.
+            let rollback_from = n_past as u32;
+            let target_rolled_back = spec
+                .target_context_mut()
+                .clear_kv_cache_seq(Some(0), Some(rollback_from), None)
+                .unwrap_or(false);
+            let draft_rolled_back = spec
+                .draft_context_mut()
+                .clear_kv_cache_seq(Some(0), Some(rollback_from), None)
+                .unwrap_or(false);
+            if !target_rolled_back || !draft_rolled_back {
+                bail!("MTP KV rollback is unsupported")
+            }
+
+            for token in accepted {
+                history.push(id_last);
+                id_last = token;
+                if model.is_eog_token(token) {
+                    return Ok(DecodeOutput {
+                        text: output,
+                        prompt_tokens: prompt_tokens as u32,
+                        completion_tokens: n_decode,
+                    });
+                }
+                let special = preserved_tokens.is_empty() || preserved_tokens.contains(&token);
+                let bytes = token_to_piece_bytes_retry_special(model, token, special)?;
+                let mut piece = String::with_capacity(32);
+                let _ = decoder.decode_to_string(&bytes, &mut piece, false);
+                output.push_str(&piece);
+                n_decode += 1;
+                if sink_requests_stop(sink, &piece) {
+                    return Ok(DecodeOutput {
+                        text: output,
+                        prompt_tokens: prompt_tokens as u32,
+                        completion_tokens: n_decode,
+                    });
+                }
+                if extra_stops
+                    .iter()
+                    .any(|stop| !stop.is_empty() && output.ends_with(stop))
+                {
+                    let stop_len = extra_stops
+                        .iter()
+                        .find(|stop| !stop.is_empty() && output.ends_with(stop.as_str()))
+                        .map_or(0, String::len);
+                    output.truncate(output.len().saturating_sub(stop_len));
+                    return Ok(DecodeOutput {
+                        text: output,
+                        prompt_tokens: prompt_tokens as u32,
+                        completion_tokens: n_decode,
+                    });
+                }
+                if n_past >= n_len {
+                    break;
+                }
+            }
+        }
+        let elapsed = Duration::from_micros((ggml_time_us() - started) as u64);
+        tracing::info!(
+            "MTP decoded {} tokens in {:.2} s, speed {:.2} t/s",
+            n_decode,
+            elapsed.as_secs_f32(),
+            n_decode as f32 / elapsed.as_secs_f32()
+        );
+        Ok(DecodeOutput {
+            text: output,
+            prompt_tokens: prompt_tokens as u32,
+            completion_tokens: n_decode,
+        })
+    }
+
     /// Legacy entry point: builds the user prompt with media markers, applies
     /// the chat template (wrapping in system+user), and forwards to the
     /// multimodal core. The system_prompt marker check is performed here so
@@ -480,6 +770,11 @@ impl LlamaModelWrapper {
         args: &InferenceArgs,
         sink: &mut dyn FnMut(&str) -> ControlFlow<()>,
     ) -> Result<DecodeOutput> {
+        if self.mtp.is_some() {
+            tracing::warn!(
+                "MTP speculative decoding does not support multimodal input; falling back to ordinary multimodal decoding"
+            );
+        }
         // Hoist `&self`-wide work (build_sampler, model copy) before borrowing
         // the context field. `mtmd` is a separate field, so it can be borrowed
         // alongside the `&mut self.context` guard below (disjoint borrows).
@@ -644,6 +939,101 @@ impl LlamaModelWrapper {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mtp_draft_limit_respects_configuration_batch_and_remaining_output() {
+        assert_eq!(MtpStepPlan::new(4, 16, 10).draft_limit, Some(4));
+        assert_eq!(MtpStepPlan::new(8, 3, 10).draft_limit, Some(2));
+        assert_eq!(MtpStepPlan::new(8, 16, 2).draft_limit, Some(1));
+        assert_eq!(MtpStepPlan::new(8, 16, 1).draft_limit, None);
+    }
+
+    #[test]
+    fn mtp_draft_limit_reserves_one_token_for_the_target_sample() {
+        let remaining_output = 3;
+        let draft = MtpStepPlan::new(8, 16, remaining_output)
+            .draft_limit
+            .expect("draft capacity");
+
+        assert_eq!(draft, 2);
+        assert_eq!(usize::from(draft) + 1, remaining_output);
+    }
+
+    #[test]
+    fn mtp_zero_draft_limit_still_processes_a_non_final_target_batch() {
+        // A zero draft limit represents an empty draft, not a reason to skip
+        // synchronization before the next draft attempt.
+        let plan = MtpStepPlan::new(0, 16, 2);
+
+        assert_eq!(plan.draft_limit, None);
+        assert!(!plan.target_only);
+        assert!(plan.should_process_target_batch());
+    }
+
+    #[test]
+    fn mtp_completion_budget_counts_only_generated_tokens() {
+        assert_eq!(mtp_completion_budget(15, 12), 3);
+        assert_eq!(mtp_completion_budget(12, 12), 0);
+        assert_eq!(mtp_completion_budget(10, 12), 0);
+    }
+
+    #[test]
+    fn mtp_uses_a_target_only_step_for_the_final_output_token() {
+        assert!(MtpStepPlan::new(8, 16, 1).target_only);
+        assert!(!MtpStepPlan::new(8, 16, 0).target_only);
+        assert!(!MtpStepPlan::new(8, 16, 2).target_only);
+    }
+
+    #[test]
+    fn mtp_processes_empty_drafts_except_on_the_final_target_only_step() {
+        // An empty draft still needs synchronization before the next draft.
+        assert!(MtpStepPlan::new(8, 16, 2).should_process_target_batch());
+        assert!(!MtpStepPlan::new(8, 16, 1).should_process_target_batch());
+    }
+
+    #[test]
+    fn mtp_batch_capacity_keeps_room_for_a_short_prompt_and_full_draft() {
+        let n_batch = 5;
+        assert_eq!(MtpStepPlan::batch_capacity(n_batch), n_batch);
+        assert!(usize::from(MtpStepPlan::new(4, n_batch, 10).draft_limit.unwrap()) < n_batch);
+    }
+
+    #[test]
+    fn mtp_step_plan_falls_back_when_batch_cannot_hold_target_and_draft() {
+        let unsupported = MtpStepPlan::new(4, 1, 2);
+        let supported = MtpStepPlan::new(4, 2, 2);
+
+        assert!(!unsupported.supports_batch);
+        assert!(supported.supports_batch);
+        assert!(!MtpStepPlan::supports_batch(1));
+        assert!(MtpStepPlan::supports_batch(2));
+    }
+
+    #[test]
+    fn mtp_plain_retry_is_safe_only_before_streaming_any_output() {
+        assert!(mtp_can_retry_plain(false));
+        assert!(!mtp_can_retry_plain(true));
+    }
+
+    #[test]
+    fn mtp_single_token_batch_routes_to_ordinary_text_decoding() {
+        assert!(!MtpStepPlan::supports_batch(1));
+        assert!(MtpStepPlan::supports_batch(2));
+    }
+
+    #[test]
+    fn mtp_resets_processes_prefill_then_begins_drafting() {
+        let source = include_str!("decode.rs");
+        let reset = source.find("spec.reset()").expect("MTP reset");
+        let begin = source.find("spec.begin(prompt)").expect("MTP begin");
+        let prefill = source
+            .find("for chunk in prompt.chunks")
+            .expect("prefill loop");
+        let process = source
+            .find("MTP failed to process prompt batch")
+            .expect("MTP prefill process");
+        assert!(reset < prefill && prefill < process && process < begin);
+    }
     use crate::model::test_support::*;
     use jobworkerp_llama_protobuf::protobuf::llama_cpp::MediaInput;
 
@@ -692,16 +1082,16 @@ mod tests {
     }
 
     #[test]
-    fn test_mtp_with_multimodal_is_rejected_before_decode_routing() {
+    fn test_mtp_with_multimodal_falls_back_to_normal_decode_routing() {
         let source = include_str!("decode.rs");
 
         assert!(
-            source.contains("self.mtp.is_some() && !args.medias.is_empty()"),
-            "MTP must reject multimodal input before entering the multimodal decode path"
+            source.contains("fn decode_multimodal_core_with_sink"),
+            "MTP multimodal fallback must use the shared multimodal decode path"
         );
         assert!(
-            source.contains("ERR_MTP_WITH_MULTIMODAL"),
-            "MTP multimodal rejection must use the shared error string"
+            source.contains("falling back to ordinary multimodal decoding"),
+            "MTP multimodal fallback must be observable in logs"
         );
     }
 
